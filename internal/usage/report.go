@@ -73,7 +73,7 @@ func normalizeQuery(q Query) (Query, error) {
 func validGroupBy(g string) bool {
 	switch g {
 	case GroupByDay, GroupByModel, GroupByDeployment, GroupByProvider, GroupByKey,
-		GroupByEndpoint, GroupByStatusClass, GroupByCacheStatus:
+		GroupByEndpoint, GroupByStatusClass, GroupByCacheStatus, GroupByProfile, GroupByRoutingMode:
 		return true
 	}
 	tag, ok := strings.CutPrefix(g, GroupByTagPrefix)
@@ -99,6 +99,10 @@ func groupValue(ev *Event, g string) string {
 		return statusClass(ev.Status)
 	case GroupByCacheStatus:
 		return ev.CacheStatus
+	case GroupByProfile:
+		return ev.Profile
+	case GroupByRoutingMode:
+		return ev.RoutingMode
 	}
 	return ev.Tags[strings.TrimPrefix(g, GroupByTagPrefix)]
 }
@@ -120,6 +124,8 @@ type accumulator struct {
 	// cost and baseline sum events with a known cost; overhead sums all.
 	cost, baseline, overhead Money
 	routing, cache           Money
+	// projected sums the projected savings of observe-mode events.
+	projected Money
 }
 
 // add adds one event.
@@ -148,6 +154,9 @@ func (a *accumulator) add(ev *Event) {
 	} else {
 		a.routing = a.routing.Add(ev.BaselineCost.Sub(ev.Cost))
 	}
+	if ev.RoutingMode == RoutingModeObserve && ev.ShadowCostKnown {
+		a.projected = a.projected.Add(ev.BaselineCost.Sub(ev.ShadowCost))
+	}
 }
 
 // totals returns the aggregate.
@@ -164,6 +173,7 @@ func (a *accumulator) totals() Totals {
 	t.SavingsUSD.Routing = a.routing
 	t.SavingsUSD.Cache = a.cache
 	t.SavingsUSD.Net = a.routing.Add(a.cache).Sub(a.overhead)
+	t.ProjectedSavingsUSD = a.projected
 	if a.requests > 0 {
 		t.CacheHitRate = float64(a.cacheHits) / float64(a.requests)
 		t.FallbackRate = float64(a.fallbacks) / float64(a.requests)

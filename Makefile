@@ -59,6 +59,10 @@ cover: ## Write coverage.out and print a per-function summary.
 bench-overhead: ## Measure the gateway's added latency (pass flags with BENCH_FLAGS="-mode stream").
 	$(GO) run ./test/load $(BENCH_FLAGS)
 
+.PHONY: demo-routing
+demo-routing: ## Run the mixed-workload routing demo against fake upstreams (pass flags with DEMO_FLAGS).
+	$(GO) run ./test/demo $(DEMO_FLAGS)
+
 # Integration tests (build tag `integration`) run against the Postgres and
 # redis-state services of deploy/compose.yaml, started in a compose project
 # of their own so that `down -v` never deletes the dev volumes. They use the

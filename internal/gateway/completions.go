@@ -16,8 +16,9 @@ import (
 const ShimChat = "chat"
 
 // Completions serves one POST /v1/completions request, in the legacy
-// OpenAI shape. The model is resolved and the deployments planned as for
-// chat completions, and the plan executed the same way. A deployment with
+// OpenAI shape. The request is routed as for chat completions (the
+// assessor reads its prompt as a user message), and the plan executed the
+// same way. A deployment with
 // capability completions on an OpenAI-wire provider gets the request
 // natively, forwarded losslessly with the model replaced. Any other
 // deployment is served through the chat shim: the prompt becomes one user
@@ -53,53 +54,48 @@ func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 		return
 	}
 
-	res, e := g.resolve(req.Model(), rec.endpoint, chatType)
-	if e != nil {
-		rec.respondError(ex, Info{}, e)
-		return
-	}
-	rec.info = Info{Model: res.Model.ID, Alias: res.Alias}
-	rec.alias = res.Alias
-	rec.model = res.Model
-	estIn := estimateIn(len(body), 0, 0, res.Model)
 	maxTokens, hasMax := req.MaxTokens()
-	estOut := estimateOut(maxTokens, hasMax, completionOutputs(req))
-	rec.estIn, rec.estOut = estIn, estOut
+	rr := routeRequest{
+		model: req.Model(), header: ex.Header(),
+		tenant: rec.tenant, keyID: rec.keyID, tags: rec.tags,
+		size: len(body), maxTokens: maxTokens, hasMax: hasMax, outputs: completionOutputs(req),
+		stream: req.Stream(),
+	}
+	// The chat form of the request is what the shim sends, and what the
+	// assessor reads. Only a field of the wrong type, such as a
+	// non-boolean stream, makes it fail.
+	chat, chatErr := req.ChatRequest()
+	rr.chat = chat
 
-	if shimErr := req.ShimError(); shimErr != nil {
+	shimErr := req.ShimError()
+	if shimErr != nil {
 		// Only a native deployment can serve this request.
-		required := req.RequiredCapabilities()
-		required[schema.CapCompletions] = struct{}{}
-		e := g.buildPlan(&rec.plan, res, required, estIn, estOut, func(d *catalog.Deployment) string {
+		rr.required = req.RequiredCapabilities()
+		rr.required[schema.CapCompletions] = struct{}{}
+		rr.keep = func(d *catalog.Deployment) string {
 			if !g.native(d) {
 				return "lacks capability completions"
 			}
 			return ""
-		})
-		rec.excluded = len(rec.plan.exclusions)
-		if e != nil {
-			if e.Code == codeNoEligible {
-				e = invalidRequest(shimErr)
-			}
-			rec.respondError(ex, rec.info, e)
+		}
+	} else {
+		if chatErr != nil {
+			rec.respondError(ex, Info{}, invalidRequest(chatErr))
 			return
 		}
-		g.execute(ctx, ex, rec, g.completionTry(ex, rec, req, nil))
-		return
+		rr.required = chat.RequiredCapabilities()
 	}
-
-	chat, err := req.ChatRequest()
-	if err != nil {
-		// The shim builds the chat request itself; only a field of the
-		// wrong type, such as a non-boolean stream, can fail here.
-		rec.respondError(ex, rec.info, invalidRequest(err))
-		return
-	}
-	e = g.buildPlan(&rec.plan, res, chat.RequiredCapabilities(), estIn, estOut, nil)
-	rec.excluded = len(rec.plan.exclusions)
+	rt, e := g.route(ctx, rec.endpoint, &rr, &rec.rt)
 	if e != nil {
-		rec.respondError(ex, rec.info, e)
+		if shimErr != nil && e.Code == codeNoEligible {
+			e = invalidRequest(shimErr)
+		}
+		g.failRoute(ex, rec, rt, e)
 		return
+	}
+	g.usePlan(rec, rt)
+	if shimErr != nil {
+		chat = nil
 	}
 	g.execute(ctx, ex, rec, g.completionTry(ex, rec, req, chat))
 }

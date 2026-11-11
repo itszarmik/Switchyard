@@ -160,7 +160,7 @@ func TestListModels(t *testing.T) {
 	before := time.Now().Unix()
 	g, _, reg := newTestGateway(t)
 	after := time.Now().Unix()
-	got := g.ListModels()
+	got := g.ListModels(context.Background())
 	if len(got) != 2 || got[0].ID != "gpt-test" || got[1].ID != "claude-test" {
 		t.Fatalf("models = %+v", got)
 	}
@@ -170,7 +170,7 @@ func TestListModels(t *testing.T) {
 		}
 	}
 	got[0].ID = "mutated"
-	if g.ListModels()[0].ID != "gpt-test" {
+	if g.ListModels(context.Background())[0].ID != "gpt-test" {
 		t.Error("ListModels returned its internal slice")
 	}
 	// Instrument counts the request, not ListModels.

@@ -119,6 +119,20 @@ func (c *Circuit) Spent(ctx context.Context, s Scope, now time.Time) (int64, err
 	return spent, err
 }
 
+// SoftCrossed implements Store.
+func (c *Circuit) SoftCrossed(ctx context.Context, scopes []Scope, now time.Time) ([]State, error) {
+	if len(scopes) == 0 {
+		return nil, nil
+	}
+	var out []State
+	err := c.call(ctx, "soft", func(ctx context.Context) error {
+		var err error
+		out, err = c.store.SoftCrossed(ctx, scopes, now)
+		return err
+	})
+	return out, err
+}
+
 // call runs f against the store, unless the store is marked unavailable,
 // and records its outcome.
 func (c *Circuit) call(ctx context.Context, op string, f func(ctx context.Context) error) error {

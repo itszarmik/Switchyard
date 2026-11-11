@@ -841,7 +841,9 @@ func TestSpillover(t *testing.T) {
 			t.Errorf("provider_in_flight{%s} = %v after the requests", p, got)
 		}
 	}
-	if got := metricValue(t, e.reg, "switchyard_provider_saturated_total", "a"); got < 2 {
+	// Routing around a saturated provider is not a refused Acquire, so it
+	// is not counted (see TestSaturationCountsOnlyAcquire).
+	if got := metricValue(t, e.reg, "switchyard_provider_saturated_total", "a"); got != 0 {
 		t.Errorf("provider_saturated_total{a} = %v", got)
 	}
 }

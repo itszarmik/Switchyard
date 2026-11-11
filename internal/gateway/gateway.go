@@ -1,8 +1,10 @@
 // Package gateway runs the request pipeline for each endpoint. It is the
 // only package that knows the order of the steps: decode and validate the
-// request, resolve the model through the catalog and plan the deployments
-// that can honor the request (the cheapest first, skipping those that are
-// unhealthy), admit the request's estimated cost against its tenant's and
+// request; route it (assess its difficulty, resolve its effective policy
+// with header tightening and the budgets' soft-profile downgrade, resolve
+// the model field, and let the router plan the deployments that can honor
+// it, the best first, skipping those that are unhealthy; see route); admit
+// the request's estimated cost against its tenant's and
 // key's budgets, then execute the plan: call each deployment's adapter,
 // with the parameters it may drop removed, retrying and falling back as
 // the error taxonomy allows, within the request's deadline. Then respond,
@@ -32,9 +34,12 @@ import (
 	"switchyard/internal/catalog"
 	"switchyard/internal/config"
 	"switchyard/internal/health"
+	"switchyard/internal/policy"
 	"switchyard/internal/providers"
 	"switchyard/internal/providers/anthropic"
 	"switchyard/internal/providers/openai"
+	"switchyard/internal/quality"
+	"switchyard/internal/router"
 	"switchyard/internal/usage"
 )
 
@@ -76,6 +81,13 @@ type Options struct {
 	BudgetStoreCheck func(ctx context.Context) error
 	// ConfigVersion identifies the config snapshot in usage events.
 	ConfigVersion string
+	// Offline makes a gateway for explaining routing decisions without
+	// live state (switchyard route explain): every deployment counts as
+	// healthy, latency estimates come from the catalog's hints, and every
+	// budget is untouched (its whole limit left, its soft threshold not
+	// crossed), as on a freshly started gateway. It must not serve
+	// traffic.
+	Offline bool
 }
 
 // Gateway serves the OpenAI-compatible endpoints. It is safe for concurrent
@@ -113,6 +125,15 @@ type Gateway struct {
 	budgetCheck   func(ctx context.Context) error
 	now           func() time.Time
 	configVersion string
+
+	// policy resolves each request's effective policy; assessor rates its
+	// difficulty; router plans it. tenants maps each tenant id to its
+	// config, for the policy. offline is Options.Offline.
+	policy   *policy.Engine
+	assessor quality.Assessor
+	router   *router.Router
+	tenants  map[string]config.Tenant
+	offline  bool
 }
 
 // Model is one entry of the model list.
@@ -169,6 +190,14 @@ func New(opts Options) (*Gateway, error) {
 		g.adapters[p.ID] = a
 	}
 
+	if g.policy, err = policy.New(cfg); err != nil {
+		return nil, fmt.Errorf("gateway: %w", err)
+	}
+	h, err := quality.NewHeuristic(cfg.Routing.Assessor.Weights)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: routing.assessor: %w", err)
+	}
+	g.assessor = h
 	g.routing = withRoutingDefaults(cfg.Routing)
 	g.jitter = fullJitter
 	g.ledger = opts.Ledger
@@ -208,6 +237,17 @@ func New(opts Options) (*Gateway, error) {
 	if err := met.registerHealth(opts.Registry, g.health, g); err != nil {
 		return nil, err
 	}
+
+	g.offline = opts.Offline
+	tracker := g.health
+	if g.offline {
+		tracker = nil
+	}
+	g.router = router.New(cat, tracker, g.routing)
+	g.tenants = make(map[string]config.Tenant, len(cfg.Tenants))
+	for _, t := range cfg.Tenants {
+		g.tenants[t.ID] = t
+	}
 	return g, nil
 }
 
@@ -237,6 +277,9 @@ func withRoutingDefaults(r config.Routing) config.Routing {
 	set(&r.Fallback.BackoffBase, def.Fallback.BackoffBase)
 	set(&r.Fallback.BackoffMax, def.Fallback.BackoffMax)
 	setFloat(&r.Fallback.RetryBudgetRatio, def.Fallback.RetryBudgetRatio)
+	if r.ExpectedOutputTokens <= 0 {
+		r.ExpectedOutputTokens = def.ExpectedOutputTokens
+	}
 	setInt(&r.Breaker.ConsecutiveFailures, def.Breaker.ConsecutiveFailures)
 	setFloat(&r.Breaker.FailureRatio, def.Breaker.FailureRatio)
 	setInt(&r.Breaker.MinRequests, def.Breaker.MinRequests)
@@ -296,11 +339,23 @@ type Info struct {
 	// Attempts is the number of upstream attempts so far; 0 when none was
 	// made.
 	Attempts int
-	// RouteReason says why the provider was chosen: cheapest_eligible,
-	// pinned, or fallback:<kind> when a fallback answered, kind being the
-	// failure that caused the first fallback. Empty when no deployment
-	// was chosen.
+	// RouteReason says why the deployment was chosen: cheapest_eligible,
+	// pinned (model@provider), preferred (a policy preference tier
+	// decided), quality_relaxed or latency_relaxed (a soft check was
+	// relaxed), budget_downgrade (a budget's soft profile is in force),
+	// observe (observe mode served what was asked for), or fallback:<kind>
+	// when a fallback answered, kind being the failure that caused the
+	// first fallback. Empty when no deployment was chosen.
 	RouteReason string
+	// Profile is the routing profile in force, for chat and legacy
+	// completions.
+	Profile string
+	// PolicyWarning lists, "; "-separated, the request headers the policy
+	// ignored because they would have loosened it, or "".
+	PolicyWarning string
+	// ShadowModel is, in observe mode, the model the router would have
+	// chosen, or "".
+	ShadowModel string
 	// CostUSD is the request's exact cost in USD as a decimal, set on a
 	// successful non-streaming response whose usage and prices are known.
 	CostUSD string

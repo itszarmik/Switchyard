@@ -322,6 +322,64 @@ func testContract(t *testing.T, newStore func(t *testing.T) Store) {
 		}
 	})
 
+	t.Run("soft crossed state", func(t *testing.T) {
+		st := newStore(t)
+		day := scope("acme", WindowDay, 1000, true)
+		day.SoftAtMicro = 500
+		month := scope("acme", WindowMonth, 2000, false) // no soft threshold
+		scopes := []Scope{day, month}
+		state := func(now time.Time) []State {
+			t.Helper()
+			got, err := st.SoftCrossed(ctx, scopes, now)
+			if err != nil {
+				t.Fatalf("SoftCrossed: %v", err)
+			}
+			return got
+		}
+		if got := state(noon); !slices.Equal(got, []State{{}, {}}) {
+			t.Errorf("before any charge: %+v, want zero states", got)
+		}
+		mustAdmit(t, st, scopes, 400, noon)
+		if got := state(noon); !slices.Equal(got, []State{{Spent: 400}, {Spent: 400}}) {
+			t.Errorf("below the threshold: %+v", got)
+		}
+		// A charge that crosses the threshold sets the flag, which stays
+		// even when a settlement brings the spend back under it.
+		b := mustAdmit(t, st, scopes, 200, noon)
+		if got := state(noon); !slices.Equal(got, []State{{Spent: 600, SoftCrossed: true}, {Spent: 600}}) {
+			t.Errorf("charged past the threshold: %+v", got)
+		}
+		if err := st.Settle(ctx, b, 0); err != nil {
+			t.Fatal(err)
+		}
+		if got := state(noon); !slices.Equal(got, []State{{Spent: 400, SoftCrossed: true}, {Spent: 400}}) {
+			t.Errorf("settled back under the threshold: %+v", got)
+		}
+		// A settlement that reaches the threshold sets no flag, but the
+		// spend shows it.
+		key := keyScope("acme", "k1", WindowDay, 1000, true)
+		key.SoftAtMicro = 500
+		c := mustAdmit(t, st, []Scope{key}, 100, noon)
+		if err := st.Settle(ctx, c, 500); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := st.SoftCrossed(ctx, []Scope{key}, noon); err != nil || !slices.Equal(got, []State{{Spent: 500, SoftCrossed: true}}) {
+			t.Errorf("settled to the threshold: %+v, %v", got, err)
+		}
+		if got := state(nextDay); !slices.Equal(got, []State{{}, {Spent: 400}}) {
+			t.Errorf("next day: %+v, want a fresh day", got)
+		}
+		if got := (State{Spent: 1200}).Remaining(day); got != 0 {
+			t.Errorf("Remaining over the limit = %d, want 0", got)
+		}
+		if got := (State{Spent: 300}).Remaining(day); got != 700 {
+			t.Errorf("Remaining = %d, want 700", got)
+		}
+		if got, err := st.SoftCrossed(ctx, nil, noon); err != nil || len(got) != 0 {
+			t.Errorf("SoftCrossed(no scopes) = %v, %v", got, err)
+		}
+	})
+
 	t.Run("no scopes", func(t *testing.T) {
 		st := newStore(t)
 		a := mustAdmit(t, st, nil, 1_000_000, noon)

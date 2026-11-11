@@ -206,15 +206,12 @@ func (p *Provider) Max() int { return int(p.max.Load()) }
 // InFlight returns the number of requests in flight.
 func (p *Provider) InFlight() int64 { return p.inFlight.Load() }
 
-// Saturated reports whether the provider is at its concurrency limit, and
-// counts the request turned away if so.
-func (p *Provider) Saturated() bool {
+// IsSaturated reports whether the provider is at its concurrency limit. It
+// has no side effects, so that routing decisions and explanations can
+// read it freely; only Acquire counts a request turned away.
+func (p *Provider) IsSaturated() bool {
 	m := p.max.Load()
-	if m > 0 && p.inFlight.Load() >= m {
-		p.t.obs.Saturated(p.id)
-		return true
-	}
-	return false
+	return m > 0 && p.inFlight.Load() >= m
 }
 
 // Acquire takes a concurrency slot. It never waits: it returns false at

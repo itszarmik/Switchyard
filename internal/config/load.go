@@ -24,6 +24,15 @@ type LoadOptions struct {
 	// device or FIFO cannot hang the load.
 	ReadFile func(name string) ([]byte, error)
 	Glob     func(pattern string) ([]string, error)
+	// SecretPlaceholders loads the configuration without its secrets, for
+	// tools that never call an upstream or a store, such as switchyard
+	// route explain. A reference in a secret setting (an API key, a Redis
+	// URL, the ledger DSN) reads neither the environment nor a file: a
+	// ${VAR:-default} reference takes its default, and any other
+	// reference a placeholder that validation accepts (a redis:// or
+	// postgres:// URL when the reference is the whole URL). References in
+	// other settings resolve as usual.
+	SecretPlaceholders bool
 	// Overrides are applied after the files are merged and defaults are set,
 	// and before validation, so precedence is defaults < files < Overrides.
 	// Supported keys: "server.listen", "server.admin_listen", "logging.level".

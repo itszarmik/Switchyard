@@ -185,7 +185,7 @@ func (g *Gateway) readTags(ex Exchange, rec *record) bool {
 // when the request sets it) at d's prices. It is 0 when d's prices are
 // unknown.
 func (g *Gateway) estimate(rec *record, d *catalog.Deployment) int64 {
-	c, ok := usage.CostFor(d.Model.Type, usage.Tokens{Input: rec.estIn, Output: rec.estOut}, d.Prices)
+	c, ok := usage.CostFor(d.Model.Type, usage.Tokens{Input: rec.estIn(d.Model), Output: rec.estOut}, d.Prices)
 	if !ok {
 		return 0
 	}
@@ -298,7 +298,8 @@ func (g *Gateway) chargeFallback(ctx context.Context, rec *record, e *planEntry)
 
 // notifyBudget logs and counts what an admission found: soft thresholds
 // reached for the first time in their window, and notify budgets over
-// their limit. Phase 5 adds the downgrade at the soft threshold.
+// their limit. The downgrade to a budget's soft profile happens when the
+// next request is routed (see budgetState).
 func (g *Gateway) notifyBudget(ctx context.Context, adm budget.Admission) {
 	for _, s := range adm.SoftCrossed {
 		g.metrics.budgetNotices.WithLabelValues(s.Name, noticeSoftThreshold).Inc()
@@ -345,7 +346,7 @@ func (r *record) account() *accounting {
 	if !r.served || d == nil {
 		if s := r.sentTo; s != nil && !r.served {
 			a.pricing = s.Prices
-			a.tokens = usage.Tokens{Input: r.estIn, Output: r.estOut}
+			a.tokens = usage.Tokens{Input: r.estIn(s.Model), Output: r.estOut}
 			a.usageEstimated, a.costKnown = true, false
 			if c, ok := usage.CostFor(s.Model.Type, a.tokens, s.Prices); ok {
 				a.cost = c
@@ -361,7 +362,7 @@ func (r *record) account() *accounting {
 	case r.usage != nil:
 		a.tokens, a.usageKnown = usage.FromUsage(r.usage), true
 	default:
-		a.tokens, a.usageEstimated = usage.EstimateTokens(r.estIn, r.outBytes), true
+		a.tokens, a.usageEstimated = usage.EstimateTokens(r.estIn(d.Model), r.outBytes), true
 	}
 	a.cost, a.costKnown = usage.CostFor(d.Model.Type, a.tokens, d.Prices)
 	return a
@@ -431,6 +432,20 @@ func (r *record) recordUsage(latency time.Duration) {
 	} else if d != nil {
 		addTokens(r.g.metrics.tokens, d, a.tokens)
 	}
+	// Observe mode: the request's tokens priced at the deployment the
+	// router would have chosen, as the baseline is.
+	var shadow *catalog.Deployment
+	var shadowCost usage.Money
+	shadowKnown := false
+	if r.route != nil && r.route.shadow != nil {
+		shadow = r.route.shadow
+		if d != nil && a.costKnown {
+			shadowCost, shadowKnown = usage.CostFor(shadow.Model.Type, a.tokens, shadow.Prices)
+		}
+		if shadowKnown {
+			r.g.metrics.projectedSavings.Add(baseline.Sub(shadowCost).Float64())
+		}
+	}
 	if r.g.ledger == nil || !r.authenticated {
 		return
 	}
@@ -459,6 +474,11 @@ func (r *record) recordUsage(latency time.Duration) {
 		TTFTMS:         ms(r.ttft),
 		Tags:           r.tags,
 		ConfigVersion:  r.g.configVersion,
+		Profile:        r.profile,
+		RoutingMode:    r.routingMode,
+	}
+	if shadow != nil {
+		ev.ShadowDeployment, ev.ShadowCost, ev.ShadowCostKnown = shadow.ID, shadowCost, shadowKnown
 	}
 	switch {
 	case d != nil:

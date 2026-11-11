@@ -27,7 +27,7 @@ func TestScopesFor(t *testing.T) {
 		ID:   "acme",
 		Keys: []config.APIKey{{ID: "k1"}},
 		Budgets: []config.Budget{
-			{Scope: "tenant", Window: "month", LimitUSD: price(t, "2000"), SoftAt: 0.8, OnExhausted: "block"},
+			{Scope: "tenant", Window: "month", LimitUSD: price(t, "2000"), SoftAt: 0.8, SoftProfile: "cheap", OnExhausted: "block"},
 			{Scope: "key", Window: "day", LimitUSD: price(t, "1.5"), OnExhausted: "notify"},
 			{Scope: "tenant", Window: "day", LimitUSD: price(t, "0.0000001"), SoftAt: 0.5, OnExhausted: "block"},
 		},
@@ -38,12 +38,12 @@ func TestScopesFor(t *testing.T) {
 		want  []Scope
 	}{
 		{"with a key", "k1", []Scope{
-			{Tenant: "acme", Window: "month", LimitMicro: 2_000_000_000, SoftAtMicro: 1_600_000_000, Block: true, Name: "acme/month"},
+			{Tenant: "acme", Window: "month", LimitMicro: 2_000_000_000, SoftAtMicro: 1_600_000_000, SoftProfile: "cheap", Block: true, Name: "acme/month"},
 			{Tenant: "acme", KeyID: "k1", Window: "day", LimitMicro: 1_500_000, Block: false, Name: "acme/key:k1/day"},
 			{Tenant: "acme", Window: "day", LimitMicro: 1, SoftAtMicro: 1, Block: true, Name: "acme/day"},
 		}},
 		{"without a key", "", []Scope{
-			{Tenant: "acme", Window: "month", LimitMicro: 2_000_000_000, SoftAtMicro: 1_600_000_000, Block: true, Name: "acme/month"},
+			{Tenant: "acme", Window: "month", LimitMicro: 2_000_000_000, SoftAtMicro: 1_600_000_000, SoftProfile: "cheap", Block: true, Name: "acme/month"},
 			{Tenant: "acme", Window: "day", LimitMicro: 1, SoftAtMicro: 1, Block: true, Name: "acme/day"},
 		}},
 	}

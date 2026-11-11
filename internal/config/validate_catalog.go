@@ -28,7 +28,6 @@ const (
 	// routing needs: input and output for a chat model, input for an
 	// embedding model.
 	MsgPricingUnknown = "pricing unknown; this deployment is ranked last"
-	msgVirtualTarget  = "virtual models arrive in Phase 5"
 )
 
 // qualityCategories are the keys Model.Quality accepts, in documentation
@@ -203,7 +202,9 @@ func PricingKnown(modelType string, p Pricing) bool {
 
 // validateAliases checks every alias name and target. models maps each
 // model id to its first definition, and modelPaths to the path of its id.
-func (st *loadState) validateAliases(aliases map[string]string, models map[string]*Model, modelPaths map[string]string) {
+// A target may also be the virtual model "auto" or "auto:<profile>", where
+// profile is one of profiles.
+func (st *loadState) validateAliases(aliases map[string]string, models map[string]*Model, modelPaths map[string]string, profiles map[string]bool) {
 	names := make([]string, 0, len(aliases))
 	for name := range aliases {
 		names = append(names, name)
@@ -229,7 +230,12 @@ func (st *loadState) validateAliases(aliases map[string]string, models map[strin
 		target := aliases[name]
 		switch modelID, provider, pinned := strings.Cut(target, "@"); {
 		case target == "":
-			st.errorAt(path, "required; set a model id or model@provider")
+			st.errorAt(path, "required; set a model id, model@provider, auto or auto:<profile>")
+		case target == autoModel:
+		case strings.HasPrefix(target, autoPrefix):
+			if prof := strings.TrimPrefix(target, autoPrefix); !profiles[prof] {
+				st.errorAt(path, "target "+st.describe(path, target)+" names an unknown profile (known profiles: "+strings.Join(sortedKeys(profiles), ", ")+")")
+			}
 		case models[target] != nil:
 		case pinned:
 			m := models[modelID]
@@ -241,10 +247,8 @@ func (st *loadState) validateAliases(aliases map[string]string, models map[strin
 			}
 		case hasKey(aliases, target):
 			st.errorAt(path, "target "+st.describe(path, target)+" is another alias; aliases do not chain")
-		case strings.HasPrefix(target, "auto"):
-			st.errorAt(path, "target "+st.describe(path, target)+": "+msgVirtualTarget)
 		default:
-			msg := "target " + st.describe(path, target) + " is not a model id or model@provider"
+			msg := "target " + st.describe(path, target) + " is not a model id, model@provider, auto or auto:<profile>"
 			if s := suggest(target, ids); s != "" && mayQuote(target) {
 				msg += " (did you mean " + st.describe(modelPaths[s], s) + "?)"
 			}
@@ -257,4 +261,14 @@ func (st *loadState) validateAliases(aliases map[string]string, models map[strin
 func hasKey(m map[string]string, k string) bool {
 	_, ok := m[k]
 	return ok
+}
+
+// sortedKeys returns the keys of m, sorted.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
 }

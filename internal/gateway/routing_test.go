@@ -332,7 +332,7 @@ func TestRouting(t *testing.T) {
 			name: "max_tokens that overflows the estimate", body: `{"model":"duo","max_tokens":9223372036854775807,` + msgs + `}`,
 			wantStatus: 400, wantCode: "no_eligible_model", wantMessage: []string{"duo@rich (context 100000 < ", "duo@cheap (context 100000 < "}, wantExcluded: 2,
 		},
-		{name: "virtual model", body: `{"model":"auto:cheap",` + msgs + `}`, wantStatus: 400, wantCode: "model_not_supported", wantMessage: []string{"virtual models arrive in a later phase"}},
+		{name: "virtual model", body: `{"model":"auto:cheap",` + msgs + `}`, wantStatus: 400, wantCode: "model_not_supported", wantMessage: []string{"this policy has no baseline_model; auto routing is disabled"}},
 		{name: "embedding model on chat", body: `{"model":"embed",` + msgs + `}`, wantStatus: 400, wantCode: "model_not_supported", wantMessage: []string{"embedding model"}},
 		{name: "unknown model", body: `{"model":"nope",` + msgs + `}`, wantStatus: 404, wantCode: "model_not_found"},
 		{name: "unknown deployment", body: `{"model":"duo@claude",` + msgs + `}`, wantStatus: 404, wantCode: "model_not_found"},
@@ -630,7 +630,7 @@ func TestEmbeddings(t *testing.T) {
 func TestListModelsAndAliases(t *testing.T) {
 	e := newRoutingEnv(t, false)
 	var ids []string
-	for _, m := range e.g.ListModels() {
+	for _, m := range e.g.ListModels(context.Background()) {
 		ids = append(ids, m.ID)
 	}
 	if diff := cmp.Diff([]string{"duo", "sonnet", "plain", "legacy", "embed", "best", "fast"}, ids); diff != "" {
@@ -656,8 +656,10 @@ func TestEstimates(t *testing.T) {
 	}
 	for _, tt := range in {
 		t.Run("in/"+tt.name, func(t *testing.T) {
-			if got := estimateIn(tt.n, tt.images, tt.inline, tt.model); got != tt.want {
-				t.Errorf("estimateIn = %d, want %d", got, tt.want)
+			rec := &record{}
+			rec.inBytes, rec.inImages = inputSize(tt.n, tt.images, tt.inline)
+			if got := rec.estIn(tt.model); got != tt.want {
+				t.Errorf("estIn = %d, want %d", got, tt.want)
 			}
 		})
 	}

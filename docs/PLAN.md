@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P4 complete** and committed on `main`. Next: P5. CI and the live smoke tests have not run yet. |
+| Status | Design approved. **P0–P5 complete** and committed on `main`. Next: P6 (caching). CI and the live smoke tests have not run yet. |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -274,15 +274,40 @@ Overhead is about +0.1 ms p99 against P2, measured alternating with the P2 build
 
 **Acceptance**
 
-- [ ] Table-driven router tests show three things: the chosen deployment satisfies every hard constraint, no cheaper eligible deployment exists in the same preference tier, and every exclusion carries the correct reason.
-- [ ] A property test over random catalogs and requests checks the first two invariants.
-- [ ] Headers can tighten the policy but never loosen it. Requests for a denied model, a higher cost cap or a disallowed profile are ignored with a warning header, or rejected.
-- [ ] On a committed sanity set of about 100 labeled prompts, at least 80 % land in their labeled difficulty band. Test output lists the misclassified prompts for tuning.
-- [ ] Mixed-workload demo (`make demo-routing`): with `auto:balanced`, easy prompts go to the cheap tier and hard ones to stronger tiers, and the usage API reports savings against the baseline.
-- [ ] In observe mode, 100 % of responses come from the requested model (or the baseline for `auto`), and projected savings are reported separately.
-- [ ] Routing adds ≤ 1 ms at p99 with a 200-deployment catalog, measured by a benchmark.
-- [ ] `switchyard route explain` (offline) and the explain endpoint agree, given the same input and snapshot.
-- [ ] Crossing a budget's soft threshold switches to the soft profile, and the switch is visible in explanations and metrics.
+- [x] Table-driven router tests show three things: the chosen deployment satisfies every hard constraint, no cheaper eligible deployment exists in the same preference tier, and every exclusion carries the correct reason.
+- [x] A property test over random catalogs and requests checks the first two invariants.
+- [x] Headers can tighten the policy but never loosen it. Requests for a denied model, a higher cost cap or a disallowed profile are ignored with a warning header, or rejected.
+- [x] On a committed sanity set of about 100 labeled prompts, at least 80 % land in their labeled difficulty band. Test output lists the misclassified prompts for tuning.
+- [x] Mixed-workload demo (`make demo-routing`): with `auto:balanced`, easy prompts go to the cheap tier and hard ones to stronger tiers, and the usage API reports savings against the baseline.
+- [x] In observe mode, 100 % of responses come from the requested model (or the baseline for `auto`), and projected savings are reported separately.
+- [x] Routing adds ≤ 1 ms at p99 with a 200-deployment catalog, measured by a benchmark.
+- [x] `switchyard route explain` (offline) and the explain endpoint agree, given the same input and snapshot.
+- [x] Crossing a budget's soft threshold switches to the soft profile, and the switch is visible in explanations and metrics.
+
+**P5 outcome.**
+
+All nine criteria pass.
+
+**Routing demo** (`make demo-routing`, 90 prompts from the sanity set as `auto:balanced`):
+- all 30 easy prompts went to the cheap tier;
+- 21 of the 30 hard prompts went to the strong tier;
+- cost came out 58% below sending everything to the strong model.
+
+**Supporting measurements:**
+- The quality assessor puts 99 of 105 labeled prompts in their band.
+- A routing decision over 200 deployments takes about 72 µs (p99 about 0.2 ms).
+- Observe mode serves only the requested or baseline model while reporting projected savings separately.
+
+**Review fixes.** Independent security and correctness reviews found 12 issues. All are fixed with regression tests.
+- **Rule layering.** Rules are split into two layers so that prompt content can't skip a cost cap. Governance rules match only on trusted facts and set anything. Quality rules match on content or hints and may only set `min_quality` and `prefer`.
+- **Per-model token ratio.** Auto routing now applies each model's `token_ratio`; before, cost caps and budgets could be underestimated by up to 10×.
+- **Embeddings** now obey cost caps.
+- **Quality header clamp.** `X-Switchyard-Min-Quality` is clamped to the caller's allowed profiles and to any soft downgrade.
+- **Rule profiles** now override the client's choice.
+- **Exact cost caps.** Caps are exact, in nano-USD.
+- **Offline explain** no longer needs production secrets.
+
+**Overhead.** P5 adds roughly 0.5 ms p99 at the gateway level on this loaded machine, and both builds miss the 5 ms gate there. The routing step itself is about 0.09 ms; profiling puts most of the CPU in the synchronous access-log write, which P7 addresses.
 
 ## P6: Exact and semantic caching
 

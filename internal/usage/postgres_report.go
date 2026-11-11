@@ -80,12 +80,13 @@ var aggregateSQL = strings.Join([]string{
 	"COALESCE(sum(overhead_cost_usd), 0)::text",
 	"COALESCE(sum(baseline_cost_usd - cost_usd) FILTER (WHERE cost_known AND cache_status <> '" + CacheStatusHit + "'), 0)::text",
 	"COALESCE(sum(baseline_cost_usd) FILTER (WHERE cost_known AND cache_status = '" + CacheStatusHit + "'), 0)::text",
+	"COALESCE(sum(baseline_cost_usd - shadow_cost_usd) FILTER (WHERE cost_known AND shadow_cost_known AND routing_mode = '" + RoutingModeObserve + "'), 0)::text",
 	// The sort key: known cost plus overhead, as Totals.CostUSD.
 	"COALESCE(sum(cost_usd) FILTER (WHERE cost_known), 0) + COALESCE(sum(overhead_cost_usd), 0) AS sort_cost",
 }, ",\n\t")
 
 // aggregateColumns is the number of columns aggregateSQL selects.
-const aggregateColumns = 15
+const aggregateColumns = 16
 
 // dimensionSQL returns the SQL expression for the validated dimension g. A
 // tag dimension's key is bound as argument number arg.
@@ -107,6 +108,10 @@ func dimensionSQL(g string, arg int) string {
 		return "CASE WHEN status BETWEEN 100 AND 599 THEN (status / 100)::text || 'xx' ELSE 'other' END"
 	case GroupByCacheStatus:
 		return "cache_status"
+	case GroupByProfile:
+		return "profile"
+	case GroupByRoutingMode:
+		return "routing_mode"
 	}
 	return "COALESCE(tags ->> $" + strconv.Itoa(arg) + ", '')"
 }
@@ -228,7 +233,7 @@ func queryGroups(ctx context.Context, tx pgx.Tx, q Query, where string, args []a
 // scanAccumulator scans a row of len(values) group values followed by the
 // aggregateSQL columns into values and a.
 func scanAccumulator(row pgx.Row, values []string, a *accumulator) error {
-	var cost, baseline, overhead, routing, cache string
+	var cost, baseline, overhead, routing, cache, projected string
 	var sortCost any
 	dest := make([]any, 0, len(values)+aggregateColumns)
 	for i := range values {
@@ -237,7 +242,7 @@ func scanAccumulator(row pgx.Row, values []string, a *accumulator) error {
 	dest = append(dest,
 		&a.requests, &a.errors, &a.unpriced, &a.cacheHits, &a.fallbacks,
 		&a.tokens.Input, &a.tokens.CachedInput, &a.tokens.CacheWrite, &a.tokens.Output,
-		&cost, &baseline, &overhead, &routing, &cache, &sortCost)
+		&cost, &baseline, &overhead, &routing, &cache, &projected, &sortCost)
 	if err := row.Scan(dest...); err != nil {
 		return err
 	}
@@ -246,6 +251,7 @@ func scanAccumulator(row pgx.Row, values []string, a *accumulator) error {
 		dst  *Money
 	}{
 		{cost, &a.cost}, {baseline, &a.baseline}, {overhead, &a.overhead}, {routing, &a.routing}, {cache, &a.cache},
+		{projected, &a.projected},
 	} {
 		m, err := ParseMoney(f.text)
 		if err != nil {

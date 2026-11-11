@@ -39,8 +39,8 @@ func TestUnknownFields(t *testing.T) {
 		},
 		{
 			name: "no suggestion when nothing is close",
-			root: "version: 1\npolicies: {}\n",
-			want: want{sev: SeverityError, file: rootFile, line: 2, path: "policies", msg: "unknown field"},
+			root: "version: 1\nwidgets: {}\n",
+			want: want{sev: SeverityError, file: rootFile, line: 2, path: "widgets", msg: "unknown field"},
 		},
 	}
 	for _, tt := range tests {

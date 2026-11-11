@@ -34,14 +34,22 @@ func money(t *testing.T, s string) usage.Money {
 func seeded(t *testing.T) *usage.MemoryLedger {
 	t.Helper()
 	l := usage.NewMemoryLedger()
-	ev := func(tenant, model string, at time.Time, cost, baseline string, status int) {
-		l.Record(&usage.Event{
+	ev := func(tenant, model string, at time.Time, cost, baseline string, status int, edit ...func(*usage.Event)) {
+		e := &usage.Event{
 			ID: tenant + model + at.String(), Time: at, Tenant: tenant, KeyID: tenant + "-key", RequestedModel: model,
 			Status: status, Cost: money(t, cost), CostKnown: true, BaselineCost: money(t, baseline),
 			Tokens: usage.Tokens{Input: 10, Output: 5}, CacheStatus: usage.CacheStatusMiss,
-		})
+		}
+		for _, f := range edit {
+			f(e)
+		}
+		l.Record(e)
 	}
-	ev("a", "m1", now.Add(-time.Hour), "0.25", "0.5", 200)
+	// In observe mode, with a shadow deployment that would have cost 0.1.
+	ev("a", "m1", now.Add(-time.Hour), "0.25", "0.5", 200, func(e *usage.Event) {
+		e.RoutingMode, e.ShadowDeployment = usage.RoutingModeObserve, "m0@p"
+		e.ShadowCost, e.ShadowCostKnown = money(t, "0.1"), true
+	})
 	ev("a", "m1", now.Add(-2*time.Hour), "0.000000000000001", "0.000000000000001", 200)
 	ev("a", "m2", now.Add(-26*time.Hour), "1.5", "1.5", 502)
 	ev("a", "m1", now.Add(-30*24*time.Hour), "100", "100", 200) // outside the default period
@@ -79,23 +87,26 @@ func TestTenantReport(t *testing.T) {
 			"requests": 3.0, "errors": 1.0, "unpriced_requests": 0.0,
 			"tokens":   map[string]any{"input": 30.0, "cached_input": 0.0, "cache_write": 0.0, "output": 15.0},
 			"cost_usd": "1.750000000000001", "baseline_cost_usd": "2.000000000000001", "overhead_usd": "0",
-			"savings_usd":    map[string]any{"routing": "0.25", "cache": "0", "net": "0.25"},
-			"cache_hit_rate": 0.0, "fallback_rate": 0.0,
+			"savings_usd":           map[string]any{"routing": "0.25", "cache": "0", "net": "0.25"},
+			"projected_savings_usd": "0.4",
+			"cache_hit_rate":        0.0, "fallback_rate": 0.0,
 		},
 		"groups": []any{
 			map[string]any{
 				"model": "m2", "requests": 1.0, "errors": 1.0, "unpriced_requests": 0.0,
 				"tokens":   map[string]any{"input": 10.0, "cached_input": 0.0, "cache_write": 0.0, "output": 5.0},
 				"cost_usd": "1.5", "baseline_cost_usd": "1.5", "overhead_usd": "0",
-				"savings_usd":    map[string]any{"routing": "0", "cache": "0", "net": "0"},
-				"cache_hit_rate": 0.0, "fallback_rate": 0.0,
+				"savings_usd":           map[string]any{"routing": "0", "cache": "0", "net": "0"},
+				"projected_savings_usd": "0",
+				"cache_hit_rate":        0.0, "fallback_rate": 0.0,
 			},
 			map[string]any{
 				"model": "m1", "requests": 2.0, "errors": 0.0, "unpriced_requests": 0.0,
 				"tokens":   map[string]any{"input": 20.0, "cached_input": 0.0, "cache_write": 0.0, "output": 10.0},
 				"cost_usd": "0.250000000000001", "baseline_cost_usd": "0.500000000000001", "overhead_usd": "0",
-				"savings_usd":    map[string]any{"routing": "0.25", "cache": "0", "net": "0.25"},
-				"cache_hit_rate": 0.0, "fallback_rate": 0.0,
+				"savings_usd":           map[string]any{"routing": "0.25", "cache": "0", "net": "0.25"},
+				"projected_savings_usd": "0.4",
+				"cache_hit_rate":        0.0, "fallback_rate": 0.0,
 			},
 		},
 	}
@@ -138,7 +149,8 @@ func TestQueryParameters(t *testing.T) {
 		{"from after to", "from=2026-11-12&to=2026-11-10", 400, "from", 0, "", ""},
 		{"bad from", "from=yesterday", 400, "from", 0, "", ""},
 		{"bad to", "to=2026-13-01", 400, "to", 0, "", ""},
-		{"unknown dimension", "group_by=profile", 400, "", 0, "", ""},
+		{"unknown dimension", "group_by=persona", 400, "", 0, "", ""},
+		{"profile and routing mode", "group_by=profile,routing_mode", 200, "", 3, "2026-11-04T12:00:00Z", "2026-11-11T12:00:00Z"},
 		{"repeated dimension", "group_by=model,model", 400, "", 0, "", ""},
 		{"empty dimension", "group_by=model,,day", 400, "group_by", 0, "", ""},
 		{"bad tag", "group_by=tag:Team", 400, "", 0, "", ""},
@@ -162,7 +174,7 @@ func TestQueryParameters(t *testing.T) {
 				if e["code"] != codeInvalidQuery || e["type"] != "invalid_request_error" || param != tt.param {
 					t.Errorf("error %s", raw)
 				}
-				for _, v := range []string{"yesterday", "profile", "Team", "ten"} {
+				for _, v := range []string{"yesterday", "persona", "Team", "ten"} {
 					if strings.Contains(e["message"].(string), v) {
 						t.Errorf("the message echoes %q: %s", v, raw)
 					}

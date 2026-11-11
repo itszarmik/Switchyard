@@ -35,6 +35,8 @@ type Config struct {
 	Aliases map[string]string `yaml:"aliases"`
 	Routing Routing           `yaml:"routing"`
 	Budgets Budgets           `yaml:"budgets"`
+	// Policies are referenced by tenants and keys (DESIGN §13).
+	Policies []Policy `yaml:"policies"`
 }
 
 // Server configures the public and admin HTTP listeners.
@@ -273,6 +275,18 @@ type Routing struct {
 	// keep-alive no fallback is possible, and a failure becomes an error
 	// event in the stream. Default 0s (off).
 	StreamKeepalive Duration `yaml:"stream_keepalive"`
+	// DefaultProfile is the profile used when a policy names none and for
+	// plain "auto". Default "balanced".
+	DefaultProfile string `yaml:"default_profile"`
+	// Profiles are routing objectives plus constraints, selected with
+	// model "auto:<name>" (DESIGN §9.3). When none are configured the
+	// built-in cheap, balanced, quality and fast profiles apply.
+	Profiles map[string]Profile `yaml:"profiles"`
+	// ExpectedOutputTokens is the output estimate when a request sets no
+	// max_tokens. Default 500.
+	ExpectedOutputTokens int64 `yaml:"expected_output_tokens"`
+	// Assessor configures request difficulty assessment (DESIGN §10.3).
+	Assessor AssessorConfig `yaml:"assessor"`
 }
 
 // Fallback bounds the attempts the gateway makes for one request.
@@ -356,6 +370,9 @@ type Tenant struct {
 	// Budgets cap this tenant's spend (DESIGN §12.3). A budget with scope
 	// key applies to each of the tenant's keys separately.
 	Budgets []Budget `yaml:"budgets"`
+	// Policy names the tenant's policy. Empty means the policy with ID
+	// "default" if one exists, otherwise built-in defaults.
+	Policy string `yaml:"policy"`
 }
 
 // Budget is a spend limit over a calendar window in UTC.
@@ -373,6 +390,9 @@ type Budget struct {
 	// budget_exceeded) or notify (they are served, logged and counted).
 	// Default block.
 	OnExhausted string `yaml:"on_exhausted"`
+	// SoftProfile, when set with SoftAt, is the profile "auto" requests use
+	// once the soft threshold has been crossed in the current window.
+	SoftProfile string `yaml:"soft_profile"`
 }
 
 // Budgets holds gateway-wide budget settings.
@@ -392,6 +412,127 @@ type APIKey struct {
 	// Hash is "sha256:" followed by 64 lowercase hex characters: the SHA-256
 	// of the full plaintext key. Hashes must be unique across all tenants.
 	Hash string `yaml:"hash"`
-	// Tags are matched by policies in later phases, e.g. prod, eu.
+	// Tags are matched by policy rules (key_tags), e.g. prod, eu.
 	Tags []string `yaml:"tags"`
+	// Policy, when set, overrides the tenant's policy for this key.
+	Policy string `yaml:"policy"`
+}
+
+// Profile is a routing objective plus constraints (DESIGN §9.3).
+type Profile struct {
+	// MinQuality is the quality bar in [0, 1] (DESIGN §10.4).
+	MinQuality float64 `yaml:"min_quality"`
+	// Objective is cost (cheapest eligible) or latency (fastest eligible
+	// by estimated time to first token). Default cost.
+	Objective string `yaml:"objective"`
+	// MaxTTFTMs, when > 0, is a soft latency target in milliseconds.
+	MaxTTFTMs int64 `yaml:"max_ttft_ms"`
+}
+
+// AssessorConfig configures the request assessor.
+type AssessorConfig struct {
+	// Type is heuristic, the only kind in Phase 5. Default heuristic.
+	Type string `yaml:"type"`
+	// Weights overrides the heuristic's signal weights by signal name; see
+	// internal/quality for the names and defaults.
+	Weights map[string]float64 `yaml:"weights"`
+}
+
+// Policy is governance attached to tenants and keys (DESIGN §13).
+type Policy struct {
+	// ID names the policy. Same rules as Provider.ID.
+	ID string `yaml:"id"`
+	// Profile is the default profile for "auto" requests. Empty means
+	// routing.default_profile.
+	Profile string `yaml:"profile"`
+	// AllowedProfiles lists the profiles callers may select by model name or
+	// header. Empty means all.
+	AllowedProfiles []string `yaml:"allowed_profiles"`
+	// Allow and Deny are glob patterns over deployment IDs (model@provider).
+	// Empty Allow means allow all; Deny wins over Allow.
+	Allow []string `yaml:"allow"`
+	Deny  []string `yaml:"deny"`
+	// Prefer lists ordered globs; earlier patterns form higher preference
+	// tiers, and cost decides within a tier.
+	Prefer []string `yaml:"prefer"`
+	// RequireTags: a deployment must carry all of these tags (provider tags
+	// plus deployment tags).
+	RequireTags []string `yaml:"require_tags"`
+	// Substitution says whether a concrete model name may be served by a
+	// different model.
+	Substitution Substitution `yaml:"substitution"`
+	// RoutingMode is enforce or observe. Default enforce.
+	RoutingMode string `yaml:"routing_mode"`
+	// BaselineModel is the savings baseline for "auto" requests and the model
+	// served for them in observe mode. Required when auto is allowed.
+	BaselineModel string `yaml:"baseline_model"`
+	// MaxCostPerRequestUSD is a hard cap on a request's estimated cost.
+	MaxCostPerRequestUSD Price `yaml:"max_cost_per_request_usd"`
+	// OnUnmet is best_effort or reject: what happens when no candidate meets
+	// the soft constraints (quality, latency). Default best_effort.
+	OnUnmet string `yaml:"on_unmet"`
+	// Rules are evaluated in order; the first whose match holds applies its
+	// set.
+	Rules []Rule `yaml:"rules"`
+}
+
+// Substitution configures cross-model substitution for concrete model names.
+type Substitution struct {
+	// Mode is pinned (only the requested model) or equivalent. Default
+	// pinned.
+	Mode string `yaml:"mode"`
+	// MaxQualityDrop is how far below the requested model's estimate a
+	// substitute may be, in [0, 1]. Default 0.05.
+	MaxQualityDrop float64 `yaml:"max_quality_drop"`
+}
+
+// Rule is one policy rule.
+type Rule struct {
+	Name  string         `yaml:"name"`
+	Match RuleMatch      `yaml:"match"`
+	Set   PolicyOverride `yaml:"set"`
+}
+
+// RuleMatch holds when every condition that is set holds. An empty match is
+// unconditional.
+type RuleMatch struct {
+	// Model is a glob over the requested model name.
+	Model string `yaml:"model"`
+	// Profile matches the requested profile.
+	Profile string `yaml:"profile"`
+	// Task matches the assessed (or hinted) category.
+	Task string `yaml:"task"`
+	// DifficultyGte and DifficultyLt bound the assessed difficulty; 0 means
+	// unset.
+	DifficultyGte float64 `yaml:"difficulty_gte"`
+	DifficultyLt  float64 `yaml:"difficulty_lt"`
+	// Key matches the API key ID; KeyTags requires all of these key tags.
+	Key     string   `yaml:"key"`
+	KeyTags []string `yaml:"key_tags"`
+	// Header maps a header name to a glob its value must match.
+	Header map[string]string `yaml:"header"`
+	// Tags maps an X-Switchyard-Tags key to a glob its value must match.
+	Tags map[string]string `yaml:"tags"`
+	// Stream, HasTools and HasImages are "true" or "false"; empty means
+	// either.
+	Stream    string `yaml:"stream"`
+	HasTools  string `yaml:"has_tools"`
+	HasImages string `yaml:"has_images"`
+	// EstInputTokensGte matches requests at least this large; 0 means unset.
+	EstInputTokensGte int64 `yaml:"est_input_tokens_gte"`
+}
+
+// PolicyOverride is what a rule sets. Zero values and nil slices mean "keep
+// the policy's value".
+type PolicyOverride struct {
+	Profile              string       `yaml:"profile"`
+	MinQuality           float64      `yaml:"min_quality"`
+	Prefer               []string     `yaml:"prefer"`
+	Allow                []string     `yaml:"allow"`
+	Deny                 []string     `yaml:"deny"`
+	RequireTags          []string     `yaml:"require_tags"`
+	Substitution         Substitution `yaml:"substitution"`
+	RoutingMode          string       `yaml:"routing_mode"`
+	MaxCostPerRequestUSD Price        `yaml:"max_cost_per_request_usd"`
+	OnUnmet              string       `yaml:"on_unmet"`
 }

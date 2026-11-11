@@ -116,10 +116,13 @@ func (st *loadState) validate(c *Config) {
 	st.validateStorage(&c.Storage)
 	providers := st.validateProviders(c.Providers)
 	models, modelPaths := st.validateModels(c.Models, providers)
-	st.validateAliases(c.Aliases, models, modelPaths)
+	profiles := st.validateProfiles(&c.Routing)
+	st.validateAliases(c.Aliases, models, modelPaths, profiles)
 	st.validateTenants(c.Tenants)
 	st.validateBudgets(&c.Budgets)
 	st.validateRouting(&c.Routing)
+	refs := st.validatePolicies(c.Policies, profiles, models, c.Aliases)
+	st.validatePolicyRefs(c.Tenants, refs)
 	st.checkLiteralSecrets(c)
 }
 

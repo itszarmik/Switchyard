@@ -7,7 +7,7 @@ Switchyard is a cost-aware, OpenAI-compatible LLM inference gateway written in G
 
 ## Status
 
-**Phase 4: cost accounting, ledger and budgets.** Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment of the requested model that has every capability the request needs, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Every request gets an exact cost in a usage ledger (memory or Postgres) with tenant-scoped reports, and tenants and keys can have daily or monthly budgets (see [Usage ledger and reporting](#usage-ledger-and-reporting) and [Budgets](#budgets)). Cost-aware model choice and caching come in later phases ([docs/PLAN.md](docs/PLAN.md)).
+**Phase 5: cost-aware routing, quality scoring and the rule engine.** Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment that has every capability it needs and meets its policy, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Every request gets an exact cost in a usage ledger (memory or Postgres) with tenant-scoped reports, and tenants and keys can have daily or monthly budgets (see [Usage ledger and reporting](#usage-ledger-and-reporting) and [Budgets](#budgets)). With `model: "auto"`, a policy with a baseline model, and quality priors in the catalog, the gateway picks the cheapest model whose estimated quality for the request clears the profile's bar, explains every decision, and measures the savings against the baseline (see [Routing](#routing)). Caching comes in a later phase ([docs/PLAN.md](docs/PLAN.md)).
 
 ## Quickstart
 
@@ -268,10 +268,13 @@ curl -N localhost:8080/v1/chat/completions \
 | Header | Value |
 |---|---|
 | `X-Request-Id` | The gateway's request ID, also in every log line for the request. |
-| `X-Switchyard-Model` | The catalog model that served the request. |
+| `X-Switchyard-Model` | The catalog model that served the request; with `auto`, or after a cross-model fallback, the model routing chose. |
 | `X-Switchyard-Provider` | The provider id of the deployment that answered (on an error, of the last one tried). |
 | `X-Switchyard-Attempts` | The number of upstream attempts, retries and fallbacks included. |
-| `X-Switchyard-Route-Reason` | `cheapest_eligible`, `pinned` (a `model@provider` request), or `fallback:<kind>` when a fallback answered, `<kind>` being the failure that caused the first fallback, such as `fallback:server_error`. |
+| `X-Switchyard-Route-Reason` | `cheapest_eligible`, `pinned` (a `model@provider` request), `preferred` (a policy `prefer` tier decided over a cheaper deployment), `quality_relaxed` or `latency_relaxed` (no deployment met the soft constraint, so it was relaxed), `budget_downgrade` (a budget's `soft_profile` is in force), `observe` (observe mode served what was asked for), or `fallback:<kind>` when a fallback answered, `<kind>` being the failure that caused the first fallback, such as `fallback:server_error`. See [Routing](#routing). |
+| `X-Switchyard-Profile` | The routing profile in force (chat and legacy completions). |
+| `X-Switchyard-Policy-Warning` | The request headers the policy ignored because they would have loosened it, `; `-separated. |
+| `X-Switchyard-Shadow-Model` | In observe mode, the model routing would have chosen. |
 | `X-Switchyard-Alias` | The alias the client sent, when it sent one. |
 | `X-Switchyard-Dropped-Params` | The request parameters removed because the deployment cannot honor them, such as `n, temperature`. |
 | `X-Switchyard-Shim` | `chat` when a legacy completion was served through Chat Completions. |
@@ -290,8 +293,9 @@ Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `
 | Body larger than `server.max_request_bytes` | 413 | `request_too_large` |
 | Body not received within `server.body_read_timeout` (default 60s) | 408 | `request_timeout` |
 | Unknown model or `model@provider` | 404 | `model_not_found` |
-| Virtual model (`auto…`), or a model of the wrong type (an embedding model on chat, a chat model on embeddings) | 400 | `model_not_supported` |
-| No deployment has every capability the request needs, or fits the context window | 400 | `no_eligible_model`; the message names each deployment and why it was excluded |
+| `auto` or `auto:<profile>` the policy does not allow (no `baseline_model`, an unknown or disallowed profile), a virtual model on embeddings, or a model of the wrong type (an embedding model on chat, a chat model on embeddings) | 400 | `model_not_supported` |
+| A malformed `X-Switchyard-Profile`, `-Max-Cost-Usd`, `-Min-Quality`, `-Max-TTFT-Ms`, `-Task` or `-Difficulty` header, or one given twice; the value is never echoed | 400 | `invalid_header`; `param` names the header |
+| No deployment has every capability the request needs, fits the context window, passes the policy (deny, allow, `require_tags`, cost cap), or (with `on_unmet: reject`) meets the soft constraints | 400 | `no_eligible_model`; the message names each deployment and why it was excluded |
 | A legacy completion parameter the chat shim cannot honor | 400 | `unsupported_parameter`; `param` names it |
 | `X-Switchyard-Timeout-Ms` not a positive whole number | 400 | `invalid_timeout` |
 | `X-Switchyard-Tags` malformed (see [Usage ledger and reporting](#usage-ledger-and-reporting)); the value is never echoed | 400 | `invalid_tags` |
@@ -307,7 +311,7 @@ Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `
 
 When a request was retried or fell back and every attempt failed, the answer is the most informative failure: 504 if the deadline expired, the provider's 429 if every failure was a rate limit, and otherwise, in order of preference, a context-length or not-found error, a 5xx, a timeout, an authentication failure, a connection failure, and last an adapter's local rejection (`unsupported`), which is the answer only when every attempt was rejected so. The `X-Switchyard-Provider` and `X-Switchyard-Upstream-Request-Id` headers are those of the attempt whose failure is the answer.
 
-Each request is logged at INFO as one `request` access-log line. For the chat, completions and embeddings endpoints it also carries the tenant, key id, requested model, the `deployment` of the last attempt, the number of `excluded` deployments, `attempts`, `attempt_chain` (each attempt as `deployment:outcome`, such as `m@a:server_error,m@a:server_error,m@b:ok`, at most ten), `fallback_reason` (the failure kind that caused the first fallback, when there was one), `deadline_ms`, latency, TTFT, gateway overhead, token counts and `cost_usd` (when the cost is known), plus the `alias` and the `dropped_params` (comma-separated) when there are any, never the prompt or the response.
+Each request is logged at INFO as one `request` access-log line. For the chat, completions and embeddings endpoints it also carries the tenant, key id, requested model, the `deployment` of the last attempt, the number of `excluded` deployments, `attempts`, `attempt_chain` (each attempt as `deployment:outcome`, such as `m@a:server_error,m@a:server_error,m@b:ok`, at most ten), `fallback_reason` (the failure kind that caused the first fallback, when there was one), `deadline_ms`, latency, TTFT, gateway overhead, token counts and `cost_usd` (when the cost is known), plus the `alias` and the `dropped_params` (comma-separated) when there are any, never the prompt or the response. Chat and legacy completion requests also log their routing: `profile`, `matched_rule` and `matched_quality_rule` (when a rule of each layer applied), `policy`, `routing_mode`, the assessment's `category` and `difficulty`, `quality_bar`, `served_q` (the served deployment's estimated quality), `relaxed` (the relaxed soft constraints, when any) and, in observe mode, `shadow_deployment`.
 
 **Legacy completions.** `POST /v1/completions` takes the legacy OpenAI shape (`prompt` a string or an array of strings; token arrays get 400). A deployment with the `completions` capability on an OpenAI-wire provider gets the request natively and losslessly. Any other deployment is served through the chat shim, marked `X-Switchyard-Shim: chat`: the prompt becomes one user message; `max_tokens`, `temperature`, `top_p`, `stop`, `n`, `stream`, `stream_options`, `user`, `seed` and the penalties carry over (other legacy fields, such as `logit_bias`, are not sent); and the answer, streamed or not, comes back as `text_completion` objects with `choices[].text`. The shim cannot honor `echo`, `suffix`, `logprobs`, `best_of` above 1 or more than one prompt: such a request goes to a native deployment if the model has one, and otherwise gets 400 `unsupported_parameter`. Capability filtering and dropping work as for chat. The legacy default of 16 `max_tokens` is not applied by the shim.
 
@@ -316,13 +320,13 @@ curl localhost:8080/v1/completions -H "Authorization: Bearer $SWITCHYARD_API_KEY
   -H "Content-Type: application/json" -d '{"model":"gpt-6-luna","prompt":"Say hello","max_tokens":20}'
 ```
 
-**Embeddings.** `POST /v1/embeddings` takes `model`, `input` (a string, an array of strings, or token arrays, which are passed through), `encoding_format` (`float` or `base64`), `dimensions` and `user`, and is forwarded losslessly. The model must be an embedding model. Its deployments are tried cheapest input price first, with retries and fallback as for chat, so the provider may change but the model never does. Only OpenAI-wire providers serve embeddings; an Anthropic deployment is excluded with "provider does not serve embeddings".
+**Embeddings.** `POST /v1/embeddings` takes `model`, `input` (a string, an array of strings, or token arrays, which are passed through), `encoding_format` (`float` or `base64`), `dimensions` and `user`, and is forwarded losslessly. The model must be an embedding model, never `auto`. Its deployments are tried cheapest input price first, with retries and fallback as for chat, so the provider may change but the model never does: vectors from different models are not interchangeable. The policy's `deny`, `allow` and `require_tags` apply to embedding deployments, and so does its `max_cost_per_request_usd` (or a lower `X-Switchyard-Max-Cost-Usd`), against each deployment's estimated input cost; its profiles, substitution and routing mode do not. Only OpenAI-wire providers serve embeddings; an Anthropic deployment is excluded with "provider does not serve embeddings".
 
-**Models.** `GET /v1/models` lists every catalog model, chat and embedding, then every alias, all with `owned_by: "switchyard"`. Metrics (`switchyard_requests_total`, which also counts requests rejected for a bad key, `switchyard_upstream_requests_total`, `switchyard_overhead_duration_seconds` and others) are on the admin listener's `/metrics`.
+**Models.** `GET /v1/models` lists every catalog model, chat and embedding, then the virtual models the key's policy allows (`auto` and `auto:<profile>` for each profile it may select; none without a `baseline_model`), then every alias, all with `owned_by: "switchyard"`. Metrics (`switchyard_requests_total`, which also counts requests rejected for a bad key, `switchyard_upstream_requests_total`, `switchyard_overhead_duration_seconds` and others) are on the admin listener's `/metrics`.
 
 ## Reliability
 
-Every request runs on a **plan**: the deployments of the requested model that can serve it, cheapest first, at most `routing.fallback.max_deployments` (default 3). Each fallback slot prefers a provider that is not in the plan yet. A pinned `model@provider` is a plan of one, and fallback never switches to a different model. Deployments that are unhealthy right now are left out of the plan: an open circuit breaker, a rate-limit cooldown, or a provider at its `max_concurrency`. If that leaves none, the answer is 503 `no_healthy_upstream`, naming each deployment and why ("circuit open", "rate-limit cooldown 4s", "provider at max_concurrency 64"). A request that no deployment could honor at all still gets 400 `no_eligible_model`.
+Every request runs on a **plan**: the deployments that can serve it, best first (see [Routing](#routing)), at most `routing.fallback.max_deployments` (default 3). Each fallback slot prefers a provider that is not in the plan yet. A pinned `model@provider` is a plan of one. A concrete model name under `pinned` substitution (the default) plans only that model's deployments, so fallback never switches models; `auto` and `equivalent` substitution plan across models, so a fallback may be another model that passed the same checks. Deployments that are unhealthy right now are left out of the plan: an open circuit breaker, a rate-limit cooldown, or a provider at its `max_concurrency`. If that leaves none, the answer is 503 `no_healthy_upstream`, naming each deployment and why ("circuit open", "rate-limit cooldown 4s", "provider at max_concurrency 64"). A request that no deployment could honor at all still gets 400 `no_eligible_model`.
 
 Each plan entry gets up to `1 + retries_per_deployment` attempts, then the next entry is tried. What happens after a failure depends on its kind:
 
@@ -377,7 +381,7 @@ routing:
   stream_keepalive: 0s          # 0s is off
 ```
 
-**Visibility.** Besides the response headers and log fields above, the admin listener's `/metrics` has `switchyard_retries_total{deployment,kind}`, `switchyard_fallbacks_total{from,to,kind}`, `switchyard_circuit_state{deployment}` (0 closed, 1 half-open, 2 open), `switchyard_circuit_transitions_total{deployment,to}`, `switchyard_rate_limit_cooldowns_total{deployment}`, `switchyard_provider_in_flight{provider}`, `switchyard_provider_saturated_total{provider}` and `switchyard_retry_budget_exhausted_total{deployment}`. `switchyard_upstream_requests_total` counts every attempt, by outcome. `GET /admin/v1/providers` on the admin listener reports, for every provider, its `in_flight` count and `max_concurrency`, and for each of its deployments the breaker state and the time of its next transition, `cooldown_until`, the recent request and failure counts, the retry budget used, and the TTFT and tokens-per-second statistics (EWMAs, seeded from the catalog's `latency_hint` until there are 20 samples), with their sample counts. It holds no secrets.
+**Visibility.** Besides the response headers and log fields above, the admin listener's `/metrics` has `switchyard_retries_total{deployment,kind}`, `switchyard_fallbacks_total{from,to,kind}`, `switchyard_circuit_state{deployment}` (0 closed, 1 half-open, 2 open), `switchyard_circuit_transitions_total{deployment,to}`, `switchyard_rate_limit_cooldowns_total{deployment}`, `switchyard_provider_in_flight{provider}`, `switchyard_provider_saturated_total{provider}` (attempts refused because the provider reached `max_concurrency` between planning and the attempt; routing around a saturated provider, and explaining a request, count nothing) and `switchyard_retry_budget_exhausted_total{deployment}`. `switchyard_upstream_requests_total` counts every attempt, by outcome. `GET /admin/v1/providers` on the admin listener reports, for every provider, its `in_flight` count and `max_concurrency`, and for each of its deployments the breaker state and the time of its next transition, `cooldown_until`, the recent request and failure counts, the retry budget used, and the TTFT and tokens-per-second statistics (EWMAs, seeded from the catalog's `latency_hint` until there are 20 samples), with their sample counts. It holds no secrets.
 
 ```sh
 curl -s localhost:9090/admin/v1/providers | jq '.providers[].deployments[] | {id, breaker: .breaker.state, cooldown_until}'
@@ -402,7 +406,7 @@ Every request gets one usage event when it completes, whatever the outcome: succ
 - **Missing usage.** When the upstream reports no usage, for example a stream that broke off after it started, the input is the gateway's own estimate (bytes/4 of the request, scaled by the model's `token_ratio`) and the output is estimated at one token per 4 bytes of the output text relayed (content, refusals, reasoning and tool-call arguments), and the event is marked `usage_estimated`. A stream that broke off after reporting part of its usage (Anthropic reports the input when the stream starts and the output only at its end) keeps the input it reported and counts the larger of the reported output and the relayed output, also marked `usage_estimated`.
 - **Requests no upstream served.** A request rejected before any upstream had it (routing errors, budget rejections, a parameter the deployment cannot take, a connection that failed before the request was sent) and a request an upstream refused with a 4xx cost 0. A request that reached an upstream but was never served, because the client went away, the deadline expired, the connection broke or the upstream answered 5xx, may still have been billed: it is recorded with the deployment and provider of the last such attempt, its estimated tokens and cost (see [Budgets](#budgets)), `usage_estimated`, and an unknown cost, so it counts in `unpriced_requests`.
 - **Prices are snapshotted** into each event, so a later catalog edit never rewrites history.
-- **Savings.** The baseline is the requested model, priced at its cheapest priced deployment for the same token counts. Routing savings are `baseline − cost`; they come only from provider arbitrage until Phase 5, and are negative when a fallback went to a pricier provider. Cache savings and overhead are recorded as 0 until the caches arrive in Phase 6.
+- **Savings.** The baseline is the requested model for a concrete model name, or the policy's `baseline_model` for `auto`, priced at its cheapest priced deployment for the same token counts. Routing savings are `baseline − cost`: from provider arbitrage, and from `auto` or `equivalent` routing to a cheaper model. They are negative when a fallback went to something pricier. In observe mode, the event also records the deployment routing would have chosen (`shadow_deployment`) and the same tokens priced at it. Cache savings and overhead are recorded as 0 until the caches arrive in Phase 6.
 
 **Storage.** `storage.ledger.driver` selects where events go:
 
@@ -432,13 +436,14 @@ Log lines about the ledger carry event IDs and counts, never event contents.
 
 **Attribution tags.** A client sends `X-Switchyard-Tags: k=v,k2=v2` to tag a request's usage event, for example by team or feature, and reports group by `tag:<key>`. At most 10 tags; keys are 1 to 32 characters of `a-z`, `0-9`, `_`, `.` and `-`, starting with a letter or digit, each at most once; values are 1 to 64 printable ASCII characters other than `,` and `=`; spaces around keys and values are ignored, and several header lines are joined. A malformed header gets 400 `invalid_tags`, without echoing it.
 
-**Metrics.** On the admin `/metrics`: `switchyard_cost_usd_total{provider,model}` (a float approximation of the ledger's exact sums; over a run they agree to within 1e-6), `switchyard_tokens_total{provider,model,class}` with class `input` (uncached), `cached_input`, `cache_write` and `output`, and `switchyard_savings_usd_total{source="routing"}`, the running total of `baseline − cost`, which decreases when a fallback costs more than the baseline.
+**Metrics.** On the admin `/metrics`: `switchyard_cost_usd_total{provider,model}` (a float approximation of the ledger's exact sums; over a run they agree to within 1e-6), `switchyard_tokens_total{provider,model,class}` with class `input` (uncached), `cached_input`, `cache_write` and `output`, `switchyard_savings_usd_total{source="routing"}`, the running total of `baseline − cost`, which decreases when a fallback costs more than the baseline, and `switchyard_routing_projected_savings_usd_total`, observe mode's running total of projected savings. Both savings metrics are gauges, not counters, because a request's savings can be negative.
 
-**Reports.** A report aggregates the events of one tenant over a time range `[from, to)`, in UTC, optionally grouped by one or more of `day`, `model` (the requested model), `deployment`, `provider`, `key`, `endpoint`, `status_class` (`2xx`, `4xx`, …), `cache_status` and `tag:<name>`. It returns totals for the whole range and, per group, the same fields:
+**Reports.** A report aggregates the events of one tenant over a time range `[from, to)`, in UTC, optionally grouped by one or more of `day`, `model` (the requested model), `deployment`, `provider`, `key`, `endpoint`, `status_class` (`2xx`, `4xx`, …), `cache_status`, `profile` (the routing profile; empty for embeddings), `routing_mode` (`enforce` or `observe`) and `tag:<name>`. It returns totals for the whole range and, per group, the same fields:
 
 - `requests`, `errors` (status 400 and above) and `unpriced_requests`;
 - token counts per class;
 - `cost_usd` (the known cost plus overhead), `baseline_cost_usd`, `overhead_usd`, and `savings_usd` with `routing`, `cache` and `net` (`net = baseline_cost_usd − cost_usd`); money is an exact decimal string;
+- `projected_savings_usd`: what observe mode estimates routing would have saved, `baseline − shadow` over the observe-mode events whose cost and shadow cost are known. It is **projected, not realized**: the shadow deployment never served those requests and its quality is unverified, so it is never part of `savings_usd`;
 - `cache_hit_rate` and `fallback_rate`.
 
 Groups are sorted by cost, highest first, then by their values, and capped at `limit` (default 1,000, at most 10,000); the totals always cover every matching event. On Postgres the sums are computed in SQL over `NUMERIC`, so they are exact. The tenant filter is applied in the store itself: a tenant's report can never include another tenant's events, and only the admin API can report across tenants.
@@ -466,6 +471,7 @@ curl "localhost:8080/switchyard/v1/usage?from=2026-11-01&to=2026-11-11&group_by=
     "tokens": { "input": 2595, "cached_input": 2351, "cache_write": 2251, "output": 553 },
     "cost_usd": "0.02230155", "baseline_cost_usd": "0.02230155", "overhead_usd": "0",
     "savings_usd": { "routing": "0", "cache": "0", "net": "0" },
+    "projected_savings_usd": "0",
     "cache_hit_rate": 0, "fallback_rate": 0
   },
   "groups": [
@@ -473,6 +479,7 @@ curl "localhost:8080/switchyard/v1/usage?from=2026-11-01&to=2026-11-11&group_by=
       "tokens": { "input": 2095, "cached_input": 2051, "cache_write": 2051, "output": 503 },
       "cost_usd": "0.02213655", "baseline_cost_usd": "0.02213655", "overhead_usd": "0",
       "savings_usd": { "routing": "0", "cache": "0", "net": "0" },
+      "projected_savings_usd": "0",
       "cache_hit_rate": 0, "fallback_rate": 0 },
     { "model": "gpt-6-luna", "requests": 2, "errors": 1, "unpriced_requests": 0,
       "tokens": { "input": 500, "cached_input": 300, "cache_write": 200, "output": 50 },
@@ -528,6 +535,212 @@ Because concurrent admissions are serialized, a budget can be overshot only by r
 **When Redis is down**, `budgets.fail_mode` decides. `open` (the default) serves the request without budget checks, logs a warning and counts it in `switchyard_budget_store_errors_total`; `closed` rejects it with `503` and code `budget_unavailable`. A fallback to a pricier deployment follows the same rule (with `closed`, that deployment is skipped). A budget call that fails, or gets no answer within 1 s, marks the store unavailable for 5 s: during that time requests skip it and get the `fail_mode` outcome at once (counted in `switchyard_budget_store_errors_total`, with the warning logged only for the failure that marked it), then one request tries Redis again. Redis may be down at startup: the gateway starts and warns. With `closed`, `/readyz` fails its `budget_store` check until Redis answers; with `open`, the replica stays ready, since it serves requests anyway, and `GET /admin/v1/providers` reports `"budget_store": {"status": "ok" | "unavailable", "fail_mode": "open"}`.
 
 **Metrics.** `switchyard_budget_rejections_total` counts requests answered 429 `budget_exceeded`; `switchyard_budget_fallback_skips_total` pricier fallback deployments passed over because a blocking budget had no room for the difference; `switchyard_budget_store_errors_total` budget store calls that failed or were skipped while the store was marked unavailable; `switchyard_budget_notifications_total{scope,kind}` the first time each window reaches `soft_at` (`kind="soft_threshold"`) and each request admitted over a `notify` budget (`kind="exceeded"`); and `switchyard_budget_utilization_ratio{scope}` is each budget's spend in its current window as a fraction of its limit, read from the store at scrape time. `scope` is the budget's name, such as `acme/month` or `acme/key:acme-backend/day`, so its values are bounded by the config.
+
+## Routing
+
+Each chat and legacy completion request goes to the cheapest deployment that meets its requirements (DESIGN §9). Embeddings never change models.
+
+**The model field.**
+
+| `model` | What is routed |
+|---|---|
+| `auto` | Every chat model the policy allows, under the policy's `profile` (or `routing.default_profile`). Needs a policy with a `baseline_model`; otherwise `400 model_not_supported` ("this policy has no baseline_model; auto routing is disabled"). |
+| `auto:<profile>` | The same, under that profile, which must exist and be in the policy's `allowed_profiles`; otherwise `400 model_not_supported` naming the allowed profiles (so is `auto:` with no profile). A matching governance rule's `profile` replaces it (see [Policies and rules](#policies-and-rules)). |
+| An alias | Whatever it targets; an alias may target `auto` or `auto:<profile>`. |
+| A model id, `substitution: pinned` (the default) | Only that model's deployments, the cheapest eligible first, as in Phase 4. |
+| A model id, `substitution: equivalent` | Every allowed chat model whose estimated quality for this request is at least the requested model's minus `max_quality_drop` (default 0.05), and at least a rule's or the `X-Switchyard-Min-Quality` header's `min_quality` when one is set; the profile's own `min_quality` does not apply. |
+| `model@provider` | Only that deployment, whatever the substitution mode. The policy's `deny`, `allow` and `require_tags` still apply. |
+
+**How a request is routed.** The gateway assesses the request (its category and difficulty, with the client's `X-Switchyard-Task` and `X-Switchyard-Difficulty` hints: `low`, `medium`, `high` or a number in [0, 1]; see [Quality scoring](#quality-scoring)), resolves its effective policy (see [Policies and rules](#policies-and-rules)), switches an `auto` request to a budget's `soft_profile` if that budget's soft threshold has been crossed, and then the router:
+
+1. takes the candidates for the model field, as in the table;
+2. applies the hard filters, which are never relaxed: the policy's `deny` (which wins) and `allow` globs over deployment ids, `require_tags`, the capabilities and parameters the request needs, the context window (which must hold the input estimate plus `max_tokens` when the request sets it), chat models only, the cost cap (the lower of `max_cost_per_request_usd` and the remaining room of the caller's blocking budgets; a deployment without prices is excluded whenever a cap is in force), and health (an open breaker, a rate-limit cooldown, a provider at `max_concurrency`);
+3. estimates each candidate's quality `q̂`, its cost (the input at bytes/4, without inline image bytes, scaled by the candidate model's own `token_ratio`, plus 1,600 tokens per image, plus the smaller of `max_tokens` and `routing.expected_output_tokens`, default 500; the context check uses the same input estimate) and its time to first token (measured, or the catalog's `latency_hint` until 20 samples, or 1000 ms);
+4. applies the soft checks: `q̂` at least the profile's `min_quality` as rules and headers adjust it (in `equivalent` mode, the requested model's `q̂` minus `max_quality_drop`, or a rule's or header's `min_quality` if higher; pinned requests skip it), and the estimated TTFT within `max_ttft_ms` when the profile or header sets one. When nothing passes and `on_unmet` is `best_effort` (the default), the latency target is dropped first, then the quality bar, keeping the best quality available; with `reject`, the request gets `400 no_eligible_model`;
+5. ranks what is left by `prefer` tier, then the profile's objective (cost or TTFT), then the other one, then config order;
+6. plans up to `routing.fallback.max_deployments`, each fallback preferring a provider not yet in the plan.
+
+The executor then runs the plan with retries and fallback (see [Reliability](#reliability)). Budget admission charges the estimate on the primary deployment, at its model's `token_ratio`, with output at `max_tokens`, as before; a fallback to another model admits the difference at that model's ratio. When the remaining budget rules out every candidate, the plan is made without it, so the request gets `429 budget_exceeded` rather than `400 no_eligible_model`. A decision is deterministic: the same request, config and health state give the same plan.
+
+**Observe mode.** A policy (or rule) with `routing_mode: observe` makes every decision as above but serves exactly what was asked for: the requested model, or the `baseline_model` for `auto`, as a pinned plan (so health skips and provider diversity still apply). The response says `X-Switchyard-Route-Reason: observe` and names the model routing would have chosen in `X-Switchyard-Shadow-Model`. The usage event records that deployment, and reports show `projected_savings_usd` (the baseline cost minus the same tokens on the shadow deployment) apart from the realized `savings_usd`, which in observe mode come only from provider arbitrage. It is the zero-risk way to see what routing would do on real traffic.
+
+**Savings** are measured against the baseline: the requested model for a concrete name, the policy's `baseline_model` for `auto`, with the same tokens at its cheapest priced deployment. That is an approximation, since another model would tokenize and answer differently. See [Usage ledger and reporting](#usage-ledger-and-reporting).
+
+**Explain.** `POST /switchyard/v1/route/explain` on the public listener, with a gateway key, takes a chat completions body and the same headers, and returns the routing decision without calling any upstream, charging any budget or recording any usage; requests chat would reject get the same error. It uses the replica's live health and budget state. In observe mode it shows the decision routing would make. `switchyard route explain` prints the same explanation offline, from the config, with every deployment healthy and every budget untouched (its whole limit left, no soft profile in force), as a freshly started gateway would; `--header 'Name: value'` (repeatable) passes request headers. It needs none of the config's secrets: references in API keys, Redis URLs and the ledger DSN resolve to their default or a placeholder, without reading the environment or the file. This is the request of DESIGN §10.5 with the `code-needs-quality` quality rule matching:
+
+```sh
+echo '{"model":"auto","messages":[{"role":"user","content":"Fix the failing test: ..."}]}' |
+  bin/switchyard route explain -c switchyard.yaml --tenant acme --key acme-backend -
+```
+
+```json
+{
+  "policy": "default",
+  "matched_rule": "",
+  "matched_quality_rule": "code-needs-quality",
+  "profile": "balanced",
+  "mode": "auto",
+  "assessment": { "category": "coding", "difficulty": 0.55, "signals": ["code", "length"], "hinted": false },
+  "estimates": { "input_tokens": 1500, "output_tokens": 500 },
+  "quality_bar": 0.85,
+  "candidates": [
+    { "deployment": "small@together", "model": "small", "q": 0.78, "est_cost_usd": "0.00035", "est_ttft_ms": 400,
+      "tier": 0, "eligible": false, "excluded_by": "quality 0.78 < 0.85" },
+    { "deployment": "medium@openai", "model": "medium", "q": 0.8625, "est_cost_usd": "0.00175", "est_ttft_ms": 500,
+      "tier": 0, "eligible": true, "rank": 1 },
+    { "deployment": "large@anthropic", "model": "large", "q": 0.9725, "est_cost_usd": "0.012", "est_ttft_ms": 900,
+      "tier": 0, "eligible": true, "rank": 2 }
+  ],
+  "plan": ["medium@openai", "large@anthropic"],
+  "relaxed": [],
+  "dropped_params": [],
+  "warnings": []
+}
+```
+
+Every candidate is listed in catalog order with its estimates and either its rank or why it was excluded; money is a decimal string. `downgrade` appears when a budget's soft profile is in force ("budget acme/month soft threshold crossed; profile cheap"), and `notes` flag estimates that used a fallback (no quality prior, so q = 0.5; no latency estimate; unknown pricing).
+
+**Demo.** `make demo-routing` runs the P5 mixed-workload demo against fake upstreams: three tiers modeled on DESIGN §10.5 (`demo-s` at $0.10 / $0.40 per million input / output tokens, `demo-m` at $0.50 / $2.00, `demo-l` on the Anthropic wire at $3 / $15), a policy routing `auto:balanced` with `demo-l` as the baseline, and 90 prompts from the quality sanity set, sent without hints:
+
+```
+    band  prompts  demo-s  demo-m  demo-l
+    easy       30      30       0       0
+  medium       30      17      12       1
+    hard       30       0       9      21
+
+Usage API (GET /switchyard/v1/usage), 90 requests:
+  cost             0.0157383 USD
+  baseline         0.037818 USD (every request on demo-l, the same tokens)
+  routing savings  0.0220797 USD (58.4% of the baseline)
+```
+
+**Metrics.** `switchyard_route_decisions_total{profile,served_model,reason}` counts served routed requests; `switchyard_route_relaxations_total{constraint}` decisions that relaxed `latency` or `quality`; `switchyard_route_profile_downgrades_total{scope}` `auto` requests switched to a budget's soft profile; and `switchyard_routing_projected_savings_usd_total` observe mode's projected savings.
+
+## Policies and rules
+
+A policy is the governance attached to a tenant or a key (DESIGN §13): which deployments may serve its requests, which routing profiles its callers may pick, a per-request cost cap, and ordered rules for specific traffic.
+
+```yaml
+routing:
+  default_profile: balanced            # used when a policy names no profile
+  expected_output_tokens: 500          # output estimate when a request sets no max_tokens
+  profiles:                            # omit to get the built-ins below; configured profiles replace them all
+    cheap:    { min_quality: 0.65, objective: cost }
+    balanced: { min_quality: 0.80, objective: cost }
+    quality:  { min_quality: 0.92, objective: cost }
+    fast:     { min_quality: 0.80, objective: latency, max_ttft_ms: 800 }
+  assessor:
+    type: heuristic                    # the only type
+    weights: { length: 0.3 }           # optional signal weights in [-1, 1]
+
+aliases:
+  code-review: auto:quality            # an alias may target auto or auto:<profile>
+
+policies:
+  - id: default                        # used by every tenant that names no policy
+    profile: balanced                  # default profile for plain "auto"; default routing.default_profile
+    allowed_profiles: [cheap, balanced, fast]   # profiles callers may select; default all
+    allow: ["*"]                       # globs over deployment ids (model@provider); default all
+    deny: ["*@experimental"]           # deny wins over allow
+    prefer: ["*@gpu-cluster", "llama-*"]        # earlier globs form higher preference tiers
+    require_tags: [zdr]                # provider tags plus deployment tags
+    substitution: { mode: pinned }     # pinned (default) | equivalent, with max_quality_drop (default 0.05)
+    routing_mode: enforce              # enforce (default) | observe
+    baseline_model: claude-sonnet-5-5  # savings baseline; required for auto routing
+    max_cost_per_request_usd: "0.50"   # hard cap on a request's estimated cost; default none
+    on_unmet: best_effort              # best_effort (default) | reject
+    rules:                             # governance rules: first match wins; quality rules: first match, on top
+      - name: staging-is-cheap
+        match: { header: { x-env: staging } }
+        set:   { profile: cheap }
+      - name: code-needs-quality
+        match: { task: coding, difficulty_gte: 0.5 }
+        set:   { min_quality: 0.85 }
+
+tenants:
+  - id: acme
+    policy: default                    # default: the policy with id "default", else built-in defaults
+    keys:
+      - { id: acme-batch, hash: "sha256:…", policy: batch }   # a key's policy replaces the tenant's; batch is another policy
+    budgets:
+      - { scope: tenant, window: month, limit_usd: 2000, soft_at: 0.8, soft_profile: cheap }
+```
+
+**Which policy applies.** The key's `policy`, else the tenant's, else the policy with id `default`, else the built-in policy: the default profile, everything allowed, `pinned` substitution, `enforce`, `best_effort`, no cost cap and no `baseline_model`. Without a `baseline_model`, `auto` requests are answered `400 model_not_supported` ("this policy has no baseline_model; auto routing is disabled"), and `config validate` warns about a tenant whose policy allows every profile but has no baseline.
+
+**Profiles.** A request selects a profile with `model: "auto:<profile>"` or the `X-Switchyard-Profile` header, and plain `auto` uses the policy's `profile` or `routing.default_profile`. A profile in the model field that is unknown or not in `allowed_profiles` is answered `400 model_not_supported`, naming the allowed profiles. The profile in force is the matching governance rule's, which replaces the one the request selects (rules are trusted config, and the response says so in `X-Switchyard-Policy-Warning`); else the one the request selects; else the policy's; else `default_profile`. Its `min_quality` and `max_ttft_ms` are the quality bar and the latency target; `objective` ranks the eligible deployments by cost or by estimated time to first token.
+
+**Rules.** Every condition of a rule's `match` that is set must hold, and an empty `match` always holds. Rules form two layers, so that what a request says about itself can never steer it past a rule that governs it:
+
+- **Governance rules** match only on `model`, `profile`, `key`, `key_tags`, `header`, `tags`, `stream`, `has_tools` and `has_images`, and may set any field. They are evaluated in order and the first that matches applies; an empty `match` therefore shadows every governance rule after it (`config validate` warns).
+- **Quality rules** are the rules whose `match` uses `task`, `difficulty_gte`, `difficulty_lt` or `est_input_tokens_gte`, which the request's content and the client's `X-Switchyard-Task` and `X-Switchyard-Difficulty` hints decide (they may use governance conditions too). They may set only `min_quality` and `prefer`; `config validate` rejects any other field. The first that matches applies on top of the governance rule's result, whatever the order of the two.
+
+The explanation names both, as `matched_rule` and `matched_quality_rule`, and so does the access log. Clients set request headers and `X-Switchyard-Tags` themselves, so a rule that matches them should only restrict, never loosen, and should come before the governance rules it must not shadow: a client can always send a header, or leave it out. Conditions:
+
+| Condition | Holds when |
+|---|---|
+| `model` | the model field as sent matches the glob (`path.Match` syntax: `*`, `?`, `[...]`; `*` does not cross `/`) |
+| `profile` | the request selected this profile |
+| `task` | the assessed or hinted category is this one (`general`, `coding`, `reasoning`, `extraction`, `creative`, `tool_use`) |
+| `difficulty_gte`, `difficulty_lt` | the difficulty is at least, or below, the bound (0 means unset) |
+| `key`, `key_tags` | the calling key has this id, or carries every one of these tags |
+| `header` | for each header name (case-insensitive), some value matches the glob (case-sensitive) |
+| `tags` | for each `X-Switchyard-Tags` key, its value matches the glob |
+| `stream`, `has_tools`, `has_images` | the request streams, has tools, or has images (`true` or `false`) |
+| `est_input_tokens_gte` | the estimated input is at least this many tokens |
+
+A governance rule's `set` may override `profile`, `min_quality`, `prefer`, `allow`, `deny`, `require_tags`, `substitution`, `routing_mode`, `max_cost_per_request_usd` and `on_unmet`; a quality rule's only `min_quality` and `prefer`, which replace the governance rule's. A field left out (or 0) keeps the policy's value, and a list set to `[]` clears it. Rules are operator config, so they may loosen the policy as well as tighten it.
+
+**Headers can only tighten.** These request headers narrow what the policy allows, and never widen it:
+
+| Header | Effect |
+|---|---|
+| `X-Switchyard-Profile` | selects one of the allowed profiles |
+| `X-Switchyard-Max-Cost-Usd` | lowers the cost cap, e.g. `0.05` |
+| `X-Switchyard-Min-Quality` | raises the quality bar, a decimal in [0, 1], up to the highest `min_quality` among the profiles the caller may select |
+| `X-Switchyard-Max-TTFT-Ms` | lowers the latency target, in whole milliseconds |
+
+A value that would loosen the policy (a higher cap, a lower bar, a longer target, or a profile the policy doesn't allow) is ignored, and the response says so in `X-Switchyard-Policy-Warning`. So is a `X-Switchyard-Min-Quality` above every selectable profile's `min_quality`, which would otherwise reach a stronger tier than `allowed_profiles` permits. A malformed value, or a header given twice, is answered `400 invalid_header`; the message names the header but never echoes its value. Costs are compared exactly, to the nano-USD a cap may be written in (at most 9 decimal places).
+
+**Budget soft profile.** A budget with `soft_at` and `soft_profile` switches `auto` requests to `soft_profile` once its soft threshold has been crossed in the current window, whatever profile the request or a rule selects; rule `min_quality` and header tightening still apply on top of it, with `X-Switchyard-Min-Quality` raising the bar no higher than the soft profile's own, and the explanation says so. `soft_profile` requires `soft_at` and must name a profile.
+
+**Validation.** `config validate` checks profile names and ranges (`min_quality` in [0, 1], `objective` `cost` or `latency`, `max_ttft_ms` ≥ 0), that `default_profile`, every policy and rule profile, every `allowed_profiles` entry, alias targets `auto:<profile>` and budget `soft_profile`s exist, that policy ids are unique and every tenant and key `policy` exists, that globs are valid, that `baseline_model` is a chat model id (not an alias or `model@provider`), that `max_cost_per_request_usd` is greater than 0, that rule names are unique within their policy, that quality rules set only `min_quality` and `prefer`, that `task` is a known category and difficulty bounds lie in [0, 1] with `difficulty_gte` < `difficulty_lt`, that header names are valid, and that assessor weights name known signals with values in [-1, 1].
+
+## Quality scoring
+
+The router sends a request to a cheaper model only when that model is likely to be good enough for it (DESIGN §10). Two things decide that: the model's quality prior for the request's category, from the catalog's `quality` map, and the request's difficulty `d` in [0, 1], from the assessor. The estimate for a deployment is
+
+```
+q̂ = clamp(1 − d · (1 − Q[model][category]) + quality_offset, 0, 1)
+```
+
+where `Q[model][category]` falls back to the model's `general` prior. An easy request (`d` near 0) scores close to 1 on every model, so the cheapest wins; a hard one (`d` near 1) scores close to the prior, so only strong models clear the profile's `min_quality`.
+
+**The heuristic assessor** rates a request without any network call, in about 15 µs for a 4 KB prompt. It reads only the last user message, the system (and developer) messages, `tools`, `tool_choice` and `response_format`, and at most the first 32 KiB of message text. It keeps nothing after the request is assessed, and its output names the signals that fired, never any content. Each signal yields a feature `f` in [0, 1], and
+
+```
+d = clamp(bias + Σ weight[signal] · f[signal], 0, 1)
+```
+
+| Signal | Looks for | Default weight | Category |
+|---|---|---|---|
+| `length` | estimated input tokens, log-scaled from 100 to 32k | 0.25 | |
+| `code` | fenced code (more lines count more), stack traces, code punctuation, programming terms | 0.25 | `coding` |
+| `math` | "prove", "derive", "show that", LaTeX, equations, mathematical terms | 0.55 | `reasoning` |
+| `reasoning_cues` | "step by step", "trade-offs", "design", "analyze", "explain why" | 0.30 | |
+| `constraints` | bullet and numbered lines, "must", "never", "at least" | 0.25 | |
+| `conversation_depth` | turns before the last user message | 0.15 | |
+| `tools` | tool definitions (more count more), a forced tool call | 0.20 | `tool_use` |
+| `strict_schema` | `response_format` `json_schema` (larger schemas count more) or `json_object` | 0.10 | `extraction` |
+| `simple_task` | a request that starts with "translate", "rewrite", "classify", "extract" and similar, asks for "one word" or "yes or no", or is short | −0.35 | `extraction` for classify/extract |
+| `creative` | "poem", "story", "toast", "sonnet" and similar | 0.10 | `creative` |
+| `bias` | the constant term | 0.40 | |
+
+The category is the strongest category signal, or `general` when none is strong enough. Override any weight, each in [-1, 1], under `routing.assessor.weights`; the names are those in the table.
+
+**Hints.** A caller that knows better can say so: `X-Switchyard-Task` sets the category (one of the categories above) and `X-Switchyard-Difficulty` sets `d` (`low` = 0.2, `medium` = 0.5, `high` = 0.85, or a number in [0, 1]). Either one marks the assessment as hinted in the route explanation. Any other value, or a header given twice, is answered `400 invalid_header`.
+
+**How well it works.** `internal/quality/testdata/sanity.json` holds 105 realistic prompts across every category, each labeled easy (`d` < 0.35), medium or hard (`d` ≥ 0.65) by reading the prompt, not by running the heuristic. With the default weights, 98 of them (93 %) land in their labeled band, and `go test -v -run TestSanitySet ./internal/quality/` lists the ones that don't. The heuristic is English-centric and can be fooled by phrasing, which is why prompt content only ever affects the quality estimate, never authorization, allow lists, budgets or cost caps; `observe` routing mode and the explain endpoint let you check its decisions before you rely on them.
 
 ## Docker
 
@@ -591,6 +804,7 @@ Run `make` or `make help` to list them.
 | `test` | `go test -race -count=1 ./...` |
 | `test-integration` | Starts Postgres and `redis-state` from `deploy/compose.yaml` in a separate compose project (`switchyard-test`), runs the tests tagged `integration` with `SWITCHYARD_TEST_POSTGRES_DSN`, `SWITCHYARD_TEST_REDIS_URL` and `SWITCHYARD_TEST_COMPOSE` (the compose command of that project) set, and always removes the containers and their volumes afterwards. The tests cover the Postgres ledger and the Redis budget store, and in `test/integration` the P4 acceptance scenarios through the gateway binary: exact costs checked against the ledger rows, 1,000 concurrent requests against a Redis budget, and Postgres stopped for 60 s under load. It takes a few minutes. It uses the same host ports as `dev-up`, so run `make dev-down` first. Without those variables, `go test -tags integration` skips these tests. Override the packages with `INTEGRATION_PKGS` and the flags with `INTEGRATION_FLAGS` (default `-race -count=1 -p 1 -timeout 20m`; `-p 1` because the outage test stops the shared Postgres). |
 | `cover` | Writes `coverage.out` and prints a per-function coverage summary. |
+| `demo-routing` | The mixed-workload routing demo: fake OpenAI-wire and Anthropic upstreams, a three-tier catalog, 30 easy, 30 medium and 30 hard prompts from the quality sanity set sent as `auto:balanced`; prints how each band was routed and the usage API's cost, baseline and savings, and fails unless most easy prompts went to the small tier, most hard ones to the large tier, and savings are above 0. See [Routing](#routing). Pass flags with `DEMO_FLAGS`. |
 | `bench-overhead` | Measures the latency the gateway adds against a zero-latency fake upstream; results in [test/load/RESULTS.md](test/load/RESULTS.md). Pass flags with `BENCH_FLAGS="-mode stream -concurrency 200"`; the default is the P1 acceptance run (non-stream, concurrency 100). |
 | `smoke` | Live smoke test against OpenAI with the SDK. Opt-in: it skips unless `OPENAI_API_KEY` is set; `SMOKE_MODEL` defaults to `gpt-5-mini`. |
 | `record-fixtures` | Records live Anthropic API responses into `test/fixtures/anthropic/recorded/`, for comparison with the handcrafted fixtures. Opt-in and billed: it skips unless `ANTHROPIC_API_KEY` is set. Until it has been run, the fixtures are handcrafted from Anthropic's documentation. |
@@ -614,9 +828,10 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same checks o
 ## Project layout
 
 ```
-cmd/switchyard/     CLI: serve, config validate, catalog lint, keys generate, version
+cmd/switchyard/     CLI: serve, config validate, catalog lint, route explain, keys generate, version
 internal/
   api/openaiapi/    HTTP handlers for /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
+                    and /switchyard/v1/route/explain
   api/usageapi/     usage reports: /switchyard/v1/usage and /admin/v1/usage
   apierror/         errors in the OpenAI-compatible JSON envelope
   app/              composition root: config snapshot to running service
@@ -624,9 +839,13 @@ internal/
   budget/           budget scopes and windows; memory and Redis (Lua) stores
   catalog/          models, deployments, prices; resolution, selection, lint
   config/           schema, loading, ${…} expansion, includes, validation, snapshot
-  gateway/          request pipeline, plans and the retry/fallback executor, completions shim,
-                    budget admission, usage events, metrics, log fields, /admin/v1/providers
+  gateway/          request pipeline: routing (assessment, policy, downgrade, router), the
+                    retry/fallback executor, completions shim, budget admission, usage events,
+                    explain, metrics, log fields, /admin/v1/providers
   health/           per-replica breakers, cooldowns, retry budgets, concurrency, latency stats
+  policy/           effective policy: base policy, governance and quality rules, header tightening
+  quality/          the heuristic assessor, the quality estimate, the labeled sanity set
+  router/           candidates, hard filters, estimates, soft checks, ranking, plan, explanation
   providers/        adapter interfaces; openai/ (OpenAI wire) and anthropic/ (Messages API)
   schema/           lossless chat, legacy completion and embedding requests; capabilities
   server/           listeners, middleware, health checks, graceful shutdown
@@ -640,10 +859,11 @@ test/
   fakeanthropic/    scriptable fake Messages API (make record-fixtures records real ones)
   fixtures/         Anthropic fixtures, handcrafted from the docs until recorded
   conformance/      OpenAI SDK conformance suite, direct and through the gateway (OpenAI and
-                    Anthropic upstreams), plus the P2, P3 and P4 acceptance cases
+                    Anthropic upstreams), plus the P2 to P5 acceptance cases
   scenario/         the P4 acceptance scenarios, shared by conformance/ and integration/
   integration/      P4 scenarios on Postgres and Redis, Postgres outage (make test-integration)
   load/             overhead benchmark (make bench-overhead)
+  demo/             mixed-workload routing demo (make demo-routing)
   smoke/            opt-in live smoke test (make smoke)
 configs/            quickstart.yaml, switchyard.example.yaml, catalog/
 deploy/             Dockerfile, compose.yaml (dev dependencies)

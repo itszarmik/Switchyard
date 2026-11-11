@@ -450,8 +450,8 @@ func TestBudgetValidation(t *testing.T) {
 		{"fail_mode closed", v1 + "budgets: {fail_mode: closed}\n", nil},
 		{"fail_mode unknown", v1 + "budgets: {fail_mode: strict}\n",
 			[]want{errAt("budgets.fail_mode", `must be one of open, closed, got "strict"`)}},
-		{"unknown budget field", tenant("{scope: tenant, window: day, limit_usd: 1, soft_profile: cheap}"),
-			[]want{errAt("tenants[0].budgets[0].soft_profile", "unknown field")}},
+		{"unknown budget field", tenant("{scope: tenant, window: day, limit_usd: 1, notify_url: x}"),
+			[]want{errAt("tenants[0].budgets[0].notify_url", "unknown field")}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

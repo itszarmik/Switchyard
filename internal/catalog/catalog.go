@@ -61,6 +61,10 @@ type Model struct {
 	// TokenRatio scales the bytes/4 token estimate for this model's
 	// tokenizer; it is 1 unless the catalog says otherwise.
 	TokenRatio float64
+	// Quality holds the model's quality priors in [0, 1] by category
+	// (DESIGN §10.2), or nil if the catalog sets none. A category without
+	// a prior falls back to general.
+	Quality map[string]float64
 	// Deployments serve the model, in config order.
 	Deployments []*Deployment
 }
@@ -91,6 +95,12 @@ type Deployment struct {
 	// LatencyHint is the operator's latency estimate, which seeds the
 	// latency statistics until there are measurements.
 	LatencyHint LatencyHint
+	// QualityOffset adjusts the model's quality priors for this
+	// deployment, in [-1, 1] (DESIGN §10.2).
+	QualityOffset float64
+	// ProviderMaxConcurrency is the provider's max_concurrency, 0 for
+	// unlimited.
+	ProviderMaxConcurrency int
 }
 
 // LatencyHint is an operator's latency estimate. Zero values are unknown.
@@ -196,6 +206,7 @@ func New(cfg *config.Config) (*Catalog, error) {
 			Capabilities:    capabilitySet(cm.Capabilities),
 			Dimensions:      cm.Dimensions,
 			TokenRatio:      ratio,
+			Quality:         maps.Clone(cm.Quality),
 		}
 		if m.Type == "" {
 			m.Type = config.ModelTypeChat
@@ -226,6 +237,8 @@ func New(cfg *config.Config) (*Catalog, error) {
 					TTFT:         time.Duration(cd.LatencyHint.TTFTMs) * time.Millisecond,
 					TokensPerSec: cd.LatencyHint.TokensPerSec,
 				},
+				QualityOffset:          cd.QualityOffset,
+				ProviderMaxConcurrency: p.MaxConcurrency,
 			}
 			if cd.Capabilities != nil {
 				d.Capabilities = capabilitySet(cd.Capabilities)
@@ -240,6 +253,9 @@ func New(cfg *config.Config) (*Catalog, error) {
 		c.byID[m.ID] = m
 	}
 	for name, target := range c.aliases {
+		if IsVirtual(target) {
+			continue
+		}
 		if _, err := c.resolveTarget(target); err != nil {
 			return nil, fmt.Errorf("catalog: alias %q: %w", name, err)
 		}
@@ -267,10 +283,28 @@ func mergeTags(a, b []string) []string {
 	return out
 }
 
+// IsVirtual reports whether name is a virtual model: "auto" or
+// "auto:<profile>". Validation reserves these names, so no catalog model
+// has one.
+func IsVirtual(name string) bool {
+	return name == "auto" || strings.HasPrefix(name, "auto:")
+}
+
+// VirtualTarget returns the virtual model that name stands for: name itself
+// when IsVirtual(name), or the target of an alias whose target is virtual.
+// It reports false for every other name, which Resolve handles.
+func (c *Catalog) VirtualTarget(name string) (string, bool) {
+	if target, ok := c.aliases[name]; ok {
+		return target, IsVirtual(target)
+	}
+	return name, IsVirtual(name)
+}
+
 // Resolve maps a client's model field to candidate deployments. It accepts
 // a catalog model ID; an alias, whose target is a model ID or
 // model@provider; or model@provider, which pins the deployment. A name that
-// is none of these and starts with "auto" returns ErrVirtualModel; any other
+// is none of these and starts with "auto", or an alias whose target is a
+// virtual model (see VirtualTarget), returns ErrVirtualModel; any other
 // unknown name returns ErrUnknownModel. Both errors are wrapped with the
 // name.
 //
@@ -279,6 +313,9 @@ func mergeTags(a, b []string) []string {
 // only "auto" and "auto:…".
 func (c *Catalog) Resolve(name string) (Resolution, error) {
 	if target, ok := c.aliases[name]; ok {
+		if IsVirtual(target) {
+			return Resolution{}, fmt.Errorf("model %q: %w", name, ErrVirtualModel)
+		}
 		res, err := c.resolveTarget(target)
 		if err != nil {
 			return Resolution{}, fmt.Errorf("model %q: %w", name, err)

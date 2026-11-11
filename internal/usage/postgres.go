@@ -227,6 +227,7 @@ var ledgerColumns = []string{
 	"usage_known", "usage_estimated", "cost_usd", "cost_known", "pricing",
 	"baseline_model", "baseline_cost_usd", "overhead_cost_usd", "latency_ms", "ttft_ms",
 	"tags", "config_version",
+	"profile", "routing_mode", "shadow_deployment", "shadow_cost_usd", "shadow_cost_known",
 }
 
 // WriteBatch implements batchStore. It copies the batch into a temporary
@@ -301,6 +302,8 @@ func eventRow(ev *Event) []any {
 		},
 		cleanText(ev.BaselineModel), numeric(ev.BaselineCost), numeric(ev.OverheadCost),
 		ev.LatencyMS, ev.TTFTMS, tags, cleanText(ev.ConfigVersion),
+		cleanText(ev.Profile), cleanText(ev.RoutingMode), cleanText(ev.ShadowDeployment),
+		numeric(ev.ShadowCost), ev.ShadowCostKnown,
 	}
 }
 

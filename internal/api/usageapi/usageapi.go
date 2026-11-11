@@ -10,8 +10,8 @@
 //     default is the 7 days before now, and the span may not exceed 400
 //     days.
 //   - group_by is a comma-separated list of dimensions: day, model,
-//     deployment, provider, key, endpoint, status_class, cache_status and
-//     tag:<name>.
+//     deployment, provider, key, endpoint, status_class, cache_status,
+//     profile, routing_mode and tag:<name>.
 //   - limit caps the number of groups (default 1000, at most 10000).
 //
 // group_by may list at most 8 dimensions, at most 3 of them tags; more is
@@ -20,6 +20,8 @@
 //
 // The admin endpoint also takes tenant, a tenant id; without it the report
 // covers every tenant. Money is serialized as exact decimal strings.
+// totals.projected_savings_usd is observe mode's projected routing
+// savings, which never ran and are reported apart from savings_usd.
 package usageapi
 
 import (
@@ -217,7 +219,7 @@ func queryMessage(err error) string {
 	if i := strings.LastIndex(msg, usage.ErrInvalidQuery.Error()+": "); i >= 0 {
 		msg = msg[i+len(usage.ErrInvalidQuery.Error())+2:]
 	}
-	return "Invalid query: " + msg + ". The group_by dimensions are day, model, deployment, provider, key, endpoint, status_class, cache_status and tag:<name>, each at most once, at most 8 of them and at most 3 tags."
+	return "Invalid query: " + msg + ". The group_by dimensions are day, model, deployment, provider, key, endpoint, status_class, cache_status, profile, routing_mode and tag:<name>, each at most once, at most 8 of them and at most 3 tags."
 }
 
 // badRequest writes a 400 invalid_query error about param.
@@ -248,8 +250,10 @@ type (
 		BaselineCostUSD  usage.Money `json:"baseline_cost_usd"`
 		OverheadUSD      usage.Money `json:"overhead_usd"`
 		SavingsUSD       savingsJSON `json:"savings_usd"`
-		CacheHitRate     float64     `json:"cache_hit_rate"`
-		FallbackRate     float64     `json:"fallback_rate"`
+		// ProjectedSavingsUSD is observe mode's estimate, never realized.
+		ProjectedSavingsUSD usage.Money `json:"projected_savings_usd"`
+		CacheHitRate        float64     `json:"cache_hit_rate"`
+		FallbackRate        float64     `json:"fallback_rate"`
 	}
 	tokensJSON struct {
 		Input       int64 `json:"input"`
@@ -273,8 +277,9 @@ func totals(t usage.Totals) totalsJSON {
 			CacheWrite: t.Tokens.CacheWrite, Output: t.Tokens.Output,
 		},
 		CostUSD: t.CostUSD, BaselineCostUSD: t.BaselineCostUSD, OverheadUSD: t.OverheadUSD,
-		SavingsUSD:   savingsJSON{Routing: t.SavingsUSD.Routing, Cache: t.SavingsUSD.Cache, Net: t.SavingsUSD.Net},
-		CacheHitRate: t.CacheHitRate, FallbackRate: t.FallbackRate,
+		SavingsUSD:          savingsJSON{Routing: t.SavingsUSD.Routing, Cache: t.SavingsUSD.Cache, Net: t.SavingsUSD.Net},
+		ProjectedSavingsUSD: t.ProjectedSavingsUSD,
+		CacheHitRate:        t.CacheHitRate, FallbackRate: t.FallbackRate,
 	}
 }
 

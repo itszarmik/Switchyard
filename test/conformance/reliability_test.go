@@ -805,8 +805,10 @@ func TestReliabilitySpillover(t *testing.T) {
 			return e.metric(t, `switchyard_provider_in_flight{provider="`+p+`"}`) == 0
 		})
 	}
-	if got := e.metric(t, `switchyard_provider_saturated_total{provider="primary"}`); got < 2 {
-		t.Errorf("provider_saturated_total{primary} = %v", got)
+	// The counter counts only refused Acquires: routing around a
+	// saturated provider is not one, so it stays unset here.
+	if got := e.metric(t, `switchyard_provider_saturated_total{provider="primary"}`); got > 0 {
+		t.Errorf("provider_saturated_total{primary} = %v, want no count for routing around it", got)
 	}
 }
 

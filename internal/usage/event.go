@@ -74,12 +74,30 @@ type Event struct {
 	Pricing config.Pricing
 
 	// BaselineModel and BaselineCost are what the request would have cost
-	// without Switchyard's routing (DESIGN §12.4): in Phase 4 the requested
-	// model, priced at its cheapest priced deployment. OverheadCost is the
-	// gateway's own spend on the request (0 in Phase 4).
+	// without Switchyard's routing (DESIGN §12.4): the requested model for
+	// a concrete model name, or the policy's baseline_model for auto, with
+	// the same tokens priced at its cheapest priced deployment.
+	// OverheadCost is the gateway's own spend on the request (0 until the
+	// gateway makes calls of its own).
 	BaselineModel string
 	BaselineCost  Money
 	OverheadCost  Money
+
+	// Profile is the routing profile in force for a routed request (chat
+	// and legacy completions), or "". RoutingMode is the policy's routing
+	// mode, RoutingModeEnforce or RoutingModeObserve, or "" when no policy
+	// applied (a request rejected before routing).
+	Profile, RoutingMode string
+	// ShadowDeployment is, in observe mode, the deployment the router
+	// would have chosen (DESIGN §9.6), or "". ShadowCost is the request's
+	// tokens priced at that deployment, the same approximation as
+	// BaselineCost; ShadowCostKnown is false when the request's cost or the
+	// shadow deployment's prices are unknown, and ShadowCost is then 0.
+	// Reports sum BaselineCost − ShadowCost over observe-mode events whose
+	// cost and shadow cost are known as the projected savings.
+	ShadowDeployment string
+	ShadowCost       Money
+	ShadowCostKnown  bool
 
 	// LatencyMS is the request's duration and TTFTMS its time to first
 	// token, in milliseconds (0 when not applicable).
@@ -111,6 +129,12 @@ type Reporter interface {
 	Report(ctx context.Context, q Query) (*Report, error)
 }
 
+// Routing modes recorded in Event.RoutingMode.
+const (
+	RoutingModeEnforce = "enforce"
+	RoutingModeObserve = "observe"
+)
+
 // Group-by dimensions accepted in Query.GroupBy. A tag dimension is
 // GroupByTagPrefix followed by a tag key, for example "tag:team".
 const (
@@ -122,6 +146,8 @@ const (
 	GroupByEndpoint    = "endpoint"     // Event.Endpoint
 	GroupByStatusClass = "status_class" // "2xx", "4xx", "5xx", …, or "other"
 	GroupByCacheStatus = "cache_status" // Event.CacheStatus
+	GroupByProfile     = "profile"      // Event.Profile
+	GroupByRoutingMode = "routing_mode" // Event.RoutingMode
 	GroupByTagPrefix   = "tag:"         // the tag's value, or "" if absent
 )
 
@@ -199,6 +225,13 @@ type Totals struct {
 	// negative; Cache is the baseline cost of cache hits; Net is Routing +
 	// Cache - OverheadUSD.
 	SavingsUSD struct{ Routing, Cache, Net Money }
+	// ProjectedSavingsUSD is what observe mode estimates routing would
+	// have saved (DESIGN §12.4): BaselineCost − ShadowCost over the
+	// observe-mode events whose cost and shadow cost are known. It is
+	// projected, not realized: the shadow deployment never served those
+	// requests, and its quality is unverified. It is not part of
+	// SavingsUSD.
+	ProjectedSavingsUSD Money
 	// CacheHitRate and FallbackRate are the fractions of requests that were
 	// cache hits and that fell back to another deployment; 0 without
 	// requests.

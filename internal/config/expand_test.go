@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -239,5 +240,91 @@ func TestFileReferencesOnDisk(t *testing.T) {
 			}
 			checkProblems(t, ve.Problems, errAt("storage.ledger.dsn", tt.msg))
 		})
+	}
+}
+
+// TestSecretPlaceholders checks LoadOptions.SecretPlaceholders: references
+// in secret settings read nothing and resolve to their default or to a
+// placeholder that validation accepts; other references resolve as usual.
+func TestSecretPlaceholders(t *testing.T) {
+	const root = `version: 1
+storage:
+  mode: redis
+  redis:
+    cache_url: ${REDIS_CACHE_URL}
+    state_url: redis://:${REDIS_PASSWORD}@redis:6380/0
+  ledger:
+    driver: postgres
+    dsn: ${file:/run/secrets/dsn}
+providers:
+  - id: a
+    type: openai
+    base_url: https://a.example/v1
+    api_key: ${A_KEY}
+    max_concurrency: ${MAXC}
+  - {id: b, type: openai, base_url: "https://b.example/v1", api_key: "${B_KEY:-unused-default}"}
+`
+	var looked []string
+	files := fakeFS{rootFile: root}
+	snap, err := Load(rootFile, LoadOptions{
+		LookupEnv: func(k string) (string, bool) {
+			looked = append(looked, k)
+			if k == "MAXC" {
+				return "7", true
+			}
+			return "", false
+		},
+		ReadFile:           files.ReadFile,
+		Glob:               files.Glob,
+		SecretPlaceholders: true,
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg := snap.Config()
+	got := map[string]string{
+		"cache_url": cfg.Storage.Redis.CacheURL.Value(),
+		"state_url": cfg.Storage.Redis.StateURL.Value(),
+		"dsn":       cfg.Storage.Ledger.DSN.Value(),
+		"a":         cfg.Providers[0].APIKey.Value(),
+		"b":         cfg.Providers[1].APIKey.Value(),
+	}
+	want := map[string]string{
+		"cache_url": placeholderRedisCache,
+		"state_url": "redis://:" + placeholderSecret + "@redis:6380/0",
+		"dsn":       placeholderDSN,
+		"a":         placeholderSecret,
+		"b":         "unused-default",
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("secrets (-want +got):\n%s", diff)
+	}
+	if cfg.Providers[0].MaxConcurrency != 7 {
+		t.Errorf("max_concurrency %d, want 7 from the environment", cfg.Providers[0].MaxConcurrency)
+	}
+	if !cmp.Equal(looked, []string{"MAXC"}) {
+		t.Errorf("looked up %v; want only the variable of a setting that is not a secret", looked)
+	}
+
+	// Without the option, the same file needs its secrets.
+	if _, err := Load(rootFile, LoadOptions{LookupEnv: envMap(map[string]string{"MAXC": "7"}), ReadFile: files.ReadFile, Glob: files.Glob}); err == nil {
+		t.Error("Load without placeholders succeeded with no secrets set")
+	}
+}
+
+func TestSecretPaths(t *testing.T) {
+	want := map[string]bool{
+		"storage.redis.cache_url": true, "storage.redis.state_url": true,
+		"storage.ledger.dsn": true, "providers[].api_key": true,
+	}
+	if diff := cmp.Diff(want, secretPaths); diff != "" {
+		t.Errorf("secret paths (-want +got):\n%s", diff)
+	}
+	for in, out := range map[string]string{
+		"providers[12].api_key": "providers[].api_key", "a[0].b[3]": "a[].b[]", "x[]": "x[]", "x[1": "x[1", "plain": "plain",
+	} {
+		if got := indexFree(in); got != out {
+			t.Errorf("indexFree(%q) = %q, want %q", in, got, out)
+		}
 	}
 }

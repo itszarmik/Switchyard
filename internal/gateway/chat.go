@@ -14,12 +14,15 @@ import (
 // ChatCompletions serves one POST /v1/chat/completions request:
 //
 //  1. read and validate the body (413, 400) and the deadline header;
-//  2. resolve the model through the catalog (404 for an unknown model,
-//     400 model_not_supported for a virtual or non-chat model) and plan
-//     the deployments that have every capability the request needs, the
-//     cheapest first (400 no_eligible_model, naming each deployment and
-//     why it was excluded; 503 no_healthy_upstream when every eligible
-//     one is unhealthy);
+//  2. route it (see route): resolve the model field (404 for an unknown
+//     model, 400 model_not_supported for a non-chat model, or for auto
+//     the policy does not allow), assess it with the client's hints and
+//     resolve its policy (400 invalid_header for a malformed routing
+//     header), and plan the deployments that meet the policy and have
+//     every capability the request needs, the cheapest eligible first
+//     (400 no_eligible_model, naming each deployment and why it was
+//     excluded; 503 no_healthy_upstream when every eligible one is
+//     unhealthy);
 //  3. execute the plan (see execute): for each attempt, remove the
 //     parameters the deployment cannot honor, if they may be dropped, and
 //     call its adapter; a non-streaming answer is returned byte for byte;
@@ -61,34 +64,37 @@ func (g *Gateway) ChatCompletions(ctx context.Context, ex Exchange) {
 		return
 	}
 
-	if !g.planChat(ex, rec, req, len(body)) {
+	if !g.planChat(ctx, ex, rec, req, len(body)) {
 		return
 	}
 	g.execute(ctx, ex, rec, g.chatTry(ex, rec, req, nil))
 }
 
-// planChat resolves the model of a chat request and plans its
-// deployments into rec. When it fails it has already answered the client
-// and returns false.
-func (g *Gateway) planChat(ex Exchange, rec *record, req *schema.ChatRequest, size int) bool {
-	res, e := g.resolve(req.Model(), rec.endpoint, chatType)
+// planChat routes a chat request (see route) and makes the decision rec's
+// plan. When it fails it has already answered the client and returns
+// false.
+func (g *Gateway) planChat(ctx context.Context, ex Exchange, rec *record, req *schema.ChatRequest, size int) bool {
+	rr := chatRoute(ex, rec, req, size)
+	rt, e := g.route(ctx, rec.endpoint, &rr, &rec.rt)
 	if e != nil {
-		rec.respondError(ex, Info{}, e)
+		g.failRoute(ex, rec, rt, e)
 		return false
 	}
-	rec.info = Info{Model: res.Model.ID, Alias: res.Alias}
-	rec.alias = res.Alias
-	rec.model = res.Model
+	g.usePlan(rec, rt)
+	return true
+}
+
+// chatRoute describes a chat request for routing.
+func chatRoute(ex Exchange, rec *record, req *schema.ChatRequest, size int) routeRequest {
 	maxTokens, hasMax := req.MaxTokens()
 	images, inline := req.ImageParts()
-	rec.estIn, rec.estOut = estimateIn(size, images, inline, res.Model), estimateOut(maxTokens, hasMax, chatOutputs(req))
-	e = g.buildPlan(&rec.plan, res, req.RequiredCapabilities(), rec.estIn, rec.estOut, nil)
-	rec.excluded = len(rec.plan.exclusions)
-	if e != nil {
-		rec.respondError(ex, rec.info, e)
-		return false
+	return routeRequest{
+		model: req.Model(), header: ex.Header(), chat: req,
+		tenant: rec.tenant, keyID: rec.keyID, tags: rec.tags,
+		size: size, images: images, inline: inline,
+		maxTokens: maxTokens, hasMax: hasMax, outputs: chatOutputs(req),
+		required: req.RequiredCapabilities(), stream: req.Stream(),
 	}
-	return true
 }
 
 // chatTry returns the attempt function of a chat request. conv, when set,

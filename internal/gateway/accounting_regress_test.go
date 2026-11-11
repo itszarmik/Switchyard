@@ -238,11 +238,22 @@ func TestPanicEventStatus(t *testing.T) {
 	}
 }
 
+// routingBlindStore is a budget store whose state cannot be read for
+// routing, so the router plans without the remaining budget and the
+// executor's fallback charges decide alone.
+type routingBlindStore struct{ budget.Store }
+
+func (routingBlindStore) SoftCrossed(context.Context, []budget.Scope, time.Time) ([]budget.State, error) {
+	return nil, fmt.Errorf("soft: %w", budget.ErrUnavailable)
+}
+
 // TestBudgetFallbackSkipMetric checks that a pricier fallback passed over
-// for budget is counted as a skip, not as a 429 budget rejection.
+// for budget is counted as a skip, not as a 429 budget rejection. With the
+// budget's state known, the router leaves such fallbacks out of the plan
+// instead (see TestRouteBudgetRemaining).
 func TestBudgetFallbackSkipMetric(t *testing.T) {
 	est := int64(len(chatBody)/4) + defaultEstOut
-	e := newAcctEnv(t, tenantDayBudget(t, est+10), nil, nil)
+	e := newAcctEnv(t, tenantDayBudget(t, est+10), routingBlindStore{budget.NewMemoryStore()}, nil)
 	e.a.script(step{err: err503})
 	res := e.do(EndpointChatCompletions, chatBody, nil)
 	if res.status == 429 {

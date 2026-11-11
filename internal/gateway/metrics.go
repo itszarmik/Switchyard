@@ -46,6 +46,12 @@ type metrics struct {
 	budgetFallbackSkips prometheus.Counter
 	budgetStoreErrors   prometheus.Counter
 	budgetNotices       *prometheus.CounterVec
+
+	// Routing (DESIGN §15.2).
+	routeDecisions   *prometheus.CounterVec
+	routeRelaxations *prometheus.CounterVec
+	routeDowngrades  *prometheus.CounterVec
+	projectedSavings prometheus.Gauge
 }
 
 var _ health.Observer = (*metrics)(nil)
@@ -101,7 +107,7 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 	}, []string{"deployment"})
 	m.saturated = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "switchyard_provider_saturated_total",
-		Help: "Requests turned away from a provider at its max_concurrency, by provider.",
+		Help: "Attempts refused because the provider was at its max_concurrency when they started, by provider; routing around a saturated provider is not counted.",
 	}, []string{"provider"})
 	m.budgetExhausted = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "switchyard_retry_budget_exhausted_total",
@@ -136,10 +142,31 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 		Name: "switchyard_budget_notifications_total",
 		Help: "Budget notifications, by budget scope and kind: soft_threshold when a window first reaches soft_at, exceeded for each request admitted over a notify budget's limit.",
 	}, []string{"scope", "kind"})
+	m.routeDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_route_decisions_total",
+		Help: "Served chat and legacy completion requests, by routing profile, the catalog model that served them, and route reason (cheapest_eligible, pinned, preferred, quality_relaxed, latency_relaxed, budget_downgrade, observe, fallback:<kind>).",
+	}, []string{"profile", "served_model", "reason"})
+	m.routeRelaxations = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_route_relaxations_total",
+		Help: "Routing decisions that relaxed a soft constraint because no candidate met it (on_unmet best_effort), by constraint (latency, quality).",
+	}, []string{"constraint"})
+	m.routeDowngrades = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_route_profile_downgrades_total",
+		Help: "Auto requests routed with a budget's soft_profile because its soft threshold was crossed, by budget scope.",
+	}, []string{"scope"})
+	// A gauge, as savings_usd_total is: the projected savings of one
+	// request are negative when the router would have chosen a deployment
+	// pricier than the baseline, so the running total can decrease, which
+	// a counter must never do.
+	m.projectedSavings = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "switchyard_routing_projected_savings_usd_total",
+		Help: "Cumulative projected routing savings in USD of observe-mode requests: the baseline cost minus the cost of the same tokens on the deployment the router would have chosen. Projected, not realized; it can decrease.",
+	})
 	collectors := []prometheus.Collector{
 		m.requests, m.requestDuration, m.overhead, m.upstreamRequests, m.upstreamTTFT, m.upstreamDuration,
 		m.retries, m.fallbacks, m.transitions, m.cooldowns, m.saturated, m.budgetExhausted,
 		m.cost, m.tokens, m.savings, m.budgetRejections, m.budgetFallbackSkips, m.budgetStoreErrors, m.budgetNotices,
+		m.routeDecisions, m.routeRelaxations, m.routeDowngrades, m.projectedSavings,
 	}
 	if err := registerAll(reg, collectors); err != nil {
 		return nil, err

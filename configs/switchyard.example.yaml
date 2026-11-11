@@ -1,8 +1,8 @@
 # Switchyard reference configuration.
 #
-# Every key Phase 3 understands, with its default. The layout mirrors
-# docs/DESIGN.md §16.3. Later phases add sections (policies, cache) and
-# more routing settings; until then, any other key is rejected at load time.
+# Every key Phase 5 understands, with its default. The layout mirrors
+# docs/DESIGN.md §16.3. Later phases add sections (cache); until then, any
+# other key is rejected at load time.
 # CI validates this file with `switchyard config validate`.
 #
 # Values may reference the environment or files:
@@ -173,12 +173,15 @@ providers:
 # those, the cheapest serves it. "model@provider" pins one deployment.
 
 # Aliases: extra model names clients may send. Each maps to a catalog
-# model id or to a pinned deployment (model@provider). Alias names follow
-# the model id rules and must not collide with a model id. Default none.
+# model id, a pinned deployment (model@provider), or a virtual model:
+# auto or auto:<profile>, which routes across every model the caller's
+# policy allows. Alias names follow the model id rules and must not
+# collide with a model id. Default none.
 aliases:
   fast: claude-haiku-5-5
   smart: claude-opus-5-5
   gpt: gpt-6.1-sol@openai
+  code-review: auto:quality
 
 routing:
   # Remove optional parameters a deployment cannot honor (n, logprobs,
@@ -237,6 +240,36 @@ routing:
     default: 1s   # default 1s
     max: 30s      # default 30s
 
+  # Routing profiles (DESIGN §9.3): a quality bar, an objective and an
+  # optional latency target. Clients pick one with model "auto:<name>" or
+  # the X-Switchyard-Profile header; plain "auto" uses the policy's
+  # profile, else default_profile. Omit profiles to get exactly these four
+  # built-ins; configured profiles replace them all.
+  #   min_quality  the bar the estimated quality q̂ must reach, in [0, 1]
+  #   objective    cost (cheapest eligible, default) | latency (fastest
+  #                estimated time to first token)
+  #   max_ttft_ms  soft latency target in milliseconds; 0 (default) is none
+  profiles:
+    cheap:    { min_quality: 0.65, objective: cost }
+    balanced: { min_quality: 0.80, objective: cost }
+    quality:  { min_quality: 0.92, objective: cost }
+    fast:     { min_quality: 0.80, objective: latency, max_ttft_ms: 800 }
+  # The profile for plain "auto" when a policy names none. Default balanced.
+  default_profile: balanced
+  # Output tokens assumed for routing cost estimates when a request sets no
+  # max_tokens; with max_tokens, the smaller of the two. Budget admission
+  # still prices the output at max_tokens. Default 500.
+  expected_output_tokens: 500
+  # The request assessor (DESIGN §10.3): heuristic, the only type. Its
+  # signal weights, each in [-1, 1], override the defaults listed in the
+  # README's Quality scoring section: length, code, math, reasoning_cues,
+  # constraints, conversation_depth, tools, strict_schema, simple_task,
+  # creative and bias.
+  assessor:
+    type: heuristic
+    weights:
+      length: 0.25
+
   # SSE keep-alives for a slow first token. With a positive interval, a
   # stream that has not received its first upstream event after that long
   # is committed: 200, the SSE headers and a ": keep-alive" comment, repeated
@@ -245,6 +278,94 @@ routing:
   # error event in the stream. Use it only for intermediaries with short
   # idle timeouts. 0s (default) is off; otherwise at least 10ms.
   stream_keepalive: 0s
+
+# Policies (DESIGN §13): governance attached to tenants and keys. A key's
+# policy replaces its tenant's; a tenant without one uses the policy with
+# id "default", else built-in defaults (the default profile, everything
+# allowed, pinned substitution, enforce, best_effort, no baseline_model,
+# so no auto routing). Keys per policy:
+#   id                        names the policy; same rules as a tenant id
+#   profile                   the profile for plain "auto"
+#   allowed_profiles          profiles callers may select; default all
+#   allow, deny               globs over deployment ids (model@provider);
+#                             default allow all; deny wins
+#   prefer                    ordered globs; earlier ones form higher
+#                             preference tiers, and cost decides within one
+#   require_tags              tags every deployment must carry (provider
+#                             tags plus deployment tags)
+#   substitution              mode: pinned (default; only the requested
+#                             model) | equivalent (any allowed model whose
+#                             estimated quality is within max_quality_drop,
+#                             default 0.05, of the requested model's)
+#   routing_mode              enforce (default) | observe: serve what was
+#                             asked for (the baseline for auto), record what
+#                             routing would have chosen and the projected
+#                             savings
+#   baseline_model            the savings baseline, and the model observe
+#                             mode serves for auto; required for auto
+#   max_cost_per_request_usd  hard cap on a request's estimated cost
+#   on_unmet                  best_effort (default: relax the latency target,
+#                             then the quality bar) | reject (400)
+#   rules                     governance rules (the first match applies),
+#                             then quality rules on top; see below and the
+#                             README
+# Request headers can only tighten a policy: X-Switchyard-Profile (an
+# allowed profile), X-Switchyard-Max-Cost-Usd (a lower cap),
+# X-Switchyard-Min-Quality (a higher bar, up to the best min_quality among
+# the allowed profiles, or the soft profile's during a budget downgrade),
+# X-Switchyard-Max-TTFT-Ms (a shorter target). A value that would loosen
+# it is ignored, with an X-Switchyard-Policy-Warning response header. A
+# matching rule's profile replaces the one the request selects.
+policies:
+  - id: default
+    profile: balanced
+    allowed_profiles: [cheap, balanced, quality, fast]
+    deny: ["*@gpu-cluster"]
+    prefer: ["claude-*"]
+    substitution: { mode: pinned, max_quality_drop: 0.05 }
+    routing_mode: enforce
+    baseline_model: claude-sonnet-5-5
+    max_cost_per_request_usd: "0.50"
+    on_unmet: best_effort
+    # Two layers of rules. Governance rules match on who is asking and
+    # what they asked for (model, profile, key, key_tags, header, tags,
+    # stream, has_tools, has_images); the first that matches applies, and
+    # it may set anything. Quality rules match on what the request is
+    # (task, difficulty_gte, difficulty_lt, est_input_tokens_gte, with any
+    # governance condition too) and may set only min_quality and prefer;
+    # the first that matches applies on top of the governance rule, so
+    # request content or client hints can never skip a governance rule.
+    # Clients set headers and tags themselves: a rule matching them should
+    # only restrict, and comes before rules it must not shadow.
+    rules:
+      # Autocomplete traffic must answer fast and cheaply.
+      - name: autocomplete
+        match: { tags: { feature: autocomplete }, stream: "true" }
+        set: { profile: fast, max_cost_per_request_usd: "0.01" }
+      # Staging traffic always takes the cheap profile, whatever profile
+      # the request selects.
+      - name: staging-is-cheap
+        match: { header: { x-env: staging } }
+        set: { profile: cheap }
+      # A quality rule: hard coding requests need a higher bar than their
+      # profile's.
+      - name: code-needs-quality
+        match: { task: coding, difficulty_gte: 0.5 }
+        set: { min_quality: 0.85 }
+  # Onboarding: route nothing, measure what routing would save. Concrete
+  # model names may be served by an equivalent model once enforced.
+  - id: observe
+    routing_mode: observe
+    baseline_model: claude-sonnet-5-5
+    substitution: { mode: equivalent, max_quality_drop: 0.05 }
+  # Batch jobs: the cheap profile only, zero-data-retention providers
+  # only, and a 400 rather than a weaker model when nothing qualifies.
+  - id: batch
+    profile: cheap
+    allowed_profiles: [cheap]
+    require_tags: [zdr]
+    baseline_model: claude-sonnet-5-5
+    on_unmet: reject
 
 # Tenants own the gateway API keys that clients send as
 # "Authorization: Bearer sy_…". Config stores only each key's SHA-256 hash;
@@ -260,13 +381,16 @@ routing:
 #          rules as the tenant id, and unique across all tenants
 #   hash   "sha256:" and 64 lowercase hex characters; unique across all
 #          tenants. Never put the key itself here.
-#   tags   matched by policies in later phases, e.g. prod, eu
+#   tags   matched by policy rules (key_tags), e.g. prod, eu
+#   policy  a policy that replaces the tenant's for this key
 # Keys per budget:
 #   scope         tenant (the tenant's total spend) | key (each key's own)
 #   window        day | month, calendar periods in UTC
 #   limit_usd     the cap in USD, an exact decimal; > 0, at most 1000000000
 #   soft_at       optional fraction in (0, 1): reaching soft_at × limit is
 #                 logged and counted once per window
+#   soft_profile  optional, with soft_at: once the soft threshold has been
+#                 crossed in the window, auto requests use this profile
 #   on_exhausted  block (default): a request whose estimated cost does not
 #                 fit gets 429 budget_exceeded, with Retry-After until the
 #                 window resets | notify: it is served, logged and counted
@@ -282,17 +406,22 @@ routing:
 # The hashes below belong to keys nobody has: replace them with your own.
 tenants:
   - id: acme
+    # The policy of this tenant's keys. Default: the policy with id
+    # "default", else built-in defaults.
+    policy: default
     keys:
       - id: acme-backend
         hash: sha256:0f7d5a33e1ad68ae7b2a4b139d4c5bf17737e0db942bfbecc5792bb3436d3e59
         tags: [prod]
       - id: acme-ci
         hash: sha256:0eb9387d9e4b212cd42007efc1e129c69f55b64724268d2b9edbdc45fda4a0c2
+        policy: observe
     budgets:
       - scope: tenant
         window: month
         limit_usd: "2000"
         soft_at: 0.8
+        soft_profile: cheap
         on_exhausted: block
       - scope: key
         window: day

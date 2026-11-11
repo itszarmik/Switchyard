@@ -270,10 +270,15 @@ func TestCooldown(t *testing.T) {
 func TestProviderConcurrency(t *testing.T) {
 	tr, _, rec := newTracker(testConfig())
 	p := tr.Provider("gpu", 2)
-	if p.Saturated() || !p.Acquire() || !p.Acquire() {
+	if p.IsSaturated() || !p.Acquire() || !p.Acquire() {
 		t.Fatal("could not take two slots")
 	}
-	if !p.Saturated() || p.Acquire() {
+	for range 10 {
+		if !p.IsSaturated() {
+			t.Fatal("not saturated at the limit")
+		}
+	}
+	if p.Acquire() {
 		t.Fatal("a third slot was available")
 	}
 	if p.InFlight() != 2 || p.Max() != 2 {
@@ -288,8 +293,9 @@ func TestProviderConcurrency(t *testing.T) {
 	if p.InFlight() != 0 {
 		t.Errorf("in flight %d after releasing all", p.InFlight())
 	}
-	if got := rec.list(); len(got) != 2 || got[0] != "saturated gpu" {
-		t.Errorf("events %v", got)
+	// Only the refused Acquire counts; IsSaturated has no side effects.
+	if got := rec.list(); len(got) != 1 || got[0] != "saturated gpu" {
+		t.Errorf("events %v, want one saturation", got)
 	}
 
 	unlimited := tr.Provider("cloud", 0)
@@ -513,7 +519,7 @@ func TestHotPathDoesNotAllocate(t *testing.T) {
 	d := tr.Deployment("m@a", "a", LatencyHint{TTFT: time.Second})
 	p := tr.Provider("a", 100)
 	allocs := testing.AllocsPerRun(1000, func() {
-		if d.Skip() != "" || p.Saturated() || !p.Acquire() {
+		if d.Skip() != "" || p.IsSaturated() || !p.Acquire() {
 			panic("unhealthy")
 		}
 		probe, _ := d.Admit(false)

@@ -56,12 +56,39 @@ const (
 	defaultCooldownMax          = 30 * time.Second
 )
 
+// Routing profile, assessor and policy defaults (DESIGN §9.3, §13).
+const (
+	// DefaultProfileName is routing.default_profile when the file sets none.
+	DefaultProfileName          = "balanced"
+	defaultExpectedOutputTokens = 500
+	defaultObjective            = ObjectiveCost
+	defaultAssessorType         = AssessorHeuristic
+	defaultSubstitutionMode     = SubstitutionPinned
+	// DefaultMaxQualityDrop is substitution.max_quality_drop when a policy
+	// sets none.
+	DefaultMaxQualityDrop = 0.05
+	defaultRoutingMode    = RoutingModeEnforce
+	defaultOnUnmet        = OnUnmetBestEffort
+)
+
 // Config paths whose zero value is valid, so a default applies only when
 // the file does not set them.
 const (
 	pathRetriesPerDeployment = "routing.fallback.retries_per_deployment"
 	pathRetryBudgetMin       = "routing.fallback.retry_budget_min"
 )
+
+// DefaultProfiles returns the built-in profiles (DESIGN §9.3): cheap,
+// balanced, quality and fast. They apply only when the file configures no
+// profiles; configured profiles replace them entirely.
+func DefaultProfiles() map[string]Profile {
+	return map[string]Profile{
+		"cheap":    {MinQuality: 0.65, Objective: ObjectiveCost},
+		"balanced": {MinQuality: 0.80, Objective: ObjectiveCost},
+		"quality":  {MinQuality: 0.92, Objective: ObjectiveCost},
+		"fast":     {MinQuality: 0.80, Objective: ObjectiveLatency},
+	}
+}
 
 // DefaultRouting returns the documented routing defaults. Code that builds
 // a Config by hand rather than loading one can use it to fill the routing
@@ -89,6 +116,10 @@ func DefaultRouting() Routing {
 			Default: Duration(defaultCooldown),
 			Max:     Duration(defaultCooldownMax),
 		},
+		DefaultProfile:       DefaultProfileName,
+		Profiles:             DefaultProfiles(),
+		ExpectedOutputTokens: defaultExpectedOutputTokens,
+		Assessor:             AssessorConfig{Type: defaultAssessorType},
 	}
 }
 
@@ -128,6 +159,23 @@ func applyDefaults(c *Config, explicit func(path string) bool) {
 	}
 	applyRoutingDefaults(&c.Routing, explicit)
 	applyBudgetDefaults(c)
+	applyPolicyDefaults(c.Policies, explicit)
+}
+
+// applyPolicyDefaults fills substitution, routing_mode and on_unmet on every
+// policy. max_quality_drop may be 0, so its default applies only when the
+// file does not set it. Rule overrides are left alone: their zero values
+// mean "keep the policy's value".
+func applyPolicyDefaults(ps []Policy, explicit func(path string) bool) {
+	for i := range ps {
+		p := &ps[i]
+		setDefault(&p.Substitution.Mode, defaultSubstitutionMode)
+		if explicit == nil || !explicit(indexPath("policies", i)+".substitution.max_quality_drop") {
+			setDefault(&p.Substitution.MaxQualityDrop, DefaultMaxQualityDrop)
+		}
+		setDefault(&p.RoutingMode, defaultRoutingMode)
+		setDefault(&p.OnUnmet, defaultOnUnmet)
+	}
 }
 
 // applyBudgetDefaults fills on_exhausted on every tenant budget and
@@ -165,6 +213,18 @@ func applyRoutingDefaults(r *Routing, explicit func(path string) bool) {
 	setDefault(&b.HalfOpenProbes, db.HalfOpenProbes)
 	setDefault(&r.RateLimitCooldown.Default, def.RateLimitCooldown.Default)
 	setDefault(&r.RateLimitCooldown.Max, def.RateLimitCooldown.Max)
+	setDefault(&r.DefaultProfile, def.DefaultProfile)
+	setDefault(&r.ExpectedOutputTokens, def.ExpectedOutputTokens)
+	setDefault(&r.Assessor.Type, def.Assessor.Type)
+	if len(r.Profiles) == 0 {
+		r.Profiles = def.Profiles
+	}
+	for name, p := range r.Profiles {
+		if p.Objective == "" {
+			p.Objective = defaultObjective
+			r.Profiles[name] = p
+		}
+	}
 }
 
 // setDefault sets *p to def if *p is the zero value.

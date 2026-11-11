@@ -1,6 +1,7 @@
 // Package openaiapi serves the OpenAI-compatible /v1 endpoints over HTTP:
 // POST /v1/chat/completions and POST /v1/completions (JSON and SSE),
-// POST /v1/embeddings and GET /v1/models.
+// POST /v1/embeddings and GET /v1/models; and the routing dry run that
+// takes the same requests, POST /switchyard/v1/route/explain.
 //
 // The handlers own the HTTP details (reading the body, the response and
 // X-Switchyard-* headers, the OpenAI error envelope, SSE framing and
@@ -40,6 +41,9 @@ const (
 	headerAttempts          = "X-Switchyard-Attempts"
 	headerRouteReason       = "X-Switchyard-Route-Reason"
 	headerCostUSD           = "X-Switchyard-Cost-Usd"
+	headerProfile           = "X-Switchyard-Profile"
+	headerPolicyWarning     = "X-Switchyard-Policy-Warning"
+	headerShadowModel       = "X-Switchyard-Shadow-Model"
 )
 
 // Defaults for the zero values of Options.
@@ -77,7 +81,7 @@ type Route struct {
 	Endpoint string
 }
 
-// Routes returns the /v1 routes served by gw.
+// Routes returns the /v1 routes and the explain route served by gw.
 func Routes(gw *gateway.Gateway, opts Options) []Route {
 	opts = opts.withDefaults()
 	post := func(endpoint string, serve func(context.Context, gateway.Exchange)) Route {
@@ -87,6 +91,7 @@ func Routes(gw *gateway.Gateway, opts Options) []Route {
 		post(gateway.EndpointChatCompletions, gw.ChatCompletions),
 		post(gateway.EndpointCompletions, gw.Completions),
 		post(gateway.EndpointEmbeddings, gw.Embeddings),
+		post(gateway.EndpointExplain, gw.Explain),
 		{Pattern: "GET " + gateway.EndpointModels, Endpoint: gateway.EndpointModels, Handler: modelsHandler{gw: gw}},
 	}
 }
@@ -120,7 +125,7 @@ type modelList struct {
 
 // ServeHTTP serves GET /v1/models.
 func (h modelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	models := h.gw.ListModels()
+	models := h.gw.ListModels(r.Context())
 	list := modelList{Object: "list", Data: make([]modelObject, 0, len(models))}
 	for _, m := range models {
 		list.Data = append(list.Data, modelObject{ID: m.ID, Object: "model", Created: m.Created, OwnedBy: "switchyard"})
@@ -292,6 +297,15 @@ func setInfo(h http.Header, info gateway.Info) {
 	}
 	if info.CostUSD != "" {
 		h.Set(headerCostUSD, info.CostUSD)
+	}
+	if info.Profile != "" {
+		h.Set(headerProfile, info.Profile)
+	}
+	if info.PolicyWarning != "" {
+		h.Set(headerPolicyWarning, info.PolicyWarning)
+	}
+	if info.ShadowModel != "" {
+		h.Set(headerShadowModel, info.ShadowModel)
 	}
 }
 

@@ -124,6 +124,24 @@ func (m *MemoryStore) Spent(_ context.Context, s Scope, now time.Time) (int64, e
 	return 0, nil
 }
 
+// SoftCrossed implements Store.
+func (m *MemoryStore) SoftCrossed(_ context.Context, scopes []Scope, now time.Time) ([]State, error) {
+	if len(scopes) == 0 {
+		return nil, nil
+	}
+	out := make([]State, len(scopes))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, s := range scopes {
+		c, ok := m.counters[counterKey{s.Name, windowStart(s.Window, now)}]
+		if !ok {
+			continue
+		}
+		out[i] = State{Spent: c.spent, SoftCrossed: s.SoftAtMicro > 0 && (c.softCrossed || c.spent >= s.SoftAtMicro)}
+	}
+	return out, nil
+}
+
 // get returns the counter of s in the window starting at start, creating
 // it if needed. The caller holds m.mu.
 func (m *MemoryStore) get(s Scope, start time.Time) *counter {

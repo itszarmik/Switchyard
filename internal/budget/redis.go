@@ -208,6 +208,39 @@ func (r *RedisStore) Settle(ctx context.Context, a Admission, actual int64) erro
 	return nil
 }
 
+// SoftCrossed implements Store with one MGET of every scope's counter and
+// soft-threshold flag.
+func (r *RedisStore) SoftCrossed(ctx context.Context, scopes []Scope, now time.Time) ([]State, error) {
+	if len(scopes) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, 2*len(scopes))
+	for _, s := range scopes {
+		k := r.key(s, windowStart(s.Window, now))
+		keys = append(keys, k, k+":soft")
+	}
+	vals, err := r.client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, unavailable(ctx, "soft", err)
+	}
+	if len(vals) != len(keys) {
+		return nil, unavailable(ctx, "soft", errors.New("unexpected MGET result"))
+	}
+	out := make([]State, len(scopes))
+	for i, s := range scopes {
+		if v, ok := vals[2*i].(string); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return nil, unavailable(ctx, "soft", errors.New("a budget counter is not an integer"))
+			}
+			out[i].Spent = n
+		}
+		flag := vals[2*i+1] != nil
+		out[i].SoftCrossed = s.SoftAtMicro > 0 && (flag || out[i].Spent >= s.SoftAtMicro)
+	}
+	return out, nil
+}
+
 // Spent implements Store.
 func (r *RedisStore) Spent(ctx context.Context, s Scope, now time.Time) (int64, error) {
 	v, err := r.client.Get(ctx, r.key(s, windowStart(s.Window, now))).Int64()

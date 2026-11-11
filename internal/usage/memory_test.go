@@ -28,15 +28,18 @@ func handEvents(t testing.TB) []*Event {
 			CacheStatus: CacheStatusMiss, Tokens: Tokens{Input: 1234, Output: 567}, UsageKnown: true,
 			Cost: m("0.0005253"), CostKnown: true, Pricing: pricing(t, "0.15", "0.6", "", ""),
 			BaselineModel: "gpt", BaselineCost: m("0.0005253"),
-			Tags: map[string]string{"team": "search"},
+			Tags:    map[string]string{"team": "search"},
+			Profile: "balanced", RoutingMode: RoutingModeEnforce,
 		},
-		{ // e2: fell back to a pricier provider, with overhead.
+		{ // e2: fell back to a pricier provider, with overhead, in observe
+			// mode with a cheaper shadow deployment.
 			ID: "e2", Time: day0.Add(time.Hour), Tenant: "acme", KeyID: "k2", Endpoint: "/v1/chat/completions",
 			RequestedModel: "gpt", Deployment: "gpt@azure", Provider: "azure", Status: 200, Attempts: 2,
 			FallbackReason: "server_error", CacheStatus: CacheStatusMiss,
 			Tokens: Tokens{Input: 100, CachedInput: 50, CacheWrite: 25, Output: 10}, UsageKnown: true,
 			Cost: m("0.001"), CostKnown: true, BaselineModel: "gpt", BaselineCost: m("0.0008"), OverheadCost: m("0.00001"),
-			Tags: map[string]string{"team": "ads", "env": "prod"},
+			Tags:        map[string]string{"team": "ads", "env": "prod"},
+			RoutingMode: RoutingModeObserve, ShadowDeployment: "mini@openai", ShadowCost: m("0.0003"), ShadowCostKnown: true,
 		},
 		{ // e3: an embedding request that failed upstream.
 			ID: "e3", Time: day0.Add(24 * time.Hour), Tenant: "acme", KeyID: "k1", Endpoint: "/v1/embeddings",
@@ -59,6 +62,7 @@ func handEvents(t testing.TB) []*Event {
 			ID: "e6", Time: day0.Add(26 * time.Hour), Tenant: "acme", KeyID: "k2", Endpoint: "/v1/chat/completions",
 			RequestedModel: "gpt", Status: 200, CacheStatus: CacheStatusHit, Tokens: Tokens{Input: 10, Output: 20},
 			UsageKnown: true, CostKnown: true, BaselineModel: "gpt", BaselineCost: m("0.002"),
+			Profile: "cheap", RoutingMode: RoutingModeEnforce,
 		},
 		{ // e7: outside the queried range.
 			ID: "e7", Time: time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC), Tenant: "acme", KeyID: "k1",
@@ -112,7 +116,8 @@ func checkHandComputed(t *testing.T, rep Reporter) {
 	}
 	want.SavingsUSD.Routing = m("-0.0002") // 0 + (0.0008 - 0.001) + 0
 	want.SavingsUSD.Cache = m("0.002")
-	want.SavingsUSD.Net = m("0.00179") // = baseline - cost
+	want.SavingsUSD.Net = m("0.00179")     // = baseline - cost
+	want.ProjectedSavingsUSD = m("0.0005") // e2 in observe mode: 0.0008 - 0.0003
 	if diff := cmp.Diff(want, r.Totals); diff != "" {
 		t.Errorf("totals (-want +got):\n%s", diff)
 	}
@@ -147,6 +152,8 @@ func TestMemoryLedgerEveryGroupBy(t *testing.T) {
 		{GroupByEndpoint, map[string]int64{"/v1/chat/completions": 4, "/v1/embeddings": 1}},
 		{GroupByStatusClass, map[string]int64{"2xx": 4, "5xx": 1}},
 		{GroupByCacheStatus, map[string]int64{"miss": 4, "hit": 1}},
+		{GroupByProfile, map[string]int64{"balanced": 1, "cheap": 1, "": 3}},
+		{GroupByRoutingMode, map[string]int64{"enforce": 2, "observe": 1, "": 2}},
 		{"tag:team", map[string]int64{"search": 1, "ads": 1, "": 3}},
 		{"tag:env", map[string]int64{"prod": 1, "": 4}},
 	}
@@ -499,6 +506,12 @@ func randomEvents(t testing.TB, seed uint64, n int) []*Event {
 		if ev.CostKnown {
 			ev.Cost, ev.BaselineCost = money(), money()
 		}
+		ev.Profile = pick("", "cheap", "balanced")
+		ev.RoutingMode = pick("", RoutingModeEnforce, RoutingModeObserve)
+		if ev.RoutingMode == RoutingModeObserve && rng.IntN(5) != 0 {
+			ev.ShadowDeployment = pick("mini@openai", "haiku@anthropic")
+			ev.ShadowCost, ev.ShadowCostKnown = money(), rng.IntN(4) != 0
+		}
 		if rng.IntN(4) == 0 {
 			ev.OverheadCost = money()
 		}
@@ -519,7 +532,7 @@ func reportQueries() []Query {
 	from := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
 	dims := []string{GroupByDay, GroupByModel, GroupByDeployment, GroupByProvider, GroupByKey, GroupByEndpoint,
-		GroupByStatusClass, GroupByCacheStatus, "tag:team", "tag:env"}
+		GroupByStatusClass, GroupByCacheStatus, GroupByProfile, GroupByRoutingMode, "tag:team", "tag:env"}
 	var qs []Query
 	for _, tenant := range []string{"acme", "globex", "nobody", ""} {
 		qs = append(qs, Query{Tenant: tenant, From: from, To: to})
@@ -529,6 +542,7 @@ func reportQueries() []Query {
 		qs = append(qs,
 			Query{Tenant: tenant, From: from, To: to, GroupBy: []string{GroupByModel, GroupByDay}, Limit: 25},
 			Query{Tenant: tenant, From: from, To: to, GroupBy: []string{"tag:team", GroupByProvider, GroupByStatusClass}},
+			Query{Tenant: tenant, From: from, To: to, GroupBy: []string{GroupByRoutingMode, GroupByProfile}},
 			// A narrower window, inside one month and across a month boundary.
 			Query{Tenant: tenant, From: from.AddDate(0, 0, 3), To: from.AddDate(0, 0, 10), GroupBy: []string{GroupByKey}},
 			Query{Tenant: tenant, From: from.AddDate(0, 0, 25), To: from.AddDate(0, 1, 5), GroupBy: []string{GroupByDay}},
@@ -542,7 +556,7 @@ func reportQueries() []Query {
 func checkTotalsAgainstEvents(t *testing.T, q Query, r *Report, events []*Event) {
 	t.Helper()
 	var n int64
-	var cost, baseline, overhead Money
+	var cost, baseline, overhead, projected Money
 	for _, ev := range events {
 		if (q.Tenant != "" && ev.Tenant != q.Tenant) || ev.Time.Before(q.From) || !ev.Time.Before(q.To) {
 			continue
@@ -552,7 +566,13 @@ func checkTotalsAgainstEvents(t *testing.T, q Query, r *Report, events []*Event)
 		if ev.CostKnown {
 			cost = cost.Add(ev.Cost)
 			baseline = baseline.Add(ev.BaselineCost)
+			if ev.RoutingMode == RoutingModeObserve && ev.ShadowCostKnown {
+				projected = projected.Add(ev.BaselineCost).Sub(ev.ShadowCost)
+			}
 		}
+	}
+	if !r.Totals.ProjectedSavingsUSD.Equal(projected) {
+		t.Errorf("projected savings = %s, Go sum %s", r.Totals.ProjectedSavingsUSD, projected)
 	}
 	if r.Totals.Requests != n || !r.Totals.CostUSD.Equal(cost.Add(overhead)) ||
 		!r.Totals.BaselineCostUSD.Equal(baseline) || !r.Totals.OverheadUSD.Equal(overhead) {

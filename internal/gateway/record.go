@@ -13,6 +13,7 @@ import (
 	"switchyard/internal/health"
 	"switchyard/internal/providers"
 	"switchyard/internal/reqctx"
+	"switchyard/internal/router"
 	"switchyard/internal/schema"
 )
 
@@ -86,9 +87,11 @@ type record struct {
 	status int
 	// model is the resolved catalog model, the baseline of the savings.
 	model *catalog.Model
-	// estIn and estOut are the request's input and output token
-	// estimates for budget admission; output is max_tokens when set.
-	estIn, estOut int64
+	// inBytes and inImages are the request's input for the token
+	// estimates (see inputSize); estIn gives the input estimate on a
+	// model. estOut is the output token estimate for budget admission:
+	// max_tokens when set.
+	inBytes, inImages, estOut int64
 	// adm is the request's budget admission, when admitted is set.
 	adm      budget.Admission
 	admitted bool
@@ -97,6 +100,17 @@ type record struct {
 	outBytes int64
 	// acct is what the request used and cost, once computed (see account).
 	acct *accounting
+
+	// route is the routing outcome of a chat or legacy completion request,
+	// once routed. profile and routingMode are what its usage event
+	// records; baseReason is its route reason before any fallback.
+	route                *routed
+	rt                   routed // the storage of route
+	profile, routingMode string
+	baseReason           string
+	// dryRun is set for the explain endpoint, which neither settles a
+	// budget nor records usage.
+	dryRun bool
 }
 
 // startAttempt makes the admitted attempt adm on d the attempt in
@@ -127,11 +141,15 @@ func (r *record) commitHealth(ttft time.Duration) {
 	r.curHealth.Commit(r.curAdmission, ttft)
 }
 
-// routeReason is the X-Switchyard-Route-Reason of an attempt on plan p.
+// routeReason is the X-Switchyard-Route-Reason of an attempt on plan p:
+// fallback:<kind> once a fallback happened, else the routing decision's
+// reason (see baseReason), else pinned or cheapest_eligible.
 func (r *record) routeReason(p *plan) string {
 	switch {
 	case r.fallbackReason != "":
 		return reasonFallback + r.fallbackReason
+	case r.baseReason != "":
+		return r.baseReason
 	case p.pinned:
 		return reasonPinned
 	}
@@ -229,9 +247,11 @@ func (r *record) done() {
 // usage event and cost metrics (see settle and recordUsage); cost_usd is
 // logged when the cost is known and the upstream accepted the request.
 func (r *record) finish() {
-	r.settle()
 	latency := time.Since(r.start)
-	r.recordUsage(latency)
+	if !r.dryRun {
+		r.settle()
+		r.recordUsage(latency)
+	}
 	overhead := max(latency-r.upstreamWait-r.clientWait-r.backoff, 0)
 	r.g.metrics.overhead.WithLabelValues(r.endpoint).Observe(overhead.Seconds())
 
@@ -240,7 +260,7 @@ func (r *record) finish() {
 		deployment = d.ID
 	}
 
-	attrs := make([]slog.Attr, 0, 20)
+	attrs := make([]slog.Attr, 0, 32)
 	attrs = append(attrs,
 		slog.String("requested_model", r.requestedModel),
 		slog.String("deployment", deployment),
@@ -288,7 +308,63 @@ func (r *record) finish() {
 	if r.errorMessage != "" {
 		attrs = append(attrs, slog.String("error", r.errorMessage))
 	}
+	if r.route != nil {
+		attrs = r.routeAttrs(attrs)
+	}
 	reqctx.Annotate(r.ctx, attrs...)
+}
+
+// routeAttrs appends the routing fields of the access log, and counts the
+// served decision in route_decisions_total: policy, matched_rule and
+// matched_quality_rule (when set), profile, routing_mode, the assessment's category and difficulty, quality_bar,
+// served_q (the served deployment's q̂), relaxed (the relaxed soft checks,
+// comma-separated) and, in observe mode, shadow_deployment.
+func (r *record) routeAttrs(attrs []slog.Attr) []slog.Attr {
+	rt := r.route
+	exp := &rt.served.Explanation
+	// The policy and the rule are logged only when set, as the other
+	// optional fields are: each attr costs the redacting handler.
+	if rt.eff.PolicyID != "" {
+		attrs = append(attrs, slog.String("policy", rt.eff.PolicyID))
+	}
+	if rt.eff.MatchedRule != "" {
+		attrs = append(attrs, slog.String("matched_rule", rt.eff.MatchedRule))
+	}
+	if rt.eff.MatchedQualityRule != "" {
+		attrs = append(attrs, slog.String("matched_quality_rule", rt.eff.MatchedQualityRule))
+	}
+	attrs = append(attrs,
+		slog.String("profile", rt.eff.Profile),
+		slog.String("routing_mode", rt.eff.RoutingMode),
+		slog.String("category", rt.assessment.Category),
+		slog.Float64("difficulty", exp.Assessment.Difficulty),
+		slog.Float64("quality_bar", rt.full.Explanation.QualityBar),
+	)
+	if d := r.deployment; d != nil {
+		for i := range exp.Candidates {
+			if c := &exp.Candidates[i]; c.Deployment == d.ID {
+				attrs = append(attrs, slog.Float64("served_q", c.Q))
+				break
+			}
+		}
+		if r.served && !r.dryRun {
+			r.g.metrics.routeDecisions.WithLabelValues(rt.eff.Profile, d.Model.ID, r.info.RouteReason).Inc()
+		}
+	}
+	if len(rt.full.Relaxed) > 0 {
+		attrs = append(attrs, slog.String("relaxed", strings.Join(rt.full.Relaxed, ",")))
+	}
+	if rt.shadow != nil {
+		attrs = append(attrs, slog.String("shadow_deployment", rt.shadow.ID))
+	}
+	return attrs
+}
+
+// estIn is the request's input-token estimate on a deployment of m, at m's
+// token_ratio, as the router estimates it: a fallback to another model, or
+// the usage estimated on the served one, uses that model's own estimate.
+func (r *record) estIn(m *catalog.Model) int64 {
+	return router.InputTokens(r.inBytes, m.TokenRatio) + r.inImages
 }
 
 // ms returns d in fractional milliseconds.

@@ -51,7 +51,7 @@ func (g *Gateway) resolve(name, endpoint, wantType string) (catalog.Resolution, 
 	res, err := g.catalog.Resolve(name)
 	switch {
 	case errors.Is(err, catalog.ErrVirtualModel):
-		return res, virtualModel(name)
+		return res, virtualModel(name, endpoint)
 	case err != nil:
 		return res, modelNotFound(name)
 	case res.Model.Type != wantType:
@@ -65,12 +65,13 @@ func (g *Gateway) resolve(name, endpoint, wantType string) (catalog.Resolution, 
 // a large one), not by the bytes of its encoding.
 const imageTokens = 1600
 
-// estimateIn is the input-token estimate of a request body of n bytes, of
-// which inline bytes are image data in images image parts: the text at
-// bytes/4, scaled by the model's token ratio, plus imageTokens per image.
-func estimateIn(n, images, inline int, m *catalog.Model) int64 {
-	text := max(n-inline, 0)
-	return int64(float64(text)/4*m.TokenRatio) + int64(images)*imageTokens
+// inputSize is the input of a request body of n bytes, of which inline
+// bytes are image data in images image parts, for the token estimates: the
+// bytes of everything but the inline images, which router.InputTokens
+// turns into tokens at a model's token ratio, and imageTokens per image,
+// whatever the model.
+func inputSize(n, images, inline int) (bytes, imageTok int64) {
+	return int64(max(n-inline, 0)), int64(images) * imageTokens
 }
 
 // maxEstOut bounds the output-token estimate. It is far above any context
@@ -195,7 +196,7 @@ func (g *Gateway) buildPlan(p *plan, res catalog.Resolution, required schema.Cap
 	for i, c := range ranking.Candidates {
 		h, pv := g.deps[c.Deployment.ID], g.provs[c.Deployment.Provider]
 		reason := h.Skip()
-		if reason == "" && pv.Saturated() {
+		if reason == "" && pv.IsSaturated() {
 			reason = "provider at max_concurrency " + strconv.Itoa(pv.Max())
 		}
 		if reason != "" {

@@ -5,6 +5,7 @@
 //	switchyard serve [-c FILE] [--log-level LEVEL]
 //	switchyard config validate [-c FILE] [--log-level LEVEL]
 //	switchyard catalog lint [-c FILE]
+//	switchyard route explain [-c FILE] --tenant ID [--key ID] [--header 'Name: value']... [FILE|-]
 //	switchyard keys generate [--tenant ID] [--key-id ID]
 //	switchyard version
 //	switchyard help
@@ -47,6 +48,7 @@ Usage:
   switchyard serve [flags]             run the gateway
   switchyard config validate [flags]   check a config file and exit
   switchyard catalog lint [-c FILE]    check catalog prices and sources; exit 1 on warnings
+  switchyard route explain [flags]     explain how a chat request would be routed, offline
   switchyard keys generate [flags]     create a gateway API key
   switchyard version                   print the build metadata
   switchyard help                      print this help
@@ -54,6 +56,12 @@ Usage:
 Flags for serve and config validate:
   -c, --config FILE    config file (default $SWITCHYARD_CONFIG, else ./switchyard.yaml)
   --log-level LEVEL    debug, info, warn or error; overrides the config file
+
+Flags for route explain (the request body is FILE, or stdin for - or none):
+  -c, --config FILE        config file, as for serve
+  --tenant ID              tenant whose policy applies (required)
+  --key ID                 the tenant's API key, for key policies and rules
+  --header 'Name: value'   a request header, such as X-Switchyard-Profile; repeatable
 
 Flags for keys generate:
   --tenant ID          tenant that owns the key (default "default")
@@ -92,6 +100,8 @@ func run(args []string, stdout, stderr io.Writer, lookupEnv func(string) (string
 		return runValidate(rest[1:], stdout, stderr, lookupEnv)
 	case "catalog":
 		return runCatalog(rest, stdout, stderr, lookupEnv, time.Now)
+	case "route":
+		return runRoute(rest, os.Stdin, stdout, stderr, lookupEnv)
 	case "keys":
 		return runKeys(rest, stdout, stderr)
 	case "version", "--version":
@@ -111,6 +121,10 @@ func run(args []string, stdout, stderr io.Writer, lookupEnv func(string) (string
 type loadFlags struct {
 	config   string
 	logLevel string
+	// secretPlaceholders loads without the config's secrets (see
+	// config.LoadOptions.SecretPlaceholders), for commands that never
+	// call an upstream or a store.
+	secretPlaceholders bool
 }
 
 // parseLoadFlags parses args for the named subcommand. When it returns
@@ -168,7 +182,7 @@ func load(f loadFlags, stderr io.Writer, lookupEnv func(string) (string, bool)) 
 		overrides["logging.level"] = f.logLevel
 	}
 
-	snap, err := config.Load(path, config.LoadOptions{LookupEnv: lookupEnv, Overrides: overrides})
+	snap, err := config.Load(path, config.LoadOptions{LookupEnv: lookupEnv, Overrides: overrides, SecretPlaceholders: f.secretPlaceholders})
 	if err == nil {
 		return snap, path, true
 	}

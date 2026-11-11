@@ -206,8 +206,71 @@ func TestPostgresMigrationsConcurrentStart(t *testing.T) {
 			t.Errorf("concurrent start: %v", err)
 		}
 	}
-	if n := db.count(t, "SELECT count(*) FROM schema_migrations"); n != 1 {
-		t.Errorf("schema_migrations has %d rows, want 1", n)
+	ms, err := loadMigrations(migrationFiles, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := db.count(t, "SELECT count(*) FROM schema_migrations"); n != int64(len(ms)) {
+		t.Errorf("schema_migrations has %d rows, want %d", n, len(ms))
+	}
+}
+
+// TestPostgresMigration0002KeepsOldRows: rows written before the routing
+// columns existed stay readable after migration 0002, which is safe to run
+// again, and reports count them with no profile, routing mode or
+// projected savings.
+func TestPostgresMigration0002KeepsOldRows(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	ctx := context.Background()
+	ms, err := loadMigrations(migrationFiles, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) < 2 || ms[1].version != 2 {
+		t.Fatalf("migrations = %v, want 0001 and 0002", ms)
+	}
+	if _, err := migrate(ctx, db.admin, ms[:1]); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	for _, sql := range []string{
+		"CREATE TABLE usage_events_p202611 PARTITION OF usage_events FOR VALUES FROM ('2026-11-01T00:00:00Z') TO ('2026-12-01T00:00:00Z')",
+		`INSERT INTO usage_events (id, ts, tenant, key_id, endpoint, requested_model, alias, deployment, provider, stream, status,
+			attempts, fallback_reason, route_reason, cache_status, input_tokens, cached_input_tokens, cache_write_tokens,
+			output_tokens, usage_known, usage_estimated, cost_usd, cost_known, pricing, baseline_model, baseline_cost_usd,
+			overhead_cost_usd, latency_ms, ttft_ms, tags, config_version)
+		VALUES ('old', '2026-11-05T12:00:00Z', 'acme', 'k1', '/v1/chat/completions', 'gpt', '', 'gpt@openai', 'openai', false, 200,
+			1, '', 'cheapest_eligible', 'miss', 10, 0, 0, 5, true, false, 0.25, true, '{}', 'gpt', 0.5, 0, 1, 1, '{}', 'v1')`,
+	} {
+		if _, err := db.admin.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	applied, err := migrate(ctx, db.admin, ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != len(ms)-1 || applied[0] != 2 {
+		t.Errorf("applied %v, want every migration after 0001", applied)
+	}
+	// The migration itself is idempotent, even outside schema_migrations.
+	if _, err := db.admin.Exec(ctx, ms[1].sql); err != nil {
+		t.Errorf("re-running 0002: %v", err)
+	}
+
+	l := openLedger(t, db.dsn, PostgresOptions{})
+	defer closeLedger(t, l)
+	r, err := l.Report(ctx, Query{Tenant: "acme", From: ts.Add(-time.Hour), To: ts.Add(time.Hour), GroupBy: []string{GroupByProfile, GroupByRoutingMode}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Totals.Requests != 1 || r.Totals.CostUSD.String() != "0.25" || r.Totals.SavingsUSD.Routing.String() != "0.25" ||
+		!r.Totals.ProjectedSavingsUSD.IsZero() {
+		t.Errorf("totals of the old row = %+v", r.Totals)
+	}
+	if len(r.Groups) != 1 || r.Groups[0].Key[GroupByProfile] != "" || r.Groups[0].Key[GroupByRoutingMode] != "" {
+		t.Errorf("groups = %+v, want one with an empty profile and routing mode", r.Groups)
 	}
 }
 
@@ -555,7 +618,8 @@ func TestPostgresReportsDoNotStarveWriter(t *testing.T) {
 	if _, err := db.admin.Exec(ctx, "INSERT INTO usage_events ("+strings.Join(ledgerColumns, ", ")+`)
 		SELECT 'seed-'||g, $1::timestamptz + (g % 86400) * interval '1 second', 'attacker', 'k', 'chat', 'm'||(g % 1000), '', 'd', 'p',
 		false, 200, 1, '', '', 'miss', 10, 0, 0, 10, true, false, 0.000001, true, '{}', 'm', 0.000001, 0, 1, 1,
-		jsonb_build_object('a', (g % 50000)::text, 'b', (g % 7)::text), 'v'
+		jsonb_build_object('a', (g % 50000)::text, 'b', (g % 7)::text), 'v',
+		'balanced', 'observe', 'm@p', 0.0000005, true
 		FROM generate_series(1, 300000) g`, month); err != nil {
 		t.Fatalf("seed: %v", err)
 	}

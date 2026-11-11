@@ -61,6 +61,10 @@ type Scope struct {
 	// SoftAtMicro is the soft threshold, soft_at × limit in micro-USD
 	// rounded up, or 0 if the budget has none.
 	SoftAtMicro int64
+	// SoftProfile is the profile auto requests use once the soft
+	// threshold has been crossed in the current window (DESIGN §9.5), or
+	// "" for none.
+	SoftProfile string
 	// Block is true when on_exhausted is block: a request that would
 	// exceed the limit is refused. Otherwise (notify) it is charged and
 	// reported in Admission.Exceeded.
@@ -85,6 +89,7 @@ func ScopesFor(t config.Tenant, keyID string) []Scope {
 		}
 		if b.SoftAt > 0 {
 			s.SoftAtMicro = softMicro(b.SoftAt, s.LimitMicro)
+			s.SoftProfile = b.SoftProfile
 		}
 		switch b.Scope {
 		case config.BudgetScopeKey:
@@ -171,7 +176,27 @@ type Store interface {
 	Delta(ctx context.Context, a *Admission, extra int64, now time.Time) error
 	// Spent returns the amount charged to s in the window containing now.
 	Spent(ctx context.Context, s Scope, now time.Time) (int64, error)
+	// SoftCrossed reads the state of every scope in the window containing
+	// now, in one call to the store, for routing (DESIGN §9.5): what was
+	// spent, and whether the soft threshold has been crossed. A threshold
+	// is crossed once a charge reached it (the flag Admit and Delta set)
+	// or the spend has reached it since, for example by a settlement.
+	// The result has one entry per scope, in order; with no scopes it is
+	// empty and the store is not called.
+	SoftCrossed(ctx context.Context, scopes []Scope, now time.Time) ([]State, error)
 }
+
+// State is a scope's spend in the current window, as SoftCrossed reads it.
+type State struct {
+	// Spent is the amount charged in the window, in micro-USD.
+	Spent int64
+	// SoftCrossed reports that the scope has a soft threshold and the
+	// window's spend has reached it.
+	SoftCrossed bool
+}
+
+// Remaining returns the room left under the scope's limit, at least 0.
+func (st State) Remaining(s Scope) int64 { return max(s.LimitMicro-st.Spent, 0) }
 
 // Admission records what Admit charged, for Delta and Settle.
 type Admission struct {

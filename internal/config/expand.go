@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 
@@ -138,7 +139,11 @@ func (st *loadState) expandScalar(n *yaml.Node, path string) {
 			continue
 		}
 		i += 3 + end
-		val, fromDefault, err := st.resolveRef(n, body)
+		placeholder := ""
+		if st.opts.SecretPlaceholders {
+			placeholder = secretPlaceholder(path, ref == s)
+		}
+		val, fromDefault, err := st.resolveRef(n, body, placeholder)
 		if err != nil {
 			st.nodeError(n, path, err.Error())
 			ok = false
@@ -194,11 +199,16 @@ func skipReference(s string, i int) int {
 
 // resolveRef returns the value of one reference, given the text between
 // "${" and "}", and whether that value is the reference's default. Errors
-// never contain the value of a variable or the contents of a file.
-func (st *loadState) resolveRef(n *yaml.Node, body string) (val string, fromDefault bool, err error) {
+// never contain the value of a variable or the contents of a file. When
+// placeholder is set, nothing is read: a well-formed reference resolves to
+// its default, if it has one, and otherwise to placeholder.
+func (st *loadState) resolveRef(n *yaml.Node, body, placeholder string) (val string, fromDefault bool, err error) {
 	if p, isFile := strings.CutPrefix(body, "file:"); isFile {
 		if p == "" {
 			return "", false, errors.New("malformed reference: empty file path in ${file:PATH}")
+		}
+		if placeholder != "" {
+			return placeholder, false, nil
 		}
 		if !filepath.IsAbs(p) {
 			p = filepath.Join(filepath.Dir(st.fileOf[n]), p)
@@ -234,6 +244,12 @@ func (st *loadState) resolveRef(n *yaml.Node, body string) (val string, fromDefa
 	if !envNameRE.MatchString(name) {
 		return "", false, errors.New("malformed reference: variable names must match [A-Za-z_][A-Za-z0-9_]*")
 	}
+	if placeholder != "" {
+		if hasDef {
+			return def, true, nil
+		}
+		return placeholder, false, nil
+	}
 	v, set := st.opts.LookupEnv(name)
 	switch {
 	case hasDef && v == "":
@@ -242,6 +258,86 @@ func (st *loadState) resolveRef(n *yaml.Node, body string) (val string, fromDefa
 		return "", false, fmt.Errorf("environment variable %s is not set", name)
 	}
 	return v, false, nil
+}
+
+// Placeholders of LoadOptions.SecretPlaceholders.
+const (
+	// placeholderSecret replaces a reference that is part of a secret, or
+	// a whole secret that is not a URL.
+	placeholderSecret = "switchyard-placeholder"
+	// placeholderRedisCache, placeholderRedisState and placeholderDSN
+	// replace a whole Redis URL or ledger DSN; the two Redis URLs differ,
+	// as the two instances should.
+	placeholderRedisCache = "redis://placeholder.invalid:6379/0"
+	placeholderRedisState = "redis://placeholder.invalid:6380/0"
+	placeholderDSN        = "postgres://placeholder.invalid/switchyard"
+)
+
+// secretPaths holds the config path of every Secret field of Config, each
+// sequence index written as "[]" (see indexFree), such as
+// "providers[].api_key". It is computed once from the types and never
+// changes.
+var secretPaths = secretFieldPaths(reflect.TypeFor[Config](), "", map[string]bool{})
+
+// secretFieldPaths adds to out the path of every Secret field of t, which
+// is at path, and returns out. Maps are not walked: no map holds a secret.
+func secretFieldPaths(t reflect.Type, path string, out map[string]bool) map[string]bool {
+	switch {
+	case t == secretType:
+		out[path] = true
+	case t.Kind() == reflect.Struct:
+		for i := range t.NumField() {
+			if f := t.Field(i); f.IsExported() {
+				secretFieldPaths(f.Type, joinPath(path, yamlName(f)), out)
+			}
+		}
+	case t.Kind() == reflect.Slice, t.Kind() == reflect.Array:
+		secretFieldPaths(t.Elem(), path+"[]", out)
+	case t.Kind() == reflect.Pointer:
+		secretFieldPaths(t.Elem(), path, out)
+	}
+	return out
+}
+
+// indexFree returns path with every sequence index, such as "[3]", written
+// as "[]".
+func indexFree(path string) string {
+	var b strings.Builder
+	for i := 0; i < len(path); i++ {
+		b.WriteByte(path[i])
+		if path[i] != '[' {
+			continue
+		}
+		j := i + 1
+		for j < len(path) && path[j] >= '0' && path[j] <= '9' {
+			j++
+		}
+		if j > i+1 && j < len(path) && path[j] == ']' {
+			i = j - 1
+		}
+	}
+	return b.String()
+}
+
+// secretPlaceholder returns what a reference at path expands to under
+// LoadOptions.SecretPlaceholders, or "" when path is not a secret and the
+// reference resolves as usual. whole reports that the reference is the
+// whole value.
+func secretPlaceholder(path string, whole bool) string {
+	if !secretPaths[indexFree(path)] {
+		return ""
+	}
+	if whole {
+		switch path {
+		case "storage.redis.cache_url":
+			return placeholderRedisCache
+		case "storage.redis.state_url":
+			return placeholderRedisState
+		case "storage.ledger.dsn":
+			return placeholderDSN
+		}
+	}
+	return placeholderSecret
 }
 
 // errRefFileTooLarge is returned for a ${file:PATH} file over the size cap.

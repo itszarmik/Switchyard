@@ -203,3 +203,41 @@ func (slowStore) Spent(ctx context.Context, _ Scope, _ time.Time) (int64, error)
 	<-ctx.Done()
 	return 0, fmt.Errorf("budget spent: %w", ctx.Err())
 }
+
+// softDownStore fails SoftCrossed as a store that is down.
+type softDownStore struct{ Store }
+
+func (softDownStore) SoftCrossed(context.Context, []Scope, time.Time) ([]State, error) {
+	return nil, errDown
+}
+
+// TestCircuitSoftCrossed checks that SoftCrossed goes through the circuit:
+// it answers from the store, and a failure marks the store unavailable.
+func TestCircuitSoftCrossed(t *testing.T) {
+	ctx := context.Background()
+	s := scope("acme", WindowDay, 1000, true)
+	s.SoftAtMicro = 100
+	inner := NewMemoryStore()
+	if _, err := inner.Admit(ctx, []Scope{s}, 150, noon); err != nil {
+		t.Fatal(err)
+	}
+	c := NewCircuit(inner, CircuitOptions{})
+	got, err := c.SoftCrossed(ctx, []Scope{s}, noon)
+	if err != nil || len(got) != 1 || got[0] != (State{Spent: 150, SoftCrossed: true}) {
+		t.Fatalf("SoftCrossed = %+v, %v", got, err)
+	}
+	if got, err := c.SoftCrossed(ctx, nil, noon); err != nil || got != nil {
+		t.Errorf("SoftCrossed(no scopes) = %v, %v", got, err)
+	}
+
+	down := NewCircuit(softDownStore{Store: inner}, CircuitOptions{})
+	if _, err := down.SoftCrossed(ctx, []Scope{s}, noon); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if down.Available() {
+		t.Error("a failed SoftCrossed left the store available")
+	}
+	if _, err := down.SoftCrossed(ctx, []Scope{s}, noon); !errors.Is(err, ErrCircuitOpen) {
+		t.Errorf("err = %v, want ErrCircuitOpen while the store is marked unavailable", err)
+	}
+}

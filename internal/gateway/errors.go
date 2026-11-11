@@ -52,11 +52,14 @@ func modelNotFound(model string) *Error {
 	}
 }
 
-// virtualModel is the answer for a virtual model name ("auto…").
-func virtualModel(model string) *Error {
+// virtualModel is the answer for a virtual model name ("auto…", or an
+// alias of one) sent to an endpoint that does not route across models,
+// such as embeddings, whose vectors are not interchangeable between
+// models.
+func virtualModel(model, endpoint string) *Error {
 	return &Error{
 		Status: http.StatusBadRequest, Type: apierror.TypeInvalidRequest, Code: codeModelNotSupport, Param: "model",
-		Message: fmt.Sprintf("The model `%s` is a virtual model: virtual models arrive in a later phase.", model),
+		Message: fmt.Sprintf("The model `%s` is a virtual model, which %s does not serve; name a concrete model.", model, endpoint),
 	}
 }
 

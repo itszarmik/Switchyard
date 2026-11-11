@@ -163,6 +163,8 @@ func (g *Gateway) execute(ctx context.Context, ex Exchange, rec *record, try try
 			}
 			rec.attempts++
 			info.Attempts = rec.attempts
+			// A cross-model fallback is served by another model.
+			info.Model = e.d.Model.ID
 			info.RouteReason = rec.routeReason(p)
 			rec.deployment = e.d
 
