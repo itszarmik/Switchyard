@@ -140,6 +140,13 @@ func newContext(ctx context.Context, p Principal) context.Context {
 	return context.WithValue(ctx, principalKey{}, p)
 }
 
+// WithPrincipal returns a copy of ctx that carries p, as Middleware does
+// for an authenticated request. It is for callers that authenticate
+// requests some other way, and for tests.
+func WithPrincipal(ctx context.Context, p Principal) context.Context {
+	return newContext(ctx, p)
+}
+
 // FromContext returns the Principal that Middleware stored in ctx.
 func FromContext(ctx context.Context) (Principal, bool) {
 	p, ok := ctx.Value(principalKey{}).(Principal)

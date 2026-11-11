@@ -34,6 +34,7 @@ type Config struct {
 	// reserved for Phase 5.
 	Aliases map[string]string `yaml:"aliases"`
 	Routing Routing           `yaml:"routing"`
+	Budgets Budgets           `yaml:"budgets"`
 }
 
 // Server configures the public and admin HTTP listeners.
@@ -104,6 +105,15 @@ type Ledger struct {
 	Driver string `yaml:"driver"`
 	// DSN is the Postgres connection string. Required when Driver is postgres.
 	DSN Secret `yaml:"dsn"`
+	// BatchSize is the most usage events written in one batch. Default 500.
+	BatchSize int `yaml:"batch_size"`
+	// FlushInterval is the longest an event waits before its batch is
+	// written. Default 1s.
+	FlushInterval Duration `yaml:"flush_interval"`
+	// QueueSize bounds the in-memory queue of events waiting to be written.
+	// When it is full the oldest event is dropped and counted (DESIGN §12.2).
+	// Default 100000.
+	QueueSize int `yaml:"queue_size"`
 }
 
 // Provider is an upstream endpoint plus its credentials.
@@ -343,6 +353,34 @@ type Tenant struct {
 	ID string `yaml:"id"`
 	// Keys are the gateway API keys that authenticate as this tenant.
 	Keys []APIKey `yaml:"keys"`
+	// Budgets cap this tenant's spend (DESIGN §12.3). A budget with scope
+	// key applies to each of the tenant's keys separately.
+	Budgets []Budget `yaml:"budgets"`
+}
+
+// Budget is a spend limit over a calendar window in UTC.
+type Budget struct {
+	// Scope is tenant (the tenant's total spend) or key (each key's spend).
+	Scope string `yaml:"scope"`
+	// Window is day or month, as calendar periods in UTC.
+	Window string `yaml:"window"`
+	// LimitUSD is the cap, in USD, as an exact decimal (for example "2000").
+	LimitUSD Price `yaml:"limit_usd"`
+	// SoftAt, when set, is a fraction in (0, 1) of the limit. Crossing it is
+	// logged and counted once per window; Phase 5 adds downgrading.
+	SoftAt float64 `yaml:"soft_at"`
+	// OnExhausted is block (requests that would exceed the limit get 429
+	// budget_exceeded) or notify (they are served, logged and counted).
+	// Default block.
+	OnExhausted string `yaml:"on_exhausted"`
+}
+
+// Budgets holds gateway-wide budget settings.
+type Budgets struct {
+	// FailMode decides what happens when the budget store is unavailable:
+	// open (serve, still enforcing per-request caps, and alert) or closed
+	// (reject with 503). Default open.
+	FailMode string `yaml:"fail_mode"`
 }
 
 // APIKey is a gateway API key, stored only as a hash. Generate one with

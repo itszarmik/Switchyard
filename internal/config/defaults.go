@@ -20,12 +20,21 @@ const (
 	defaultLogFormat         = "json"
 	defaultStorageMode       = "memory"
 	defaultLedgerDriver      = "memory"
+	defaultLedgerBatchSize   = 500
+	defaultLedgerFlush       = time.Second
+	defaultLedgerQueueSize   = 100_000
 	defaultConnectTimeout    = 5 * time.Second
 	defaultFirstTokenTimeout = 30 * time.Second
 	defaultIdleChunkTimeout  = 60 * time.Second
 	defaultTotalTimeout      = 10 * time.Minute
 	defaultModelType         = ModelTypeChat
 	defaultTokenRatio        = 1.0
+)
+
+// Budget defaults (DESIGN §12.3).
+const (
+	defaultOnExhausted    = BudgetBlock
+	defaultBudgetFailMode = BudgetFailOpen
 )
 
 // Routing defaults (DESIGN §14).
@@ -102,6 +111,9 @@ func applyDefaults(c *Config, explicit func(path string) bool) {
 	setDefault(&c.Logging.Format, defaultLogFormat)
 	setDefault(&c.Storage.Mode, defaultStorageMode)
 	setDefault(&c.Storage.Ledger.Driver, defaultLedgerDriver)
+	setDefault(&c.Storage.Ledger.BatchSize, defaultLedgerBatchSize)
+	setDefault(&c.Storage.Ledger.FlushInterval, Duration(defaultLedgerFlush))
+	setDefault(&c.Storage.Ledger.QueueSize, defaultLedgerQueueSize)
 	for i := range c.Providers {
 		t := &c.Providers[i].Timeouts
 		setDefault(&t.Connect, Duration(defaultConnectTimeout))
@@ -115,6 +127,18 @@ func applyDefaults(c *Config, explicit func(path string) bool) {
 		setDefault(&m.TokenRatio, defaultTokenRatio)
 	}
 	applyRoutingDefaults(&c.Routing, explicit)
+	applyBudgetDefaults(c)
+}
+
+// applyBudgetDefaults fills on_exhausted on every tenant budget and
+// budgets.fail_mode.
+func applyBudgetDefaults(c *Config) {
+	for i := range c.Tenants {
+		for j := range c.Tenants[i].Budgets {
+			setDefault(&c.Tenants[i].Budgets[j].OnExhausted, defaultOnExhausted)
+		}
+	}
+	setDefault(&c.Budgets.FailMode, defaultBudgetFailMode)
 }
 
 // applyRoutingDefaults fills the routing section; see applyDefaults.

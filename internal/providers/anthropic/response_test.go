@@ -69,7 +69,7 @@ func TestChatResponseGolden(t *testing.T) {
 			fixture: "message_cache_usage.json",
 			want: `{"id":"chatcmpl-msg_013Zva2CMHLNnXjNJJKqJ2EF","object":"chat.completion","created":1794398400,"model":"claude-opus-5-5",
 				"choices":[{"index":0,"message":{"role":"assistant","content":"Hi! My name is Claude.","refusal":null},"logprobs":null,"finish_reason":"stop"}],
-				"usage":{"prompt_tokens":6197,"completion_tokens":503,"total_tokens":6700,"prompt_tokens_details":{"cached_tokens":2051},
+				"usage":{"prompt_tokens":6197,"completion_tokens":503,"total_tokens":6700,"prompt_tokens_details":{"cached_tokens":2051,"cache_write_tokens":2051},
 					"completion_tokens_details":{"reasoning_tokens":0}}}`,
 		},
 		{

@@ -29,7 +29,10 @@ const ShimChat = "chat"
 // can serve the request.
 func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 	rec := g.newRecord(ctx, EndpointCompletions)
-	defer rec.finish()
+	defer rec.done()
+	if !g.readTags(ex, rec) {
+		return
+	}
 
 	body, berr := ex.Body()
 	if berr != nil {
@@ -57,9 +60,11 @@ func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 	}
 	rec.info = Info{Model: res.Model.ID, Alias: res.Alias}
 	rec.alias = res.Alias
+	rec.model = res.Model
 	estIn := estimateIn(len(body), 0, 0, res.Model)
 	maxTokens, hasMax := req.MaxTokens()
-	estOut := estimateOut(maxTokens, hasMax)
+	estOut := estimateOut(maxTokens, hasMax, completionOutputs(req))
+	rec.estIn, rec.estOut = estIn, estOut
 
 	if shimErr := req.ShimError(); shimErr != nil {
 		// Only a native deployment can serve this request.

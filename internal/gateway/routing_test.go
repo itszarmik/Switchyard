@@ -662,19 +662,24 @@ func TestEstimates(t *testing.T) {
 		})
 	}
 	out := []struct {
-		name string
-		max  int64
-		ok   bool
-		want int64
+		name    string
+		max     int64
+		ok      bool
+		outputs int64
+		want    int64
 	}{
 		{name: "unset", want: defaultEstOut},
 		{name: "zero", max: 0, ok: true, want: defaultEstOut},
 		{name: "set", max: 1234, ok: true, want: 1234},
 		{name: "clamped", max: math.MaxInt64, ok: true, want: maxEstOut},
+		{name: "n", max: 10, ok: true, outputs: 100, want: 1000},
+		{name: "n unset max", outputs: 3, want: 3 * defaultEstOut},
+		{name: "n clamped", max: maxEstOut / 2, ok: true, outputs: 3, want: maxEstOut},
+		{name: "n huge", max: 2, ok: true, outputs: math.MaxInt64, want: maxEstOut},
 	}
 	for _, tt := range out {
 		t.Run("out/"+tt.name, func(t *testing.T) {
-			if got := estimateOut(tt.max, tt.ok); got != tt.want {
+			if got := estimateOut(tt.max, tt.ok, tt.outputs); got != tt.want {
 				t.Errorf("estimateOut = %d, want %d", got, tt.want)
 			}
 		})

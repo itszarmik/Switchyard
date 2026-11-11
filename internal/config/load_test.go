@@ -53,7 +53,10 @@ func TestLoadHappyPath(t *testing.T) {
 				CacheURL: NewSecret("redis://localhost:6379/0"),
 				StateURL: NewSecret("redis://:state-pass-9f2c@localhost:6380/0"),
 			},
-			Ledger: Ledger{Driver: "postgres", DSN: NewSecret("postgres://switchyard:s3cret-db-pass@db.internal:5432/switchyard")},
+			Ledger: Ledger{
+				Driver: "postgres", DSN: NewSecret("postgres://switchyard:s3cret-db-pass@db.internal:5432/switchyard"),
+				BatchSize: 500, FlushInterval: Duration(time.Second), QueueSize: 100_000,
+			},
 		},
 		Providers: []Provider{
 			{
@@ -89,6 +92,7 @@ func TestLoadHappyPath(t *testing.T) {
 			{ID: "beta", Keys: []APIKey{{ID: "beta-1", Hash: "sha256:" + strings.Repeat("a", 64)}}},
 		},
 		Routing: DefaultRouting(),
+		Budgets: Budgets{FailMode: BudgetFailOpen},
 	}
 	if diff := cmp.Diff(want, cfg, cmp.Comparer(func(a, b Secret) bool { return a.Value() == b.Value() })); diff != "" {
 		t.Errorf("Config mismatch (-want +got):\n%s", diff)

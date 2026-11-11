@@ -69,10 +69,11 @@ logging:
   # json | text. Default json.
   format: json
 
-# State backends. Validated, but nothing connects to them until a later phase.
+# State backends.
 storage:
   # memory (quickstart and dev only; state is lost on restart) | redis.
-  # Default memory.
+  # Default memory. With redis, budget counters live in the state instance
+  # and are shared by every replica; with memory they are per process.
   mode: redis
   # Two Redis roles (DESIGN §11.5). Both are required in redis mode. The
   # URLs are secrets because they may embed passwords. `make dev-up` starts
@@ -81,13 +82,30 @@ storage:
     # Evictable cache instance (maxmemory-policy allkeys-lru).
     cache_url: ${REDIS_CACHE_URL:-redis://localhost:6379/0}
     # Non-evictable state instance for budgets and limits
-    # (maxmemory-policy noeviction).
+    # (maxmemory-policy noeviction). A single server or a failover pair, not
+    # a Cluster. It may be down at startup: budgets then follow
+    # budgets.fail_mode. With fail_mode closed, /readyz fails its
+    # budget_store check while it is down; with open, /admin/v1/providers
+    # reports it.
     state_url: ${REDIS_STATE_URL:-redis://localhost:6380/0}
+  # The usage ledger: one event per request (DESIGN §12.2).
   ledger:
-    # memory | postgres. Default memory.
+    # memory (the latest 100,000 events, per process) | postgres.
+    # Default memory.
     driver: postgres
     # Postgres connection string, a secret. Required when driver is postgres.
+    # Postgres must be reachable at startup, when the ledger applies its
+    # migrations; after that, outages are buffered in memory.
+    # `make dev-up` starts one on port 5433.
     dsn: ${DATABASE_URL}
+    # Events per batch written with COPY. Default 500.
+    batch_size: 500
+    # The longest an event waits before its batch is written. Default 1s.
+    flush_interval: 1s
+    # Events buffered in memory while Postgres is slow or down; when full,
+    # the oldest are dropped and counted in
+    # switchyard_usage_events_dropped_total. Default 100000.
+    queue_size: 100000
 
 # Upstream endpoints and their credentials. Keys per provider:
 #   id               names the provider in deployment IDs (model@provider)
@@ -236,12 +254,30 @@ routing:
 #   id     names the tenant in logs and reports; 1 to 63 characters from
 #          a-z, 0-9, _ and -, starting with a letter or digit; unique
 #   keys   the tenant's API keys; a tenant without keys gets a warning
+#   budgets  spend limits, at most one per scope and window (DESIGN §12.3)
 # Keys per key:
 #   id     names the key in logs and reports (never the key itself); same
 #          rules as the tenant id, and unique across all tenants
 #   hash   "sha256:" and 64 lowercase hex characters; unique across all
 #          tenants. Never put the key itself here.
 #   tags   matched by policies in later phases, e.g. prod, eu
+# Keys per budget:
+#   scope         tenant (the tenant's total spend) | key (each key's own)
+#   window        day | month, calendar periods in UTC
+#   limit_usd     the cap in USD, an exact decimal; > 0, at most 1000000000
+#   soft_at       optional fraction in (0, 1): reaching soft_at × limit is
+#                 logged and counted once per window
+#   on_exhausted  block (default): a request whose estimated cost does not
+#                 fit gets 429 budget_exceeded, with Retry-After until the
+#                 window resets | notify: it is served, logged and counted
+# A request is admitted at its estimated cost (output priced at max_tokens
+# when set, else 500 tokens, for each of its n choices) before its first
+# upstream attempt, and settled at its actual cost when it ends; at its
+# estimate if an upstream had it but never served it (the client went
+# away, a timeout, a 5xx), since it may have been billed anyway.
+# Deployments without prices can't be budget-controlled precisely: under a
+# block budget they are admitted and settled at 1 micro-USD. catalog lint
+# flags them.
 # To revoke a key, delete its entry and restart.
 # The hashes below belong to keys nobody has: replace them with your own.
 tenants:
@@ -252,3 +288,22 @@ tenants:
         tags: [prod]
       - id: acme-ci
         hash: sha256:0eb9387d9e4b212cd42007efc1e129c69f55b64724268d2b9edbdc45fda4a0c2
+    budgets:
+      - scope: tenant
+        window: month
+        limit_usd: "2000"
+        soft_at: 0.8
+        on_exhausted: block
+      - scope: key
+        window: day
+        limit_usd: "50"
+        on_exhausted: notify
+
+# Budget settings for every tenant.
+budgets:
+  # What a request gets while the budget store (the Redis state instance)
+  # is unavailable: open (default) serves it unchecked, logs a warning and
+  # counts switchyard_budget_store_errors_total; closed answers 503
+  # budget_unavailable. After a failure, or no answer within 1s, the store
+  # is skipped for 5s, then one request tries it again.
+  fail_mode: open

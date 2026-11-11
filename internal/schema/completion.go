@@ -114,6 +114,15 @@ func (r *CompletionRequest) MaxTokens() (int64, bool) {
 	return decodeField[int64](r.obj.get(fieldMaxTokens))
 }
 
+// N returns the number of completions requested per prompt, and false if
+// n is absent, null or not an integer.
+func (r *CompletionRequest) N() (int, bool) { return intField(r.obj, fieldN) }
+
+// BestOf returns best_of, the number of completions generated per prompt
+// to return the best n of, and false if it is absent, null or not an
+// integer.
+func (r *CompletionRequest) BestOf() (int, bool) { return intField(r.obj, fieldBestOf) }
+
 // Field returns the raw value of any top-level field, and whether it is
 // present.
 func (r *CompletionRequest) Field(name string) (json.RawMessage, bool) {

@@ -46,7 +46,11 @@ func (st *loadState) decodeValueAt(at, n *yaml.Node, v reflect.Value, path strin
 	if reflect.PointerTo(v.Type()).Implements(unmarshalerType) {
 		u := v.Addr().Interface().(yaml.Unmarshaler)
 		if err := u.UnmarshalYAML(n); err != nil {
-			st.typeError(at, n, v.Type(), path, err.Error())
+			msg := err.Error()
+			if v.Type() == priceType && strings.HasSuffix(path, ".limit_usd") {
+				msg = usdAmountMessage(err)
+			}
+			st.typeError(at, n, v.Type(), path, msg)
 		}
 		return
 	}

@@ -15,9 +15,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"switchyard/internal/auth"
+	"switchyard/internal/budget"
 	"switchyard/internal/config"
 	"switchyard/internal/telemetry"
+	"switchyard/internal/usage"
 )
 
 // Secret values used by the tests. The Anthropic key matches no credential
@@ -147,10 +151,17 @@ type running struct {
 // called, and returns it once it is listening.
 func startApp(t *testing.T, snap *config.Snapshot, logs *logBuffer) *running {
 	t.Helper()
-	a, err := New(snap, logs)
+	a, err := testNew(snap, logs)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	return startBuilt(t, a, logs)
+}
+
+// startBuilt runs a until the test ends or stop is called, and returns it
+// once it is listening.
+func startBuilt(t *testing.T, a *App, logs *logBuffer) *running {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &running{cancel: cancel, runErr: make(chan error, 1)}
 	go func() { r.runErr <- a.Run(ctx, context.Background()) }()
@@ -283,13 +294,13 @@ func TestSecretsNeverLogged(t *testing.T) {
 
 func TestNew(t *testing.T) {
 	t.Run("nil snapshot", func(t *testing.T) {
-		if _, err := New(nil, io.Discard); err == nil {
-			t.Fatal("New(nil) succeeded")
+		if _, err := testNew(nil, io.Discard); err == nil {
+			t.Fatal("testNew(nil) succeeded")
 		}
 	})
 	t.Run("nil log output", func(t *testing.T) {
 		restoreDefaultLogger(t)
-		if _, err := New(loadSnapshot(t, secretConfig), nil); err == nil {
+		if _, err := testNew(loadSnapshot(t, secretConfig), nil); err == nil {
 			t.Fatal("New with a nil writer succeeded")
 		}
 	})
@@ -301,7 +312,7 @@ func TestNew(t *testing.T) {
 			t.Fatal("the test config has no warnings")
 		}
 		var buf bytes.Buffer
-		if _, err := New(snap, &buf); err != nil {
+		if _, err := testNew(snap, &buf); err != nil {
 			t.Fatalf("New: %v", err)
 		}
 		lines := map[string]map[string]any{}
@@ -335,7 +346,7 @@ func TestNew(t *testing.T) {
 		restoreDefaultLogger(t)
 		snap := loadSnapshot(t, strings.Replace(secretConfig, "level: debug", "level: info", 1))
 		var buf bytes.Buffer
-		if _, err := New(snap, &buf); err != nil {
+		if _, err := testNew(snap, &buf); err != nil {
 			t.Fatalf("New: %v", err)
 		}
 		if strings.Contains(buf.String(), "effective config") {
@@ -347,7 +358,7 @@ func TestNew(t *testing.T) {
 func TestRunReportsListenErrors(t *testing.T) {
 	restoreDefaultLogger(t)
 	snap := loadSnapshot(t, strings.Replace(secretConfig, "listen: 127.0.0.1:0", "listen: 256.0.0.1:0", 1))
-	a, err := New(snap, io.Discard)
+	a, err := testNew(snap, io.Discard)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -483,4 +494,12 @@ func TestAPIRequestsCounted(t *testing.T) {
 	if strings.Contains(logs.String(), key) {
 		t.Error("the logs contain the client key")
 	}
+}
+
+// testNew is New with a memory ledger and memory budgets whatever the
+// config says, so that the tests need no Postgres or Redis.
+func testNew(snap *config.Snapshot, logOutput io.Writer) (*App, error) {
+	return newApp(snap, logOutput, func(*config.Config, prometheus.Registerer, *slog.Logger) (storage, error) {
+		return storage{ledger: usage.NewMemoryLedger(), budgets: budget.NewMemoryStore()}, nil
+	})
 }

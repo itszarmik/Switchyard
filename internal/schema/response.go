@@ -18,6 +18,10 @@ type Usage struct {
 type PromptTokensDetails struct {
 	// CachedTokens were served from the provider's prompt cache.
 	CachedTokens int64 `json:"cached_tokens"`
+	// CacheWriteTokens were written to the provider's prompt cache, which
+	// some providers bill at a different rate (OpenAI reports this field;
+	// the Anthropic adapter fills it from cache_creation_input_tokens).
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
 }
 
 // CompletionTokensDetails breaks down the completion tokens.

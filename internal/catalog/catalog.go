@@ -83,8 +83,11 @@ type Deployment struct {
 	// Tags are the provider's tags followed by the deployment's, without
 	// duplicates.
 	Tags []string
-	// Pricing is what the deployment costs.
+	// Pricing is what the deployment costs, as floats for ranking.
 	Pricing Pricing
+	// Prices are the deployment's exact prices from the config, for cost
+	// accounting.
+	Prices config.Pricing
 	// LatencyHint is the operator's latency estimate, which seeds the
 	// latency statistics until there are measurements.
 	LatencyHint LatencyHint
@@ -218,6 +221,7 @@ func New(cfg *config.Config) (*Catalog, error) {
 					CacheWrite:  cd.Pricing.CacheWrite.Float64(),
 					Known:       config.PricingKnown(m.Type, cd.Pricing),
 				},
+				Prices: cd.Pricing,
 				LatencyHint: LatencyHint{
 					TTFT:         time.Duration(cd.LatencyHint.TTFTMs) * time.Millisecond,
 					TokensPerSec: cd.LatencyHint.TokensPerSec,

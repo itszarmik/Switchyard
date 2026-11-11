@@ -39,6 +39,7 @@ const (
 	headerShim              = "X-Switchyard-Shim"
 	headerAttempts          = "X-Switchyard-Attempts"
 	headerRouteReason       = "X-Switchyard-Route-Reason"
+	headerCostUSD           = "X-Switchyard-Cost-Usd"
 )
 
 // Defaults for the zero values of Options.
@@ -288,6 +289,9 @@ func setInfo(h http.Header, info gateway.Info) {
 	}
 	if info.RouteReason != "" {
 		h.Set(headerRouteReason, info.RouteReason)
+	}
+	if info.CostUSD != "" {
+		h.Set(headerCostUSD, info.CostUSD)
 	}
 }
 

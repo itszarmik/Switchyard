@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P3 complete** and committed on `main`. Next: P4. CI and the live smoke tests have not run yet. |
+| Status | Design approved. **P0–P4 complete** and committed on `main`. Next: P5. CI and the live smoke tests have not run yet. |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -231,11 +231,27 @@ Overhead is about +0.1 ms p99 against P2, measured alternating with the P2 build
 
 **Acceptance**
 
-- [ ] For each provider, fixture requests produce costs equal to hand-computed decimals, including cached input and cache writes.
-- [ ] Over a test run, the sum of ledger costs equals the `cost_usd_total` metric to within 1e-6.
-- [ ] With 1,000 concurrent requests against a small budget and a fake upstream that reports exactly the estimated usage, final spend never exceeds the limit. When usage is under-estimated, the overshoot is at most the sum of the admitted requests' under-estimates. Rejected requests get `429 budget_exceeded` with `Retry-After`.
-- [ ] Stopping Postgres for 60 s under load fails no requests. Queued events land after recovery, and an overflow (forced with a tiny queue in the test) increments the drop counter.
-- [ ] Reports return correct aggregates for seeded data. Tenant A can't read tenant B's usage, verified with both API tests and store-layer tests.
+- [x] For each provider, fixture requests produce costs equal to hand-computed decimals, including cached input and cache writes.
+- [x] Over a test run, the sum of ledger costs equals the `cost_usd_total` metric to within 1e-6.
+- [x] With 1,000 concurrent requests against a small budget and a fake upstream that reports exactly the estimated usage, final spend never exceeds the limit. When usage is under-estimated, the overshoot is at most the sum of the admitted requests' under-estimates. Rejected requests get `429 budget_exceeded` with `Retry-After`.
+- [x] Stopping Postgres for 60 s under load fails no requests. Queued events land after recovery, and an overflow (forced with a tiny queue in the test) increments the drop counter.
+- [x] Reports return correct aggregates for seeded data. Tenant A can't read tenant B's usage, verified with both API tests and store-layer tests.
+
+**P4 outcome.**
+
+- **Exact cost per request.** Every request has an exact cost on record. Costs are computed in femto-USD from the catalog's decimal prices and stored as NUMERIC in Postgres. They are returned in `X-Switchyard-Cost-Usd` and in the tenant and admin usage reports.
+- **Budgets.**
+  - 1,000 concurrent requests against a budget with room for 50 admitted exactly 50, on both memory and Redis budgets.
+  - With under-estimated usage, the overshoot equals the sum of the under-estimates, as designed.
+- **Postgres outage.** A 66-second Postgres outage under load lost no requests and no events.
+- **Review fixes.** Independent security and correctness reviews found 8 issues, and all are fixed with regression tests. Two more fail-open issues came from integration. The fixes:
+  - **Cancelled requests:** a request the upstream received but never finished is now charged its admitted estimate. Before, it was free, which let a client bypass a blocking budget by disconnecting.
+  - **Broken streams:** a stream that broke mid-way under-counted output; output is now estimated.
+  - **Multi-output requests:** `n`, `best_of` and multi-prompt requests are now counted in the budget estimate.
+  - **Unpriced deployments:** these are now refused by an exhausted blocking budget.
+  - **Usage reports:** reports can no longer stall other tenants or starve the ledger writer. `group_by` is capped, and reports use a separate connection pool with per-tenant limits and a statement timeout.
+  - **Redis outages:** with fail-open budgets, a Redis outage no longer fails readiness. A 5-second circuit stops a dead Redis from adding 1–2 s to every request.
+- **Overhead.** The bench is noisy on this machine, so the 5 ms p99 gate fails for both builds. Throughput and p50/p90 improved compared with P3.
 
 ## P5: Cost-aware routing, quality scoring and the rule engine
 

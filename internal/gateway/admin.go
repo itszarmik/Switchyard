@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -17,17 +18,42 @@ type providersReport struct {
 	GeneratedAt time.Time `json:"generated_at"`
 	// Providers lists every provider and its deployments, sorted by id.
 	Providers []health.ProviderSnapshot `json:"providers"`
+	// BudgetStore is the budget store's health, when it is a shared store
+	// that can fail (Options.BudgetStoreCheck).
+	BudgetStore *budgetStoreStatus `json:"budget_store,omitempty"`
 }
+
+// budgetStoreStatus is the budget store's health in the provider report.
+type budgetStoreStatus struct {
+	// Status is "ok" when the store answered, else "unavailable".
+	Status string `json:"status"`
+	// FailMode is budgets.fail_mode: what requests get while the store is
+	// unavailable.
+	FailMode string `json:"fail_mode"`
+}
+
+// budgetCheckTimeout bounds the budget store check of the provider report.
+const budgetCheckTimeout = time.Second
 
 // ProvidersHandler serves GET /admin/v1/providers: for every provider its
 // in-flight count and max_concurrency, and for each of its deployments the
 // breaker state and the time of its next transition, the rate-limit
 // cooldown, the recent request and failure counts, the retry budget and
-// the latency statistics. It shows no secrets. It belongs on the admin
-// listener.
+// the latency statistics. With Options.BudgetStoreCheck, it also reports
+// whether the budget store answers, and budgets.fail_mode. It shows no
+// secrets. It belongs on the admin listener.
 func (g *Gateway) ProvidersHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		report := providersReport{GeneratedAt: time.Now().UTC(), Providers: g.health.Snapshot().Providers}
+		if g.budgetCheck != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), budgetCheckTimeout)
+			st := &budgetStoreStatus{Status: "ok", FailMode: g.failMode}
+			if g.budgetCheck(ctx) != nil {
+				st.Status = "unavailable"
+			}
+			cancel()
+			report.BudgetStore = st
+		}
 		data, err := json.Marshal(report)
 		if err != nil {
 			ctx := r.Context()

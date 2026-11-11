@@ -16,6 +16,16 @@ const maxPriceDecimals = 9
 // errPriceSyntax is returned for a value that is not a plain decimal.
 var errPriceSyntax = errors.New(`expected a price in USD per 1M tokens, such as 0.15 or "0.0375"`)
 
+// usdAmountMessage rewords a Price decoding error for a field that holds an
+// amount of USD rather than a price per 1M tokens, such as a budget's
+// limit_usd.
+func usdAmountMessage(err error) string {
+	if errors.Is(err, errPriceSyntax) {
+		return `expected an amount in USD, such as 2000 or "12.50"`
+	}
+	return strings.Replace(err.Error(), "a price", "an amount in USD", 1)
+}
+
 // ParsePrice parses s as a Price: a non-negative decimal such as "3",
 // "0.15" or ".5" with at most 9 decimal places. Signs, exponents, NaN,
 // infinities, hexadecimal and digit separators are rejected. The empty

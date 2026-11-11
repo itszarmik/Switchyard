@@ -7,7 +7,7 @@ Switchyard is a cost-aware, OpenAI-compatible LLM inference gateway written in G
 
 ## Status
 
-**Phase 3: reliability.** Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment of the requested model that has every capability the request needs, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Budgets, cost-aware model choice and caching come in later phases ([docs/PLAN.md](docs/PLAN.md)).
+**Phase 4: cost accounting, ledger and budgets.** Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment of the requested model that has every capability the request needs, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Every request gets an exact cost in a usage ledger (memory or Postgres) with tenant-scoped reports, and tenants and keys can have daily or monthly budgets (see [Usage ledger and reporting](#usage-ledger-and-reporting) and [Budgets](#budgets)). Cost-aware model choice and caching come in later phases ([docs/PLAN.md](docs/PLAN.md)).
 
 ## Quickstart
 
@@ -276,9 +276,10 @@ curl -N localhost:8080/v1/chat/completions \
 | `X-Switchyard-Dropped-Params` | The request parameters removed because the deployment cannot honor them, such as `n, temperature`. |
 | `X-Switchyard-Shim` | `chat` when a legacy completion was served through Chat Completions. |
 | `X-Switchyard-Upstream-Request-Id` | The provider's own `x-request-id`, from the attempt that answered, for support tickets. Omitted unless it is at most 128 bytes of printable ASCII. |
-| `Retry-After` | On 429, copied from the provider. |
+| `X-Switchyard-Cost-Usd` | The request's exact cost in USD, such as `0.000165`, on a successful non-streaming response whose usage the provider reported and whose deployment has prices. A stream's cost is in the [usage ledger](#usage-ledger-and-reporting). |
+| `Retry-After` | On 429, copied from the provider; on `budget_exceeded`, the seconds until the budget's window resets. |
 
-Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no`. The response is committed only when the first upstream event arrives, so failures before that are retried or fall back, and otherwise get a normal error status. A client can shorten its request's deadline with the request header `X-Switchyard-Timeout-Ms: <milliseconds>`; it can never extend it past `routing.request_timeout`.
+Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no`. The response is committed only when the first upstream event arrives, so failures before that are retried or fall back, and otherwise get a normal error status. A client can shorten its request's deadline with the request header `X-Switchyard-Timeout-Ms: <milliseconds>`; it can never extend it past `routing.request_timeout`. It can attach attribution tags to the request's usage event with `X-Switchyard-Tags: team=search,feature=autocomplete` (see [Usage ledger and reporting](#usage-ledger-and-reporting)).
 
 **Errors.** Every error uses OpenAI's envelope, `{"error":{"message","type","param","code"}}`, so SDKs raise their usual exceptions.
 
@@ -293,6 +294,9 @@ Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `
 | No deployment has every capability the request needs, or fits the context window | 400 | `no_eligible_model`; the message names each deployment and why it was excluded |
 | A legacy completion parameter the chat shim cannot honor | 400 | `unsupported_parameter`; `param` names it |
 | `X-Switchyard-Timeout-Ms` not a positive whole number | 400 | `invalid_timeout` |
+| `X-Switchyard-Tags` malformed (see [Usage ledger and reporting](#usage-ledger-and-reporting)); the value is never echoed | 400 | `invalid_tags` |
+| A blocking budget has no room for the request's estimated cost; no upstream is called | 429, with `Retry-After`; `type` is `insufficient_quota` | `budget_exceeded` |
+| The budget store (Redis) is down and `budgets.fail_mode` is `closed` | 503 | `budget_unavailable` |
 | A request an adapter cannot translate (for example a content part or tool type the Anthropic Messages API cannot express), when no other deployment in the plan could serve it | 400 | `invalid_value`; `param` names the field |
 | Every eligible deployment is unhealthy: breaker open, rate-limit cooldown, or provider at `max_concurrency` | 503 | `no_healthy_upstream`; the message names each deployment and why |
 | Provider 4xx (other than 401/402/403), including 429 | the provider's status | the provider's body |
@@ -303,7 +307,7 @@ Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `
 
 When a request was retried or fell back and every attempt failed, the answer is the most informative failure: 504 if the deadline expired, the provider's 429 if every failure was a rate limit, and otherwise, in order of preference, a context-length or not-found error, a 5xx, a timeout, an authentication failure, a connection failure, and last an adapter's local rejection (`unsupported`), which is the answer only when every attempt was rejected so. The `X-Switchyard-Provider` and `X-Switchyard-Upstream-Request-Id` headers are those of the attempt whose failure is the answer.
 
-Each request is logged at INFO as one `request` access-log line. For the chat, completions and embeddings endpoints it also carries the tenant, key id, requested model, the `deployment` of the last attempt, the number of `excluded` deployments, `attempts`, `attempt_chain` (each attempt as `deployment:outcome`, such as `m@a:server_error,m@a:server_error,m@b:ok`, at most ten), `fallback_reason` (the failure kind that caused the first fallback, when there was one), `deadline_ms`, latency, TTFT, gateway overhead and token counts, plus the `alias` and the `dropped_params` (comma-separated) when there are any, never the prompt or the response.
+Each request is logged at INFO as one `request` access-log line. For the chat, completions and embeddings endpoints it also carries the tenant, key id, requested model, the `deployment` of the last attempt, the number of `excluded` deployments, `attempts`, `attempt_chain` (each attempt as `deployment:outcome`, such as `m@a:server_error,m@a:server_error,m@b:ok`, at most ten), `fallback_reason` (the failure kind that caused the first fallback, when there was one), `deadline_ms`, latency, TTFT, gateway overhead, token counts and `cost_usd` (when the cost is known), plus the `alias` and the `dropped_params` (comma-separated) when there are any, never the prompt or the response.
 
 **Legacy completions.** `POST /v1/completions` takes the legacy OpenAI shape (`prompt` a string or an array of strings; token arrays get 400). A deployment with the `completions` capability on an OpenAI-wire provider gets the request natively and losslessly. Any other deployment is served through the chat shim, marked `X-Switchyard-Shim: chat`: the prompt becomes one user message; `max_tokens`, `temperature`, `top_p`, `stop`, `n`, `stream`, `stream_options`, `user`, `seed` and the penalties carry over (other legacy fields, such as `logit_bias`, are not sent); and the answer, streamed or not, comes back as `text_completion` objects with `choices[].text`. The shim cannot honor `echo`, `suffix`, `logprobs`, `best_of` above 1 or more than one prompt: such a request goes to a native deployment if the model has one, and otherwise gets 400 `unsupported_parameter`. Capability filtering and dropping work as for chat. The legacy default of 16 `max_tokens` is not applied by the shim.
 
@@ -381,6 +385,150 @@ curl -s localhost:9090/admin/v1/providers | jq '.providers[].deployments[] | {id
 
 All of this state is per replica and kept in memory.
 
+## Usage ledger and reporting
+
+Every request gets one usage event when it completes, whatever the outcome: successes, upstream failures, budget rejections, client cancellations, and requests that authenticated but failed validation. (A request rejected by auth has no known tenant and is not recorded.) The event holds the tenant, key, endpoint, requested model, the deployment and provider that served it, status, attempts, fallback reason, cache status, token counts, cost, the prices it was computed from, the baseline cost, latency, time to first token, attribution tags and the config version. It never holds prompts or completions.
+
+**Cost is exact.** A request costs, for each token class, tokens × the deployment's price for that class / 1,000,000. Prices are taken as the exact decimal text from the catalog and computed with arbitrary-precision integers in femto-USD (1e-15 USD), so no floating-point rounding is involved anywhere between the catalog and the ledger. The classes are:
+
+| Class | From the OpenAI-wire usage | Price when the class has none |
+|---|---|---|
+| input (uncached) | `prompt_tokens − cached_tokens − cache_write_tokens`, at least 0 | none: the cost is unknown |
+| cached input | `prompt_tokens_details.cached_tokens` | the input price |
+| cache write | `prompt_tokens_details.cache_write_tokens` | the input price |
+| output | `completion_tokens`, which includes reasoning tokens | none: the cost is unknown (embeddings need no output price) |
+
+- **Unknown prices.** A deployment without an input price (or, for chat, an output price) has an unknown cost. Such requests are recorded with cost 0, counted in sums as 0, and reported separately as `unpriced_requests`.
+- **Missing usage.** When the upstream reports no usage, for example a stream that broke off after it started, the input is the gateway's own estimate (bytes/4 of the request, scaled by the model's `token_ratio`) and the output is estimated at one token per 4 bytes of the output text relayed (content, refusals, reasoning and tool-call arguments), and the event is marked `usage_estimated`. A stream that broke off after reporting part of its usage (Anthropic reports the input when the stream starts and the output only at its end) keeps the input it reported and counts the larger of the reported output and the relayed output, also marked `usage_estimated`.
+- **Requests no upstream served.** A request rejected before any upstream had it (routing errors, budget rejections, a parameter the deployment cannot take, a connection that failed before the request was sent) and a request an upstream refused with a 4xx cost 0. A request that reached an upstream but was never served, because the client went away, the deadline expired, the connection broke or the upstream answered 5xx, may still have been billed: it is recorded with the deployment and provider of the last such attempt, its estimated tokens and cost (see [Budgets](#budgets)), `usage_estimated`, and an unknown cost, so it counts in `unpriced_requests`.
+- **Prices are snapshotted** into each event, so a later catalog edit never rewrites history.
+- **Savings.** The baseline is the requested model, priced at its cheapest priced deployment for the same token counts. Routing savings are `baseline − cost`; they come only from provider arbitrage until Phase 5, and are negative when a fallback went to a pricier provider. Cache savings and overhead are recorded as 0 until the caches arrive in Phase 6.
+
+**Storage.** `storage.ledger.driver` selects where events go:
+
+```yaml
+storage:
+  ledger:
+    driver: postgres        # memory (default) | postgres
+    dsn: ${DATABASE_URL}
+    batch_size: 500         # events per write
+    flush_interval: 1s      # the longest an event waits
+    queue_size: 100000      # events buffered in memory
+```
+
+- **`memory`** keeps the most recent 100,000 events in process memory, per replica. It suits the quickstart and tests; nothing survives a restart.
+- **`postgres`** must be reachable at startup: the gateway exits with an error naming `storage.ledger` (never the DSN) if it cannot connect or migrate. It applies its embedded migrations at startup (recorded in `schema_migrations`, in one transaction, safe with several replicas starting at once), into the first schema of the connection's `search_path`. Events go to `usage_events`, which is append-only, partitioned by month on `ts` (`usage_events_p202611`, …) and indexed on `(tenant, ts)`. Partitions are created at startup for the current and the next month, and before writing any other month. Money is stored as `NUMERIC(38,15)`, tags as `jsonb`. To drop old data, drop old partitions.
+
+**Requests never wait for the database.** Events go into a bounded in-memory queue, and a background writer copies them to Postgres with `COPY`, in batches of `batch_size` or every `flush_interval`. If Postgres is down or failing, the writer keeps the events and retries with exponential backoff (100 ms doubling to 10 s); requests are unaffected. A retried batch is never stored twice. If the queue fills up, the oldest events are dropped and counted. On shutdown, once the server has drained, the writer flushes what is queued, within `server.shutdown_grace`; events it cannot write by then are counted as dropped and the exit status is 1. Watch these metrics:
+
+| Metric | Meaning |
+|---|---|
+| `switchyard_usage_queue_depth` | Events waiting to be written, including the batch being written |
+| `switchyard_usage_events_written_total` | Events written |
+| `switchyard_usage_write_errors_total` | Failed batch writes; each is retried |
+| `switchyard_usage_events_dropped_total` | Events lost: dropped from a full queue, rejected by the database, or left at shutdown. Alert on any increase. |
+
+Log lines about the ledger carry event IDs and counts, never event contents.
+
+**Attribution tags.** A client sends `X-Switchyard-Tags: k=v,k2=v2` to tag a request's usage event, for example by team or feature, and reports group by `tag:<key>`. At most 10 tags; keys are 1 to 32 characters of `a-z`, `0-9`, `_`, `.` and `-`, starting with a letter or digit, each at most once; values are 1 to 64 printable ASCII characters other than `,` and `=`; spaces around keys and values are ignored, and several header lines are joined. A malformed header gets 400 `invalid_tags`, without echoing it.
+
+**Metrics.** On the admin `/metrics`: `switchyard_cost_usd_total{provider,model}` (a float approximation of the ledger's exact sums; over a run they agree to within 1e-6), `switchyard_tokens_total{provider,model,class}` with class `input` (uncached), `cached_input`, `cache_write` and `output`, and `switchyard_savings_usd_total{source="routing"}`, the running total of `baseline − cost`, which decreases when a fallback costs more than the baseline.
+
+**Reports.** A report aggregates the events of one tenant over a time range `[from, to)`, in UTC, optionally grouped by one or more of `day`, `model` (the requested model), `deployment`, `provider`, `key`, `endpoint`, `status_class` (`2xx`, `4xx`, …), `cache_status` and `tag:<name>`. It returns totals for the whole range and, per group, the same fields:
+
+- `requests`, `errors` (status 400 and above) and `unpriced_requests`;
+- token counts per class;
+- `cost_usd` (the known cost plus overhead), `baseline_cost_usd`, `overhead_usd`, and `savings_usd` with `routing`, `cache` and `net` (`net = baseline_cost_usd − cost_usd`); money is an exact decimal string;
+- `cache_hit_rate` and `fallback_rate`.
+
+Groups are sorted by cost, highest first, then by their values, and capped at `limit` (default 1,000, at most 10,000); the totals always cover every matching event. On Postgres the sums are computed in SQL over `NUMERIC`, so they are exact. The tenant filter is applied in the store itself: a tenant's report can never include another tenant's events, and only the admin API can report across tenants.
+
+Two endpoints serve reports:
+
+- **`GET /switchyard/v1/usage`** on the public listener, with a gateway key: the report of the key's own tenant. Any `tenant` parameter is ignored.
+- **`GET /admin/v1/usage`** on the admin listener: the report of the tenant named by `tenant=`, or of every tenant without it.
+
+Both take `from` and `to`, as RFC 3339 times or `YYYY-MM-DD` dates in UTC; a date as `to` includes that whole day. The default is the 7 days before now, and a report may span at most 400 days. `group_by` is a comma-separated list of the dimensions above, at most 8 of them and at most 3 tags, and `limit` caps the groups. A malformed parameter, or a report the database finds too complex, gets 400 `invalid_query`, and a ledger that cannot answer (Postgres down) 503 `usage_unavailable`. The Postgres ledger runs reports on a small connection pool of their own, so that they never hold up the writer, one at a time per tenant (the admin report across every tenant counts as one tenant) and at most 4 at once, each statement limited to 25 s; a report beyond those limits gets 429 `report_busy` with `Retry-After`.
+
+```sh
+curl "localhost:8080/switchyard/v1/usage?from=2026-11-01&to=2026-11-11&group_by=model" \
+  -H "Authorization: Bearer $SWITCHYARD_API_KEY"
+```
+
+```json
+{
+  "object": "usage_report",
+  "period": { "from": "2026-11-01T00:00:00Z", "to": "2026-11-12T00:00:00Z" },
+  "tenant": "acme",
+  "group_by": ["model"],
+  "totals": {
+    "requests": 3, "errors": 1, "unpriced_requests": 0,
+    "tokens": { "input": 2595, "cached_input": 2351, "cache_write": 2251, "output": 553 },
+    "cost_usd": "0.02230155", "baseline_cost_usd": "0.02230155", "overhead_usd": "0",
+    "savings_usd": { "routing": "0", "cache": "0", "net": "0" },
+    "cache_hit_rate": 0, "fallback_rate": 0
+  },
+  "groups": [
+    { "model": "claude-sonnet", "requests": 1, "errors": 0, "unpriced_requests": 0,
+      "tokens": { "input": 2095, "cached_input": 2051, "cache_write": 2051, "output": 503 },
+      "cost_usd": "0.02213655", "baseline_cost_usd": "0.02213655", "overhead_usd": "0",
+      "savings_usd": { "routing": "0", "cache": "0", "net": "0" },
+      "cache_hit_rate": 0, "fallback_rate": 0 },
+    { "model": "gpt-6-luna", "requests": 2, "errors": 1, "unpriced_requests": 0,
+      "tokens": { "input": 500, "cached_input": 300, "cache_write": 200, "output": 50 },
+      "cost_usd": "0.000165", "baseline_cost_usd": "0.000165", "overhead_usd": "0",
+      "savings_usd": { "routing": "0", "cache": "0", "net": "0" },
+      "cache_hit_rate": 0, "fallback_rate": 0 }
+  ]
+}
+```
+
+Each group is one flat object: its dimension values (here `model`; a tag dimension appears as `"tag:team"`), then its totals. `tenant` is `null` in an admin report across every tenant:
+
+```sh
+curl "127.0.0.1:9090/admin/v1/usage?group_by=day,tag:team"
+curl "127.0.0.1:9090/admin/v1/usage?tenant=acme&from=2026-11-01T00:00:00Z&to=2026-11-02T00:00:00Z"
+```
+
+## Budgets
+
+A tenant can cap its spend per calendar day or month, in UTC, either in total (`scope: tenant`) or for each of its keys separately (`scope: key`):
+
+```yaml
+tenants:
+  - id: acme
+    keys: [...]
+    budgets:
+      - scope: tenant           # tenant | key
+        window: month           # day | month, calendar periods in UTC
+        limit_usd: "2000"       # exact decimal, > 0 and at most 1000000000
+        soft_at: 0.8            # optional, in (0, 1)
+        on_exhausted: block     # block (default) | notify
+      - scope: key
+        window: day
+        limit_usd: "50"
+budgets:
+  fail_mode: open               # open (default) | closed
+```
+
+Each tenant may have at most one budget per scope and window. A `key` budget on a tenant without keys applies to nothing, and `config validate` warns about it.
+
+**How a request is charged.** Before the first upstream attempt, the gateway estimates the request's cost on the chosen deployment, pricing the output at `max_tokens` (or `max_completion_tokens`) when the request sets it, else at 500 tokens, for each completion the request generates (`n` for chat; `max(n, best_of)` for each prompt of a legacy completion), and admits that estimate against every budget that applies: the tenant's budgets and, for `key` budgets, those of the calling key. Admission is atomic across all of them. If any `block` budget lacks room (spent + estimate > limit), nothing is charged anywhere and the request gets `429` with type `insufficient_quota`, code `budget_exceeded`, and a `Retry-After` giving the seconds until that budget's window resets (the latest one, if several are full). Otherwise the estimate is added to every budget. A fallback to a pricier deployment admits the difference first, under the same rule. When the request ends, the charge is settled once: to its exact cost rounded up to micro-USD when that is known; to the admitted estimate when it is not (a deployment without prices, or a stream that broke off on a deployment without prices); to the admitted estimate too when an upstream had the request but never served it (the client went away, the deadline expired, the connection broke, or the upstream answered 5xx), since it may have billed it anyway; and to 0 when no upstream had the request (routing errors, budget rejections, a parameter the deployment cannot take, a connection that failed before the request was sent) or every upstream refused it with a 4xx. The actual cost may be lower or higher than the estimate.
+
+**Deployments without prices can't be budget-controlled precisely.** Their estimate is 0, so a request under a `block` budget is admitted at 1 micro-USD instead, and settled at that minimum: a full budget refuses it, but its spend is not counted. `switchyard catalog lint` flags deployments without prices.
+
+Because concurrent admissions are serialized, a budget can be overshot only by requests that were admitted and then cost more than estimated, never by a race. If a replica dies mid-request, the estimate stays counted: budgets err towards over-counting.
+
+- **`notify`** budgets never refuse. Requests over the limit are served, charged, logged and counted.
+- **`soft_at`** reports, once per budget and window across all replicas, the first admission that brings spend to `soft_at × limit` or above. Phase 5 adds downgrading to a cheaper profile at that point.
+- **Money.** Counters hold whole micro-USD (1e-6 USD). Limits, soft thresholds and charges are rounded up, so rounding never lets spend through. The usage ledger keeps exact decimal costs.
+
+**Where counters live.** With `storage.mode: memory` they are in process memory, per replica, and reset on restart. With `storage.mode: redis` they are in the state instance (`storage.redis.state_url`, which must not evict keys), shared by every replica, as `sy:b:v1:<scope>:<window start, yyyymmdd>`, for example `sy:b:v1:acme/month:20261101` or `sy:b:v1:acme/key:acme-backend/day:20261111`. Each counter expires two days after its window ends. Admission is a single Lua script over every budget of the request. The state instance must be a single Redis server or a failover pair, not a Redis Cluster.
+
+**When Redis is down**, `budgets.fail_mode` decides. `open` (the default) serves the request without budget checks, logs a warning and counts it in `switchyard_budget_store_errors_total`; `closed` rejects it with `503` and code `budget_unavailable`. A fallback to a pricier deployment follows the same rule (with `closed`, that deployment is skipped). A budget call that fails, or gets no answer within 1 s, marks the store unavailable for 5 s: during that time requests skip it and get the `fail_mode` outcome at once (counted in `switchyard_budget_store_errors_total`, with the warning logged only for the failure that marked it), then one request tries Redis again. Redis may be down at startup: the gateway starts and warns. With `closed`, `/readyz` fails its `budget_store` check until Redis answers; with `open`, the replica stays ready, since it serves requests anyway, and `GET /admin/v1/providers` reports `"budget_store": {"status": "ok" | "unavailable", "fail_mode": "open"}`.
+
+**Metrics.** `switchyard_budget_rejections_total` counts requests answered 429 `budget_exceeded`; `switchyard_budget_fallback_skips_total` pricier fallback deployments passed over because a blocking budget had no room for the difference; `switchyard_budget_store_errors_total` budget store calls that failed or were skipped while the store was marked unavailable; `switchyard_budget_notifications_total{scope,kind}` the first time each window reaches `soft_at` (`kind="soft_threshold"`) and each request admitted over a `notify` budget (`kind="exceeded"`); and `switchyard_budget_utilization_ratio{scope}` is each budget's spend in its current window as a fraction of its limit, read from the store at scrape time. `scope` is the budget's name, such as `acme/month` or `acme/key:acme-backend/day`, so its values are bounded by the config.
+
 ## Docker
 
 ```sh
@@ -431,12 +579,7 @@ To delete the data as well, run `docker-compose -f deploy/compose.yaml down -v` 
 - Start the Docker daemon first with `colima start`.
 - The Makefile uses `docker compose` when that plugin is registered and falls back to the standalone `docker-compose` binary otherwise, so registering the plugin is optional. To register it, add the line Homebrew prints to `~/.docker/config.json`, for example `"cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"]`.
 - `make docker` needs the buildx plugin: `brew install docker-buildx`, with the same `cliPluginsExtraDirs` entry. Without it, `docker build` fails with "BuildKit is enabled but the buildx component is missing or broken". Until it is installed, the Colima VM's own Docker CLI, which includes buildx, can build against the same daemon: `make docker-check DOCKER="colima ssh -- docker"` (Colima mounts your home directory at the same path inside the VM).
-- Later phases run integration tests with testcontainers, which on Colima needs:
-
-  ```sh
-  export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
-  export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
-  ```
+- `make test-integration` needs only Colima's Docker daemon and `docker-compose` (or the `docker compose` plugin): it starts the services itself. It uses host ports 5433 and 6380, so stop anything else on them first, `make dev-up` included.
 
 ## Make targets
 
@@ -446,6 +589,7 @@ Run `make` or `make help` to list them.
 |---|---|
 | `build` | Builds `bin/switchyard` with `-trimpath` and version metadata from git. |
 | `test` | `go test -race -count=1 ./...` |
+| `test-integration` | Starts Postgres and `redis-state` from `deploy/compose.yaml` in a separate compose project (`switchyard-test`), runs the tests tagged `integration` with `SWITCHYARD_TEST_POSTGRES_DSN`, `SWITCHYARD_TEST_REDIS_URL` and `SWITCHYARD_TEST_COMPOSE` (the compose command of that project) set, and always removes the containers and their volumes afterwards. The tests cover the Postgres ledger and the Redis budget store, and in `test/integration` the P4 acceptance scenarios through the gateway binary: exact costs checked against the ledger rows, 1,000 concurrent requests against a Redis budget, and Postgres stopped for 60 s under load. It takes a few minutes. It uses the same host ports as `dev-up`, so run `make dev-down` first. Without those variables, `go test -tags integration` skips these tests. Override the packages with `INTEGRATION_PKGS` and the flags with `INTEGRATION_FLAGS` (default `-race -count=1 -p 1 -timeout 20m`; `-p 1` because the outage test stops the shared Postgres). |
 | `cover` | Writes `coverage.out` and prints a per-function coverage summary. |
 | `bench-overhead` | Measures the latency the gateway adds against a zero-latency fake upstream; results in [test/load/RESULTS.md](test/load/RESULTS.md). Pass flags with `BENCH_FLAGS="-mode stream -concurrency 200"`; the default is the P1 acceptance run (non-stream, concurrency 100). |
 | `smoke` | Live smoke test against OpenAI with the SDK. Opt-in: it skips unless `OPENAI_API_KEY` is set; `SMOKE_MODEL` defaults to `gpt-5-mini`. |
@@ -473,19 +617,22 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same checks o
 cmd/switchyard/     CLI: serve, config validate, catalog lint, keys generate, version
 internal/
   api/openaiapi/    HTTP handlers for /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
+  api/usageapi/     usage reports: /switchyard/v1/usage and /admin/v1/usage
   apierror/         errors in the OpenAI-compatible JSON envelope
   app/              composition root: config snapshot to running service
   auth/             gateway API keys: hashing, store, middleware
+  budget/           budget scopes and windows; memory and Redis (Lua) stores
   catalog/          models, deployments, prices; resolution, selection, lint
   config/           schema, loading, ${…} expansion, includes, validation, snapshot
   gateway/          request pipeline, plans and the retry/fallback executor, completions shim,
-                    metrics, log fields, /admin/v1/providers
+                    budget admission, usage events, metrics, log fields, /admin/v1/providers
   health/           per-replica breakers, cooldowns, retry budgets, concurrency, latency stats
   providers/        adapter interfaces; openai/ (OpenAI wire) and anthropic/ (Messages API)
   schema/           lossless chat, legacy completion and embedding requests; capabilities
   server/           listeners, middleware, health checks, graceful shutdown
   sse/              server-sent events reader and writer
   telemetry/        slog with secret redaction, Prometheus registry
+  usage/            exact money and costs, usage events, memory and Postgres ledgers, reports
   reqctx/           request ID and request-scoped logger in context
   version/          build metadata
 test/
@@ -493,7 +640,9 @@ test/
   fakeanthropic/    scriptable fake Messages API (make record-fixtures records real ones)
   fixtures/         Anthropic fixtures, handcrafted from the docs until recorded
   conformance/      OpenAI SDK conformance suite, direct and through the gateway (OpenAI and
-                    Anthropic upstreams), plus the P2 and P3 acceptance cases
+                    Anthropic upstreams), plus the P2, P3 and P4 acceptance cases
+  scenario/         the P4 acceptance scenarios, shared by conformance/ and integration/
+  integration/      P4 scenarios on Postgres and Redis, Postgres outage (make test-integration)
   load/             overhead benchmark (make bench-overhead)
   smoke/            opt-in live smoke test (make smoke)
 configs/            quickstart.yaml, switchyard.example.yaml, catalog/

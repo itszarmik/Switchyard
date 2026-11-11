@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math/big"
 	"net"
 	"net/netip"
 	"net/url"
@@ -117,6 +118,7 @@ func (st *loadState) validate(c *Config) {
 	models, modelPaths := st.validateModels(c.Models, providers)
 	st.validateAliases(c.Aliases, models, modelPaths)
 	st.validateTenants(c.Tenants)
+	st.validateBudgets(&c.Budgets)
 	st.validateRouting(&c.Routing)
 	st.checkLiteralSecrets(c)
 }
@@ -302,6 +304,15 @@ func (st *loadState) validateStorage(s *Storage) {
 	if st.checkOneOf("storage.ledger.driver", s.Ledger.Driver, "memory", "postgres") &&
 		s.Ledger.Driver == "postgres" && !s.Ledger.DSN.IsSet() {
 		st.errorAt("storage.ledger.dsn", "required when storage.ledger.driver is postgres")
+	}
+	if s.Ledger.BatchSize <= 0 {
+		st.errorAt("storage.ledger.batch_size", "must be greater than 0")
+	}
+	if s.Ledger.FlushInterval <= 0 {
+		st.errorAt("storage.ledger.flush_interval", "must be greater than 0")
+	}
+	if s.Ledger.QueueSize <= 0 {
+		st.errorAt("storage.ledger.queue_size", "must be greater than 0")
 	}
 }
 
@@ -510,7 +521,92 @@ func (st *loadState) validateTenants(ts []Tenant) {
 			st.checkKeyHash(kb+".hash", k.Hash, hashes)
 			st.checkTags(kb+".tags", k.Tags)
 		}
+		st.validateTenantBudgets(t, base)
 	}
+}
+
+// Budget settings (DESIGN §12.3).
+const (
+	// BudgetScopeTenant caps a tenant's total spend.
+	BudgetScopeTenant = "tenant"
+	// BudgetScopeKey caps the spend of each of a tenant's keys separately.
+	BudgetScopeKey = "key"
+	// BudgetWindowDay is a calendar day in UTC.
+	BudgetWindowDay = "day"
+	// BudgetWindowMonth is a calendar month in UTC.
+	BudgetWindowMonth = "month"
+	// BudgetBlock rejects requests that would exceed the limit.
+	BudgetBlock = "block"
+	// BudgetNotify serves requests over the limit, reporting them.
+	BudgetNotify = "notify"
+	// BudgetFailOpen serves requests while the budget store is unavailable.
+	BudgetFailOpen = "open"
+	// BudgetFailClosed rejects requests while the budget store is
+	// unavailable.
+	BudgetFailClosed = "closed"
+)
+
+// MaxBudgetLimitUSD is the largest limit_usd a budget may have. It keeps
+// every counter, in micro-USD, well inside the range where the budget
+// store's Lua arithmetic (IEEE doubles) is exact.
+const MaxBudgetLimitUSD = 1_000_000_000
+
+// msgKeyBudgetNoKeys warns about a key budget that can never apply.
+const msgKeyBudgetNoKeys = "budget with scope key on a tenant with no keys; it applies to no request"
+
+// validateTenantBudgets checks the budgets of tenant t, whose path is base.
+// Each scope and window pair may appear once per tenant.
+func (st *loadState) validateTenantBudgets(t *Tenant, base string) {
+	first := make(map[[2]string]string) // {scope, window} -> path of its first definition
+	for j := range t.Budgets {
+		b := &t.Budgets[j]
+		bp := indexPath(base+".budgets", j)
+		scopeOK := st.checkOneOf(bp+".scope", b.Scope, BudgetScopeTenant, BudgetScopeKey)
+		windowOK := st.checkOneOf(bp+".window", b.Window, BudgetWindowDay, BudgetWindowMonth)
+		st.checkBudgetLimit(bp+".limit_usd", b.LimitUSD)
+		if b.SoftAt != 0 && !(b.SoftAt > 0 && b.SoftAt < 1) {
+			st.errorAt(bp+".soft_at", fmt.Sprintf("must be greater than 0 and less than 1, got %s", strconv.FormatFloat(b.SoftAt, 'g', -1, 64)))
+		}
+		st.checkOneOf(bp+".on_exhausted", b.OnExhausted, BudgetBlock, BudgetNotify)
+		if !scopeOK || !windowOK {
+			continue
+		}
+		pair := [2]string{b.Scope, b.Window}
+		if prev, dup := first[pair]; dup {
+			st.errorAt(bp, fmt.Sprintf("duplicate budget for scope %s and window %s; first defined at %s", b.Scope, b.Window, st.where(prev)))
+			continue
+		}
+		first[pair] = bp
+		if b.Scope == BudgetScopeKey && len(t.Keys) == 0 {
+			st.warnAt(bp+".scope", msgKeyBudgetNoKeys)
+		}
+	}
+}
+
+// checkBudgetLimit reports an error unless p is set and
+// 0 < p <= MaxBudgetLimitUSD.
+func (st *loadState) checkBudgetLimit(path string, p Price) {
+	switch {
+	case !p.IsSet():
+		st.errorAt(path, msgRequired)
+	case p.Float64() <= 0:
+		st.errorAt(path, "must be greater than 0")
+	case new(big.Rat).SetFrac64(MaxBudgetLimitUSD, 1).Cmp(priceRat(p)) < 0:
+		st.errorAt(path, fmt.Sprintf("must be at most %d", MaxBudgetLimitUSD))
+	}
+}
+
+// priceRat returns the exact value of a set Price.
+func priceRat(p Price) *big.Rat {
+	r, ok := new(big.Rat).SetString(p.String())
+	if !ok { // unreachable: ParsePrice accepts only plain decimals
+		return new(big.Rat)
+	}
+	return r
+}
+
+func (st *loadState) validateBudgets(b *Budgets) {
+	st.checkOneOf("budgets.fail_mode", b.FailMode, BudgetFailOpen, BudgetFailClosed)
 }
 
 // checkKeyHash validates the API key hash at path and checks that it is

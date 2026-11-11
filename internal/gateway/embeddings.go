@@ -22,7 +22,10 @@ const reasonNoEmbeddings = "provider does not serve embeddings"
 // replaced, and the answer returned byte for byte.
 func (g *Gateway) Embeddings(ctx context.Context, ex Exchange) {
 	rec := g.newRecord(ctx, EndpointEmbeddings)
-	defer rec.finish()
+	defer rec.done()
+	if !g.readTags(ex, rec) {
+		return
+	}
 
 	body, berr := ex.Body()
 	if berr != nil {
@@ -48,6 +51,10 @@ func (g *Gateway) Embeddings(ctx context.Context, ex Exchange) {
 	}
 	rec.info = Info{Model: res.Model.ID, Alias: res.Alias}
 	rec.alias = res.Alias
+	rec.model = res.Model
+	// Budgets estimate every input together, at bytes/4 of the body;
+	// embeddings have no output.
+	rec.estIn = estimateIn(len(body), 0, 0, res.Model)
 	// The context filter applies per input, so the estimate is the
 	// largest input's.
 	e = g.buildPlan(&rec.plan, res, schema.CapabilitySet{}, req.LargestInputTokens(res.Model.TokenRatio), 0,

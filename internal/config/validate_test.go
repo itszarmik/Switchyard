@@ -382,3 +382,133 @@ func TestValidID(t *testing.T) {
 		}
 	}
 }
+
+func TestBudgetValidation(t *testing.T) {
+	const v1 = "version: 1\n"
+	key := "keys: [{id: k, hash: " + keyHash("a") + "}]"
+	// tenant returns a tenant with one key and the given budgets.
+	tenant := func(budgets ...string) string {
+		return v1 + tenantsYAML("{id: acme, "+key+", budgets: ["+strings.Join(budgets, ", ")+"]}")
+	}
+	tests := []struct {
+		name  string
+		yaml  string
+		wants []want
+	}{
+		{"no budgets", tenant(), nil},
+		{"every field", tenant(
+			"{scope: tenant, window: month, limit_usd: '2000', soft_at: 0.8, on_exhausted: block}",
+			"{scope: tenant, window: day, limit_usd: 100.5, on_exhausted: notify}",
+			"{scope: key, window: day, limit_usd: 0.000000001}",
+			"{scope: key, window: month, limit_usd: 1000000000}",
+		), nil},
+		{"scope missing", tenant("{window: day, limit_usd: 1}"),
+			[]want{errAt("tenants[0].budgets[0].scope", "required; must be one of tenant, key")}},
+		{"scope unknown", tenant("{scope: team, window: day, limit_usd: 1}"),
+			[]want{errAt("tenants[0].budgets[0].scope", `must be one of tenant, key, got "team"`)}},
+		{"window missing", tenant("{scope: tenant, limit_usd: 1}"),
+			[]want{errAt("tenants[0].budgets[0].window", "required; must be one of day, month")}},
+		{"window unknown", tenant("{scope: tenant, window: week, limit_usd: 1}"),
+			[]want{errAt("tenants[0].budgets[0].window", `must be one of day, month, got "week"`)}},
+		{"limit missing", tenant("{scope: tenant, window: day}"),
+			[]want{errAt("tenants[0].budgets[0].limit_usd", "required")}},
+		{"limit null", tenant("{scope: tenant, window: day, limit_usd: ~}"),
+			[]want{errAt("tenants[0].budgets[0].limit_usd", "required")}},
+		{"limit zero", tenant("{scope: tenant, window: day, limit_usd: 0}"),
+			[]want{errAt("tenants[0].budgets[0].limit_usd", "must be greater than 0")}},
+		{"limit zero decimal", tenant("{scope: tenant, window: day, limit_usd: '0.000'}"),
+			[]want{errAt("tenants[0].budgets[0].limit_usd", "must be greater than 0")}},
+		{"limit negative", tenant("{scope: tenant, window: day, limit_usd: -5}"),
+			[]want{errAt("tenants[0].budgets[0].limit_usd", "must not be negative")}},
+		{"limit not a number", tenant("{scope: tenant, window: day, limit_usd: lots}"),
+			[]want{errAt("tenants[0].budgets[0].limit_usd", `expected an amount in USD, such as 2000 or "12.50", got "lots"`)}},
+		{"limit with exponent", tenant("{scope: tenant, window: day, limit_usd: 1e3}"),
+			[]want{errAt("tenants[0].budgets[0].limit_usd", "an amount in USD must be written as a plain decimal")}},
+		{"limit too large", tenant("{scope: tenant, window: day, limit_usd: '1000000000.000000001'}"),
+			[]want{errAt("tenants[0].budgets[0].limit_usd", "must be at most 1000000000")}},
+		{"soft_at half", tenant("{scope: tenant, window: day, limit_usd: 1, soft_at: 0.5}"), nil},
+		{"soft_at one", tenant("{scope: tenant, window: day, limit_usd: 1, soft_at: 1}"),
+			[]want{errAt("tenants[0].budgets[0].soft_at", "must be greater than 0 and less than 1, got 1")}},
+		{"soft_at negative", tenant("{scope: tenant, window: day, limit_usd: 1, soft_at: -0.1}"),
+			[]want{errAt("tenants[0].budgets[0].soft_at", "got -0.1")}},
+		{"soft_at nan", tenant("{scope: tenant, window: day, limit_usd: 1, soft_at: .nan}"),
+			[]want{errAt("tenants[0].budgets[0].soft_at", "expected a finite number")}},
+		{"on_exhausted unknown", tenant("{scope: tenant, window: day, limit_usd: 1, on_exhausted: warn}"),
+			[]want{errAt("tenants[0].budgets[0].on_exhausted", `must be one of block, notify, got "warn"`)}},
+		{"duplicate pair", tenant(
+			"{scope: tenant, window: day, limit_usd: 1}",
+			"{scope: key, window: day, limit_usd: 1}",
+			"{scope: tenant, window: day, limit_usd: 2, on_exhausted: notify}",
+		), []want{errAt("tenants[0].budgets[2]", "duplicate budget for scope tenant and window day; first defined at cfg.yaml:3")}},
+		{"same pair in two tenants", v1 + tenantsYAML(
+			"{id: a, keys: [{id: k1, hash: "+keyHash("a")+"}], budgets: [{scope: tenant, window: day, limit_usd: 1}]}",
+			"{id: b, keys: [{id: k2, hash: "+keyHash("b")+"}], budgets: [{scope: tenant, window: day, limit_usd: 1}]}",
+		), nil},
+		{"key budget without keys", v1 + tenantsYAML("{id: a, budgets: [{scope: key, window: day, limit_usd: 1}, {scope: tenant, window: day, limit_usd: 1}]}"),
+			[]want{warnAt("tenants[0].keys", msgTenantNoKeys), warnAt("tenants[0].budgets[0].scope", msgKeyBudgetNoKeys)}},
+		{"fail_mode open", v1 + "budgets: {fail_mode: open}\n", nil},
+		{"fail_mode closed", v1 + "budgets: {fail_mode: closed}\n", nil},
+		{"fail_mode unknown", v1 + "budgets: {fail_mode: strict}\n",
+			[]want{errAt("budgets.fail_mode", `must be one of open, closed, got "strict"`)}},
+		{"unknown budget field", tenant("{scope: tenant, window: day, limit_usd: 1, soft_profile: cheap}"),
+			[]want{errAt("tenants[0].budgets[0].soft_profile", "unknown field")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkProblems(t, problemsOf(t, tt.yaml, nil, nil), tt.wants...)
+		})
+	}
+}
+
+func TestBudgetDefaults(t *testing.T) {
+	root := "version: 1\n" + tenantsYAML("{id: acme, keys: [{id: k, hash: "+keyHash("a")+"}], budgets: ["+
+		"{scope: tenant, window: month, limit_usd: '2000.50', soft_at: 0.8}, "+
+		"{scope: key, window: day, limit_usd: 5, on_exhausted: notify}]}")
+	cfg := mustLoad(t, root, nil, nil).Config()
+	want := []Budget{
+		{Scope: BudgetScopeTenant, Window: BudgetWindowMonth, LimitUSD: mustPrice(t, "2000.50"), SoftAt: 0.8, OnExhausted: BudgetBlock},
+		{Scope: BudgetScopeKey, Window: BudgetWindowDay, LimitUSD: mustPrice(t, "5"), OnExhausted: BudgetNotify},
+	}
+	if diff := cmp.Diff(want, cfg.Tenants[0].Budgets); diff != "" {
+		t.Errorf("budgets (-want +got):\n%s", diff)
+	}
+	if got := cfg.Budgets.FailMode; got != BudgetFailOpen {
+		t.Errorf("budgets.fail_mode = %q, want %q", got, BudgetFailOpen)
+	}
+	cfg = mustLoad(t, "version: 1\nbudgets: {fail_mode: closed}\n", nil, nil).Config()
+	if got := cfg.Budgets.FailMode; got != BudgetFailClosed {
+		t.Errorf("explicit budgets.fail_mode = %q, want %q", got, BudgetFailClosed)
+	}
+}
+
+func TestLedgerValidation(t *testing.T) {
+	const v1 = "version: 1\n"
+	tests := []struct {
+		name  string
+		yaml  string
+		wants []want
+	}{
+		{"defaults", v1, nil},
+		{"every field", v1 + "storage: {ledger: {driver: memory, batch_size: 10, flush_interval: 250ms, queue_size: 20}}\n", nil},
+		{"batch_size negative", v1 + "storage: {ledger: {batch_size: -1}}\n",
+			[]want{errAt("storage.ledger.batch_size", "must be greater than 0")}},
+		{"flush_interval negative", v1 + "storage: {ledger: {flush_interval: -1s}}\n",
+			[]want{errAt("storage.ledger.flush_interval", "duration must not be negative")}},
+		{"queue_size negative", v1 + "storage: {ledger: {queue_size: -5}}\n",
+			[]want{errAt("storage.ledger.queue_size", "must be greater than 0")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkProblems(t, problemsOf(t, tt.yaml, nil, nil), tt.wants...)
+		})
+	}
+}
+
+func TestLedgerDefaults(t *testing.T) {
+	cfg := mustLoad(t, "version: 1\n", nil, nil).Config()
+	l := cfg.Storage.Ledger
+	if l.Driver != "memory" || l.BatchSize != 500 || l.FlushInterval != Duration(time.Second) || l.QueueSize != 100_000 {
+		t.Errorf("ledger = driver %q, batch_size %d, flush_interval %s, queue_size %d; want memory, 500, 1s, 100000",
+			l.Driver, l.BatchSize, l.FlushInterval, l.QueueSize)
+	}
+}

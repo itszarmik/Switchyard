@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"time"
 
 	"switchyard/internal/providers"
@@ -36,7 +37,10 @@ import (
 // the upstream request.
 func (g *Gateway) ChatCompletions(ctx context.Context, ex Exchange) {
 	rec := g.newRecord(ctx, EndpointChatCompletions)
-	defer rec.finish()
+	defer rec.done()
+	if !g.readTags(ex, rec) {
+		return
+	}
 
 	body, berr := ex.Body()
 	if berr != nil {
@@ -74,9 +78,11 @@ func (g *Gateway) planChat(ex Exchange, rec *record, req *schema.ChatRequest, si
 	}
 	rec.info = Info{Model: res.Model.ID, Alias: res.Alias}
 	rec.alias = res.Alias
+	rec.model = res.Model
 	maxTokens, hasMax := req.MaxTokens()
 	images, inline := req.ImageParts()
-	e = g.buildPlan(&rec.plan, res, req.RequiredCapabilities(), estimateIn(size, images, inline, res.Model), estimateOut(maxTokens, hasMax), nil)
+	rec.estIn, rec.estOut = estimateIn(size, images, inline, res.Model), estimateOut(maxTokens, hasMax, chatOutputs(req))
+	e = g.buildPlan(&rec.plan, res, req.RequiredCapabilities(), rec.estIn, rec.estOut, nil)
 	rec.excluded = len(rec.plan.exclusions)
 	if e != nil {
 		rec.respondError(ex, rec.info, e)
@@ -129,6 +135,7 @@ func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage boo
 		start := time.Now()
 		err := ex.StartStream(info)
 		rec.committed = true
+		rec.status = http.StatusOK
 		rec.wroteClient(start)
 		if err != nil {
 			rec.errorCode = codeClientGone
@@ -170,6 +177,7 @@ func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage boo
 			stripped.Usage = nil
 			chunk = &stripped
 		}
+		rec.outBytes += chunkOutputBytes(chunk)
 		data := chunk.Raw
 		if conv != nil {
 			var keep bool

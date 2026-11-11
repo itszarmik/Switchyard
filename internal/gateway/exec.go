@@ -5,8 +5,10 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"switchyard/internal/catalog"
@@ -101,8 +103,16 @@ func (g *Gateway) withDeadline(ctx context.Context, ex Exchange, rec *record) (c
 // failureRank), and 503 no_healthy_upstream if no attempt could be made
 // at all.
 //
+// First, the request is admitted against its budgets (see admitBudget),
+// and before an attempt on a deployment whose estimate is higher than the
+// charge so far, the difference is admitted (see chargeFallback); a
+// deployment the budgets have no room for is passed over.
+//
 // The plan is rec.plan, and the response headers start from rec.info.
 func (g *Gateway) execute(ctx context.Context, ex Exchange, rec *record, try tryFunc) {
+	if !g.admitBudget(ctx, ex, rec) {
+		return
+	}
 	p, info := &rec.plan, &rec.info
 	var (
 		last      *planEntry // the deployment of the last failure
@@ -129,6 +139,10 @@ func (g *Gateway) execute(ctx context.Context, ex Exchange, rec *record, try try
 			if ctx.Err() != nil {
 				g.answerFailure(ctx, ex, rec, failureState{})
 				return
+			}
+			if reason := g.chargeFallback(ctx, rec, e); reason != "" {
+				skipped = append(skipped, catalog.Exclusion{Deployment: e.d.ID, Reason: reason})
+				break
 			}
 			if !e.prov.Acquire() {
 				skipped = append(skipped, catalog.Exclusion{Deployment: e.d.ID, Reason: "provider at max_concurrency " + strconv.Itoa(e.prov.Max())})
@@ -322,6 +336,10 @@ func (g *Gateway) sleep(ctx context.Context, rec *record, d time.Duration) bool 
 // slot of its provider, and records it. If try panics, the slot is
 // released and the admission ended, as neutral for the breaker, before the
 // panic goes on: neither may leak.
+//
+// It also notes whether the attempt reached the upstream (see sentTrace)
+// and may have been billed without serving the request (see billable):
+// such a request is charged its estimate (see record.account).
 func (g *Gateway) runAttempt(ctx context.Context, rec *record, e *planEntry, adm health.Admission, info *Info, try tryFunc) attempt {
 	rec.startAttempt(e.health, adm)
 	ended := false
@@ -331,13 +349,48 @@ func (g *Gateway) runAttempt(ctx context.Context, rec *record, e *planEntry, adm
 			rec.reportHealth(health.Result{Kind: providers.KindCanceled})
 		}
 	}()
+	var sent atomic.Bool
 	start := time.Now()
-	a := try(ctx, e, info)
+	a := try(sentTrace(ctx, &sent), e, info)
 	dur := time.Since(start)
 	ended = true
 	e.prov.Release()
+	if !rec.served && sent.Load() && billable(a.kind) {
+		rec.sentTo = e.d
+	}
 	g.recordAttempt(ctx, rec, e, a, dur)
 	return a
+}
+
+// sentTrace returns ctx with an HTTP client trace that sets sent once the
+// upstream request has been written in full, or the upstream has begun to
+// answer: from then on the upstream may process, and bill, the request
+// whatever happens to the attempt. A request that failed before, such as
+// on a dial failure, never reached it.
+func sentTrace(ctx context.Context, sent *atomic.Bool) context.Context {
+	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(i httptrace.WroteRequestInfo) {
+			if i.Err == nil {
+				sent.Store(true)
+			}
+		},
+		GotFirstResponseByte: func() { sent.Store(true) },
+	})
+}
+
+// billable reports whether an attempt that reached the upstream and ended
+// with kind, without serving the request, may have been billed: anything
+// but an upstream refusal (a 4xx answer), which is not, and the adapter's
+// own rejection, which never reaches the upstream. A cancellation, a
+// timeout, a broken connection and a 5xx may all come after the upstream
+// did the work.
+func billable(k providers.Kind) bool {
+	switch k {
+	case providers.KindClientError, providers.KindAuth, providers.KindNotFound, providers.KindContextLength,
+		providers.KindContentFilter, providers.KindRateLimited, providers.KindUnsupported:
+		return false
+	}
+	return true
 }
 
 // recordAttempt records one attempt in the health tracker, the metrics and
@@ -431,6 +484,9 @@ func (g *Gateway) responseAttempt(ex Exchange, rec *record, start time.Time, res
 	info.UpstreamRequestID = resp.UpstreamRequestID
 	a := attempt{committed: true, ttft: resp.TTFT, usage: resp.Usage}
 	body := resp.Body
+	if resp.Usage == nil {
+		rec.outBytes = responseOutputBytes(body)
+	}
 	if conv != nil {
 		out, cerr := conv.response(body)
 		if cerr != nil {
@@ -440,6 +496,8 @@ func (g *Gateway) responseAttempt(ex Exchange, rec *record, start time.Time, res
 		}
 		body = out
 	}
+	info.CostUSD = rec.costHeader()
+	rec.status = resp.Status
 	wstart := time.Now()
 	ex.Respond(*info, resp.Status, body)
 	rec.wroteClient(wstart)
@@ -497,7 +555,9 @@ func (g *Gateway) streamAttempt(ctx context.Context, ex Exchange, rec *record, i
 	info.UpstreamRequestID = s.UpstreamRequestID()
 
 	kind, serr := pump(ex, rec, s, *info, wantUsage, &wait, conv)
-	rec.usage = s.Usage()
+	// A stream that did not complete may have reported only part of its
+	// usage, such as Anthropic's message_start (see record.account).
+	rec.usage, rec.usagePartial = s.Usage(), kind != ""
 	rec.upstreamWait += wait
 	return attempt{kind: kind, err: serr, committed: true, ttft: s.TTFT(), usage: rec.usage}
 }
@@ -553,6 +613,7 @@ func (g *Gateway) openWithKeepalive(ctx context.Context, ex Exchange, rec *recor
 		if !rec.committed {
 			err = ex.StartStream(*info)
 			rec.committed = true
+			rec.status = http.StatusOK
 		}
 		if err == nil {
 			err = ex.Comment("keep-alive")

@@ -890,3 +890,17 @@ func TestFinishReason(t *testing.T) {
 		}
 	}
 }
+
+func TestUsageOverride(t *testing.T) {
+	s := newServer(t, fakeupstream.Options{})
+	s.Script(fakeupstream.Behavior{Usage: &fakeupstream.Usage{PromptTokens: 100, CompletionTokens: 7, CachedTokens: 40, CacheWriteTokens: 30}})
+	want := `"usage":{"prompt_tokens":100,"completion_tokens":7,"total_tokens":107,"prompt_tokens_details":{"cached_tokens":40,"audio_tokens":0,"cache_write_tokens":30}`
+	r := post(t, s, requestBody("m", false, ""))
+	if !strings.Contains(string(r.body), want) {
+		t.Errorf("non-stream: %s", r.body)
+	}
+	r = post(t, s, `{"model":"m","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`)
+	if !strings.Contains(string(r.body), want) {
+		t.Errorf("stream: %s", r.body)
+	}
+}

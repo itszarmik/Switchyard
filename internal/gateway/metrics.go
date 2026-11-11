@@ -36,6 +36,16 @@ type metrics struct {
 	saturated          *prometheus.CounterVec
 	budgetExhausted    *prometheus.CounterVec
 	registeredCounters []prometheus.Collector
+
+	// Cost accounting and budgets (DESIGN §12, §15.2).
+	cost                *prometheus.CounterVec
+	tokens              *prometheus.CounterVec
+	savings             *prometheus.GaugeVec
+	savingsRouting      prometheus.Gauge
+	budgetRejections    prometheus.Counter
+	budgetFallbackSkips prometheus.Counter
+	budgetStoreErrors   prometheus.Counter
+	budgetNotices       *prometheus.CounterVec
 }
 
 var _ health.Observer = (*metrics)(nil)
@@ -97,9 +107,39 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 		Name: "switchyard_retry_budget_exhausted_total",
 		Help: "Retries refused because the deployment's retry budget was spent, by deployment.",
 	}, []string{"deployment"})
+	m.cost = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_cost_usd_total",
+		Help: "Upstream cost in USD of the requests with a known cost, by provider and catalog model. A float approximation of the usage ledger's exact sums.",
+	}, []string{"provider", "model"})
+	m.tokens = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_tokens_total",
+		Help: "Billed tokens, by provider, catalog model and class (input, cached_input, cache_write, output). Input is uncached input; output includes reasoning tokens.",
+	}, []string{"provider", "model", "class"})
+	m.savings = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "switchyard_savings_usd_total",
+		Help: "Cumulative savings in USD against the baseline, by source (routing). Routing savings are negative when a fallback costs more than the baseline, so this running total can decrease.",
+	}, []string{"source"})
+	m.savingsRouting = m.savings.WithLabelValues("routing")
+	m.budgetRejections = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "switchyard_budget_rejections_total",
+		Help: "Requests answered 429 budget_exceeded because a blocking budget had no room for their estimated cost.",
+	})
+	m.budgetFallbackSkips = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "switchyard_budget_fallback_skips_total",
+		Help: "Pricier fallback deployments passed over because a blocking budget had no room for the difference in their estimated cost.",
+	})
+	m.budgetStoreErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "switchyard_budget_store_errors_total",
+		Help: "Budget store calls that failed, or were skipped while the store was marked unavailable after a failure; budgets.fail_mode decides what the request gets.",
+	})
+	m.budgetNotices = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_budget_notifications_total",
+		Help: "Budget notifications, by budget scope and kind: soft_threshold when a window first reaches soft_at, exceeded for each request admitted over a notify budget's limit.",
+	}, []string{"scope", "kind"})
 	collectors := []prometheus.Collector{
 		m.requests, m.requestDuration, m.overhead, m.upstreamRequests, m.upstreamTTFT, m.upstreamDuration,
 		m.retries, m.fallbacks, m.transitions, m.cooldowns, m.saturated, m.budgetExhausted,
+		m.cost, m.tokens, m.savings, m.budgetRejections, m.budgetFallbackSkips, m.budgetStoreErrors, m.budgetNotices,
 	}
 	if err := registerAll(reg, collectors); err != nil {
 		return nil, err
@@ -122,10 +162,11 @@ func registerAll(reg prometheus.Registerer, collectors []prometheus.Collector) e
 	return nil
 }
 
-// registerHealth registers the gauges read from the health tracker. If it
-// fails, the other metrics are removed again.
-func (m *metrics) registerHealth(reg prometheus.Registerer, t *health.Tracker) error {
-	if err := registerAll(reg, []prometheus.Collector{healthCollector{t: t}}); err != nil {
+// registerHealth registers the gauges read at scrape time: from the health
+// tracker, and the budgets' utilization from g. If it fails, the other
+// metrics are removed again.
+func (m *metrics) registerHealth(reg prometheus.Registerer, t *health.Tracker, g *Gateway) error {
+	if err := registerAll(reg, []prometheus.Collector{healthCollector{t: t}, budgetCollector{g: g}}); err != nil {
 		for _, c := range m.registeredCounters {
 			reg.Unregister(c)
 		}

@@ -22,8 +22,10 @@ logging:
   level: info
   format: json
 
-# Memory mode keeps all state in the process and loses it on restart.
-# Use it for the quickstart and development only.
+# Memory mode keeps all state in the process and loses it on restart: the
+# budget counters, and the usage ledger behind GET /switchyard/v1/usage
+# (the latest 100,000 requests). Use it for the quickstart and development
+# only.
 storage:
   mode: memory
   ledger:

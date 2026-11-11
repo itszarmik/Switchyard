@@ -59,6 +59,30 @@ cover: ## Write coverage.out and print a per-function summary.
 bench-overhead: ## Measure the gateway's added latency (pass flags with BENCH_FLAGS="-mode stream").
 	$(GO) run ./test/load $(BENCH_FLAGS)
 
+# Integration tests (build tag `integration`) run against the Postgres and
+# redis-state services of deploy/compose.yaml, started in a compose project
+# of their own so that `down -v` never deletes the dev volumes. They use the
+# same host ports as `make dev-up`, so stop the dev dependencies first. The
+# credentials are the throwaway dev ones from the compose file. The
+# packages run one at a time (-p 1), because the Postgres outage test in
+# test/integration stops and restarts the test project's Postgres through
+# SWITCHYARD_TEST_COMPOSE.
+TEST_COMPOSE_PROJECT ?= switchyard-test
+INTEGRATION_PKGS     ?= ./internal/usage/... ./internal/budget/... ./test/integration/...
+INTEGRATION_FLAGS    ?= -race -count=1 -p 1 -timeout 20m
+TEST_POSTGRES_DSN    := postgres://switchyard:switchyard@127.0.0.1:5433/switchyard?sslmode=disable
+TEST_REDIS_URL       := redis://127.0.0.1:6380/0
+
+.PHONY: test-integration
+test-integration: ## Run the integration tests against Postgres and Redis from deploy/compose.yaml, then tear them down.
+	@compose="$(COMPOSE) -p $(TEST_COMPOSE_PROJECT) -f $(COMPOSE_FILE)"; \
+	trap '$$compose down -v' EXIT; \
+	$$compose up -d --wait postgres redis-state || exit 1; \
+	echo "$(GO) test -tags integration $(INTEGRATION_FLAGS) $(INTEGRATION_PKGS)"; \
+	SWITCHYARD_TEST_POSTGRES_DSN='$(TEST_POSTGRES_DSN)' SWITCHYARD_TEST_REDIS_URL='$(TEST_REDIS_URL)' \
+	SWITCHYARD_TEST_COMPOSE="$(COMPOSE) -p $(TEST_COMPOSE_PROJECT) -f $(CURDIR)/$(COMPOSE_FILE)" \
+		$(GO) test -tags integration $(INTEGRATION_FLAGS) $(INTEGRATION_PKGS)
+
 smoke: ## Run the live smoke test against a real provider (needs OPENAI_API_KEY; SMOKE_MODEL optional).
 	$(GO) test -tags smoke -count=1 -v ./test/smoke/...
 

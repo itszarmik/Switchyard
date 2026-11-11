@@ -174,9 +174,10 @@ func (u *anthropicUsage) merge(u2 anthropicUsage) {
 
 // normalize maps Anthropic usage onto OpenAI's (DESIGN §6.2, §12.1):
 // prompt_tokens is input + cache read + cache creation, because Anthropic's
-// input_tokens excludes cached tokens; cached_tokens is the cache read;
-// completion_tokens is the output, and reasoning_tokens the thinking
-// tokens when reported.
+// input_tokens excludes cached tokens; cached_tokens is the cache read and
+// cache_write_tokens the cache creation, so that the uncached input is
+// prompt_tokens minus both; completion_tokens is the output, and
+// reasoning_tokens the thinking tokens when reported.
 func (u anthropicUsage) normalize() *schema.Usage {
 	val := func(p *int64) int64 {
 		if p == nil {
@@ -188,7 +189,7 @@ func (u anthropicUsage) normalize() *schema.Usage {
 	out := &schema.Usage{
 		PromptTokens:        val(u.InputTokens) + read + val(u.CacheCreationInputTokens),
 		CompletionTokens:    val(u.OutputTokens),
-		PromptTokensDetails: &schema.PromptTokensDetails{CachedTokens: read},
+		PromptTokensDetails: &schema.PromptTokensDetails{CachedTokens: read, CacheWriteTokens: val(u.CacheCreationInputTokens)},
 	}
 	out.TotalTokens = out.PromptTokens + out.CompletionTokens
 	if d := u.OutputTokensDetails; d != nil && d.ThinkingTokens != nil {

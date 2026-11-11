@@ -125,7 +125,7 @@ func TestStreamGolden(t *testing.T) {
 		{
 			fixture: "stream_cache_usage.sse",
 			id:      "chatcmpl-msg_01CacheStream", model: "claude-opus-5-5",
-			usage:   `{"prompt_tokens":6197,"completion_tokens":503,"total_tokens":6700,"prompt_tokens_details":{"cached_tokens":2051}}`,
+			usage:   `{"prompt_tokens":6197,"completion_tokens":503,"total_tokens":6700,"prompt_tokens_details":{"cached_tokens":2051,"cache_write_tokens":2051}}`,
 			deltas:  []string{roleDelta, `{"content":"Hi!"}`, "finish:length"},
 			content: "Hi!", finish: "length",
 		},

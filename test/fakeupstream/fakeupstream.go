@@ -85,6 +85,16 @@ type Behavior struct {
 	// stream chunk, to model fields a client or gateway does not know. Each
 	// value must be valid JSON.
 	ExtraFields map[string]json.RawMessage
+	// Usage, when set, replaces the token counts of the canned answer, in
+	// the completion and in the stream's usage chunk.
+	Usage *Usage
+}
+
+// Usage is the token counts the fake reports, as OpenAI does: PromptTokens
+// includes CachedTokens and CacheWriteTokens.
+type Usage struct {
+	PromptTokens, CompletionTokens int
+	CachedTokens, CacheWriteTokens int
 }
 
 // Options configure a Server.
@@ -463,6 +473,11 @@ func (s *Server) chat(ctx context.Context, out *responder, body []byte) {
 		for i := range p.choices {
 			p.choices[i].finish = b.FinishReason
 		}
+	}
+	if u := b.Usage; u != nil {
+		p.usage = usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, TotalTokens: u.PromptTokens + u.CompletionTokens}
+		p.usage.PromptTokensDetails.CachedTokens = u.CachedTokens
+		p.usage.PromptTokensDetails.CacheWriteTokens = u.CacheWriteTokens
 	}
 	if req.stream {
 		s.stream(ctx, out, b, p)

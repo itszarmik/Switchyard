@@ -78,13 +78,35 @@ func estimateIn(n, images, inline int, m *catalog.Model) int64 {
 // same, and sums and products of estimates cannot overflow.
 const maxEstOut = math.MaxInt32
 
-// estimateOut is the output-token estimate: the request's cap if it sets
-// one, at most maxEstOut, else defaultEstOut.
-func estimateOut(maxTokens int64, ok bool) int64 {
+// estimateOut is the output-token estimate of a request that generates
+// outputs completions: per completion, the request's cap if it sets one,
+// else defaultEstOut; in all, at most maxEstOut. outputs below 1 count as
+// 1.
+func estimateOut(maxTokens int64, ok bool, outputs int64) int64 {
+	per := int64(defaultEstOut)
 	if ok && maxTokens > 0 {
-		return min(maxTokens, maxEstOut)
+		per = min(maxTokens, maxEstOut)
 	}
-	return defaultEstOut
+	outputs = max(outputs, 1)
+	if per > maxEstOut/outputs {
+		return maxEstOut
+	}
+	return per * outputs
+}
+
+// chatOutputs is the number of completions a chat request generates: n,
+// at least 1.
+func chatOutputs(req *schema.ChatRequest) int64 {
+	n, _ := req.N()
+	return int64(max(n, 1))
+}
+
+// completionOutputs is the number of completions a legacy completion
+// request generates: max(n, best_of, 1) for each of its prompts.
+func completionOutputs(req *schema.CompletionRequest) int64 {
+	n, _ := req.N()
+	bestOf, _ := req.BestOf()
+	return int64(max(n, bestOf, 1)) * int64(max(len(req.Prompts()), 1))
 }
 
 // filter returns why the gateway itself cannot use deployment d for a

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +40,11 @@ type step struct {
 	chunks []string
 	// end is what the stream returns after its chunks; nil means io.EOF.
 	end error
+	// unsent fails the call before the request reaches the upstream, as a
+	// dial failure does. Every other call is marked sent, through the
+	// context's HTTP client trace, as the adapters' transport does once
+	// the request is written.
+	unsent bool
 }
 
 // scripted is a concurrency-safe adapter of every interface (chat,
@@ -80,6 +86,9 @@ func (a *scripted) begin(ctx context.Context, kind string) (step, error) {
 	a.inFlight++
 	a.peak = max(a.peak, a.inFlight)
 	a.mu.Unlock()
+	if tr := httptrace.ContextClientTrace(ctx); tr != nil && tr.WroteRequest != nil && !s.unsent {
+		tr.WroteRequest(httptrace.WroteRequestInfo{})
+	}
 	defer func() {
 		a.mu.Lock()
 		a.inFlight--
@@ -224,6 +233,12 @@ func newExecEnv(t *testing.T, routing config.Routing, edit func(*config.Config))
 // newExecEnvClock is newExecEnv with the health tracker's clock.
 func newExecEnvClock(t *testing.T, routing config.Routing, edit func(*config.Config), now func() time.Time) *execEnv {
 	t.Helper()
+	return newExecEnvOpts(t, routing, edit, func(o *Options) { o.Clock = now })
+}
+
+// newExecEnvOpts is newExecEnv with the gateway options edited by opts.
+func newExecEnvOpts(t *testing.T, routing config.Routing, edit func(*config.Config), opts func(*Options)) *execEnv {
+	t.Helper()
 	cfg := &config.Config{
 		Providers: []config.Provider{
 			{ID: "a", Type: "openai", BaseURL: "http://127.0.0.1:1/v1"},
@@ -248,7 +263,11 @@ func newExecEnvClock(t *testing.T, routing config.Routing, edit func(*config.Con
 	}
 	logs := &logBuffer{}
 	reg := prometheus.NewRegistry()
-	g, err := New(Options{Config: cfg, Logger: slog.New(slog.NewJSONHandler(logs, nil)), Registry: reg, Clock: now})
+	o := Options{Config: cfg, Logger: slog.New(slog.NewJSONHandler(logs, nil)), Registry: reg}
+	if opts != nil {
+		opts(&o)
+	}
+	g, err := New(o)
 	if err != nil {
 		t.Fatal(err)
 	}

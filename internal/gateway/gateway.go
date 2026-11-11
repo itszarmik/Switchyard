@@ -2,10 +2,12 @@
 // only package that knows the order of the steps: decode and validate the
 // request, resolve the model through the catalog and plan the deployments
 // that can honor the request (the cheapest first, skipping those that are
-// unhealthy), then execute the plan: call each deployment's adapter, with
-// the parameters it may drop removed, retrying and falling back as the
-// error taxonomy allows, within the request's deadline. Then respond,
-// record metrics and annotate the request's access-log line with the
+// unhealthy), admit the request's estimated cost against its tenant's and
+// key's budgets, then execute the plan: call each deployment's adapter,
+// with the parameters it may drop removed, retrying and falling back as
+// the error taxonomy allows, within the request's deadline. Then respond,
+// settle the budgets at the actual cost, record the request's usage event
+// and its metrics, and annotate the request's access-log line with the
 // completion fields.
 //
 // The pipeline is transport-neutral: it talks to the HTTP layer
@@ -16,6 +18,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,12 +28,14 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"switchyard/internal/budget"
 	"switchyard/internal/catalog"
 	"switchyard/internal/config"
 	"switchyard/internal/health"
 	"switchyard/internal/providers"
 	"switchyard/internal/providers/anthropic"
 	"switchyard/internal/providers/openai"
+	"switchyard/internal/usage"
 )
 
 // Endpoint labels, used in metrics and logs.
@@ -56,8 +61,21 @@ type Options struct {
 	// Registry receives the API and upstream metrics.
 	Registry *prometheus.Registry
 	// Clock is the health tracker's clock, for breakers, cooldowns and
-	// retry budgets; nil means time.Now.
+	// retry budgets, and the budgets' clock, which picks their windows;
+	// nil means time.Now.
 	Clock func() time.Time
+	// Ledger receives one usage event per request (DESIGN §12.2). Nil
+	// records none.
+	Ledger usage.Sink
+	// Budgets holds the spend counters of the tenants' budgets (DESIGN
+	// §12.3). Nil means a new in-memory store.
+	Budgets budget.Store
+	// BudgetStoreCheck, when set, reports whether the budget store
+	// answers, for GET /admin/v1/providers. Set it for a shared store,
+	// such as Redis, that can be down.
+	BudgetStoreCheck func(ctx context.Context) error
+	// ConfigVersion identifies the config snapshot in usage events.
+	ConfigVersion string
 }
 
 // Gateway serves the OpenAI-compatible endpoints. It is safe for concurrent
@@ -80,6 +98,21 @@ type Gateway struct {
 	provs  map[string]*health.Provider
 	// jitter returns a random duration in [0, d], for the backoff.
 	jitter func(d time.Duration) time.Duration
+
+	// ledger receives the usage events, if set.
+	ledger usage.Sink
+	// budgets holds the budget counters; scopes maps each tenant and key
+	// to the budgets that apply to its requests, and allScopes lists every
+	// budget scope once, for the utilization gauge. failClosed is
+	// budgets.fail_mode closed.
+	budgets       budget.Store
+	scopes        map[principal][]budget.Scope
+	allScopes     []budget.Scope
+	failClosed    bool
+	failMode      string
+	budgetCheck   func(ctx context.Context) error
+	now           func() time.Time
+	configVersion string
 }
 
 // Model is one entry of the model list.
@@ -138,6 +171,23 @@ func New(opts Options) (*Gateway, error) {
 
 	g.routing = withRoutingDefaults(cfg.Routing)
 	g.jitter = fullJitter
+	g.ledger = opts.Ledger
+	g.budgets = opts.Budgets
+	if g.budgets == nil {
+		g.budgets = budget.NewMemoryStore()
+	}
+	g.failClosed = cfg.Budgets.FailMode == config.BudgetFailClosed
+	g.failMode = config.BudgetFailOpen
+	if g.failClosed {
+		g.failMode = config.BudgetFailClosed
+	}
+	g.budgetCheck = opts.BudgetStoreCheck
+	g.now = opts.Clock
+	if g.now == nil {
+		g.now = time.Now
+	}
+	g.configVersion = opts.ConfigVersion
+	g.scopes, g.allScopes = budgetScopes(cfg.Tenants)
 	met, err := newMetrics(opts.Registry)
 	if err != nil {
 		return nil, err
@@ -155,7 +205,7 @@ func New(opts Options) (*Gateway, error) {
 				health.LatencyHint{TTFT: d.LatencyHint.TTFT, TokensPerSec: d.LatencyHint.TokensPerSec})
 		}
 	}
-	if err := met.registerHealth(opts.Registry, g.health); err != nil {
+	if err := met.registerHealth(opts.Registry, g.health, g); err != nil {
 		return nil, err
 	}
 	return g, nil
@@ -251,6 +301,9 @@ type Info struct {
 	// failure that caused the first fallback. Empty when no deployment
 	// was chosen.
 	RouteReason string
+	// CostUSD is the request's exact cost in USD as a decimal, set on a
+	// successful non-streaming response whose usage and prices are known.
+	CostUSD string
 }
 
 // Error is a failed request, ready to be sent in the OpenAI error

@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
+	"switchyard/internal/budget"
 	"switchyard/internal/catalog"
 	"switchyard/internal/health"
 	"switchyard/internal/providers"
@@ -42,9 +44,17 @@ type record struct {
 	// served is set once the upstream accepted the request: a 2xx answer,
 	// or a stream whose first event arrived. Tokens were spent from then
 	// on, so a missing usage is unknown, not zero.
-	served            bool
-	ttft              time.Duration
-	usage             *schema.Usage
+	served bool
+	// sentTo is the deployment of the last attempt that reached the
+	// upstream and may have been billed without serving the request (see
+	// runAttempt), or nil. A request no upstream served is charged its
+	// estimate if it is set, and nothing otherwise.
+	sentTo *catalog.Deployment
+	ttft   time.Duration
+	usage  *schema.Usage
+	// usagePartial is set when usage is what a stream reported before it
+	// broke off, which may not count all its output.
+	usagePartial      bool
 	upstreamRequestID string
 
 	// attempts counts the upstream attempts; chain lists the first
@@ -66,6 +76,27 @@ type record struct {
 	// keepaliveDue is when the next keep-alive is due, once keep-alives
 	// have started.
 	keepaliveDue time.Time
+
+	// tenant and keyID identify the caller; authenticated is set when the
+	// auth middleware did. tags are its attribution tags.
+	tenant, keyID string
+	authenticated bool
+	tags          map[string]string
+	// status is the HTTP status the client was sent, once it was.
+	status int
+	// model is the resolved catalog model, the baseline of the savings.
+	model *catalog.Model
+	// estIn and estOut are the request's input and output token
+	// estimates for budget admission; output is max_tokens when set.
+	estIn, estOut int64
+	// adm is the request's budget admission, when admitted is set.
+	adm      budget.Admission
+	admitted bool
+	// outBytes counts the output text relayed from a stream, for the
+	// estimate when the upstream reports no usage.
+	outBytes int64
+	// acct is what the request used and cost, once computed (see account).
+	acct *accounting
 }
 
 // startAttempt makes the admitted attempt adm on d the attempt in
@@ -121,7 +152,9 @@ func (r *record) addChain(deployment, outcome string) {
 }
 
 func (g *Gateway) newRecord(ctx context.Context, endpoint string) *record {
-	return &record{g: g, ctx: ctx, start: time.Now(), endpoint: endpoint}
+	r := &record{g: g, ctx: ctx, start: time.Now(), endpoint: endpoint}
+	r.identify()
+	return r
 }
 
 // respondError sends e and records it.
@@ -132,6 +165,7 @@ func (r *record) respondError(ex Exchange, info Info, e *Error) {
 			r.errorCode = codeUpstreamError
 		}
 	}
+	r.status = e.Status
 	start := time.Now()
 	ex.RespondError(info, e)
 	r.wroteClient(start)
@@ -155,6 +189,21 @@ func (r *record) upstreamFailed(err error) {
 	}
 }
 
+// done is deferred by each endpoint's handler: it finishes the record (see
+// finish) and, when the handler is panicking, first records the 500 that
+// the server's recovery answers, then lets the panic go on. A deliberate
+// abort (http.ErrAbortHandler) keeps the status already sent.
+func (r *record) done() {
+	if v := recover(); v != nil {
+		if err, ok := v.(error); !ok || !errors.Is(err, http.ErrAbortHandler) {
+			r.status = http.StatusInternalServerError
+		}
+		r.finish()
+		panic(v)
+	}
+	r.finish()
+}
+
 // finish records the overhead metric and annotates the access-log line
 // with the completion fields. The status is the access line's own.
 // Overhead is the request's time minus the time spent waiting on the
@@ -175,8 +224,14 @@ func (r *record) upstreamFailed(err error) {
 // before or by the upstream), and omitted when the upstream served it but
 // reported no usage, for example a stream from a deployment without
 // stream_usage: the count is then unknown, not zero.
+//
+// Before that it settles the request's budget admission and records its
+// usage event and cost metrics (see settle and recordUsage); cost_usd is
+// logged when the cost is known and the upstream accepted the request.
 func (r *record) finish() {
+	r.settle()
 	latency := time.Since(r.start)
+	r.recordUsage(latency)
 	overhead := max(latency-r.upstreamWait-r.clientWait-r.backoff, 0)
 	r.g.metrics.overhead.WithLabelValues(r.endpoint).Observe(overhead.Seconds())
 
@@ -222,6 +277,9 @@ func (r *record) finish() {
 			slog.Int64("completion_tokens", r.usage.CompletionTokens))
 	case !r.served:
 		attrs = append(attrs, slog.Int64("prompt_tokens", 0), slog.Int64("completion_tokens", 0))
+	}
+	if a := r.account(); r.served && a.costKnown {
+		attrs = append(attrs, slog.String("cost_usd", a.cost.String()))
 	}
 	attrs = append(attrs,
 		slog.String("upstream_request_id", r.upstreamRequestID),
