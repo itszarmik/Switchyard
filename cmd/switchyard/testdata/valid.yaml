@@ -1,0 +1,29 @@
+# A valid config with one warning: the admin listener binds every interface.
+version: 1
+
+server:
+  listen: "127.0.0.1:8080"
+  admin_listen: ":9090"
+
+logging:
+  level: info
+
+providers:
+  - id: openai
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY:-}
+  - id: local
+    type: openai
+    base_url: http://localhost:8000/v1
+
+models:
+  - id: gpt-5-mini
+    deployments:
+      - provider: openai
+        upstream_model: gpt-5-mini
+tenants:
+  - id: test
+    keys:
+      - id: test-key
+        hash: sha256:0f7d5a33e1ad68ae7b2a4b139d4c5bf17737e0db942bfbecc5792bb3436d3e59

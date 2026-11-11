@@ -1,0 +1,10 @@
+providers:
+  - id: together
+    type: openai
+    base_url: https://api.together.xyz/v1
+    api_key: ${TOGETHER_API_KEY}
+models:
+  - id: gpt-5
+    deployments:
+      - provider: openai
+        upstream_model: gpt-5

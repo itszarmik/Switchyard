@@ -1,0 +1,18 @@
+# Identical to level-warn.yaml except for logging.level.
+version: 1
+logging:
+  level: info
+providers:
+  - id: openai
+    type: openai
+    base_url: https://api.openai.com/v1
+models:
+  - id: gpt-5-mini
+    deployments:
+      - provider: openai
+        upstream_model: gpt-5-mini
+tenants:
+  - id: test
+    keys:
+      - id: test-key
+        hash: sha256:0f7d5a33e1ad68ae7b2a4b139d4c5bf17737e0db942bfbecc5792bb3436d3e59

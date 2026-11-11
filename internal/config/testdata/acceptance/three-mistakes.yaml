@@ -1,0 +1,19 @@
+# The P0 acceptance case: an unknown key, a deployment that references an
+# unknown provider, and a missing environment variable.
+version: 1
+
+server:
+  listen: ":8080"
+  admin_lisen: "127.0.0.1:9090"
+
+providers:
+  - id: openai
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+
+models:
+  - id: gpt-5
+    deployments:
+      - provider: openia
+        upstream_model: gpt-5

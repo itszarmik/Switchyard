@@ -1,0 +1,44 @@
+# Root file for the happy-path test: two included catalog files, defaults
+# for everything not set here.
+version: 1
+
+server:
+  listen: ":8080"
+  max_request_bytes: 8MiB
+
+storage:
+  mode: redis
+  redis:
+    cache_url: ${REDIS_CACHE_URL:-redis://localhost:6379/0}
+    state_url: redis://:${REDIS_STATE_PASSWORD}@localhost:6380/0
+  ledger:
+    driver: postgres
+    dsn: ${file:secrets/dsn}
+
+include:
+  - catalog/*.yaml
+
+providers:
+  - id: openai
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+  - id: gpu-cluster
+    type: openai
+    base_url: http://vllm.internal:8000/v1
+    tags: [self_hosted, zdr]
+    max_concurrency: ${GPU_MAX_CONCURRENCY}
+    timeouts: { connect: 2s, first_token: 20s }
+
+tenants:
+  - id: acme
+    keys:
+      - id: acme-backend
+        hash: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        tags: [prod, eu]
+      - id: acme-ci
+        hash: sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+  - id: beta
+    keys:
+      - id: beta-1
+        hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

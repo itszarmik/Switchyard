@@ -1,0 +1,102 @@
+# golangci-lint configuration (v2 format), pinned to golangci-lint v2.14.0.
+#
+#   make lint        run the linters
+#   make fmt         rewrite files with the configured formatters
+#   make fmt-check   fail if formatting would change anything
+#
+# The aim is a focused set that catches real bugs without noise. Before
+# adding a linter, check that it would have caught something worth fixing.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - bodyclose     # HTTP response bodies that are never closed
+    - errorlint     # error comparisons and type assertions that break on wrapped errors
+    - gocritic      # diagnostic checks only, see settings
+    - gosec         # security problems, minus the noisy checks excluded below
+    - misspell      # misspelled English words in comments and strings
+    - nilerr        # returning nil after checking err != nil
+    - noctx         # HTTP requests and net calls made without a context
+    - revive        # doc comments on exported identifiers and similar
+    - unconvert     # conversions to the type a value already has
+    - usestdlibvars # literals where net/http and time constants exist
+
+  settings:
+    gocritic:
+      # Diagnostic checks find likely bugs; the other tags are mostly taste.
+      # Experimental checks are skipped until they stabilize.
+      enabled-tags:
+        - diagnostic
+      disabled-tags:
+        - experimental
+        - opinionated
+        - performance
+        - style
+
+    gosec:
+      excludes:
+        # G104 (unhandled errors) duplicates errcheck, which is configurable
+        # and already reports the same calls.
+        - G104
+        # G304 (file path from a variable) flags every os.ReadFile of a path.
+        # Switchyard reads files only at paths the operator supplies (the
+        # config path, include globs and file references), so it is noise.
+        - G304
+
+    misspell:
+      locale: US
+
+    revive:
+      # Only the rules listed here run.
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+        - name: package-comments
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: var-declaration
+        - name: var-naming
+
+  exclusions:
+    generated: lax
+    # The "comments" preset is deliberately not used: it would hide missing
+    # doc comments on exported identifiers, which revive enforces.
+    presets:
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # Tests build requests with fixed URLs and fake credentials, and call
+      # httptest servers without a context.
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+
+issues:
+  # Report every issue rather than a sample.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - switchyard
+  exclusions:
+    generated: lax

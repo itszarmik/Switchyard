@@ -1,0 +1,162 @@
+# Switchyard reference configuration.
+#
+# Every key Phase 1 understands, with its default. The layout mirrors
+# docs/DESIGN.md §16.3. Later phases add sections (policies, routing,
+# cache); until then, any other key is rejected at load time.
+# CI validates this file with `switchyard config validate`.
+#
+# Values may reference the environment or files:
+#   ${VAR}              required environment variable; an error if unset
+#   ${VAR:-default}     environment variable, or the default when unset
+#   ${file:/path}       contents of a file, e.g. a Docker or Kubernetes secret
+# Never write secrets literally into a config file.
+#
+# Precedence, lowest to highest: built-in defaults, this file and its
+# includes, the SWITCHYARD_LISTEN, SWITCHYARD_ADMIN_LISTEN and
+# SWITCHYARD_LOG_LEVEL environment variables, then CLI flags.
+#
+# Validating this file needs DATABASE_URL and the four provider API keys set.
+
+# Schema version. Required; only 1 is defined.
+version: 1
+
+# Glob patterns of additional files, relative to this file's directory.
+# Included files may define only list sections (providers, models); their
+# entries are appended in sorted file-name order, and a duplicate ID is an
+# error. The model catalog lives in configs/catalog/.
+include:
+  - catalog/*.yaml
+
+server:
+  # Public API address (host:port). Default ":8080".
+  listen: ":8080"
+  # Address for /metrics and /admin/v1/*. Default "127.0.0.1:9090".
+  # Keep it private: it must never be reachable from the internet.
+  admin_listen: "127.0.0.1:9090"
+  # Largest accepted request body; larger bodies get 413. Default 10MiB.
+  # Sizes are an integer number of bytes, or a number with a unit:
+  # B, KB, MB, GB (powers of 1000) or KiB, MiB, GiB (powers of 1024).
+  max_request_bytes: 10MiB
+  # Largest accepted request headers; larger headers get 431. Default 64KiB.
+  # net/http allows up to 4 KiB beyond this before it rejects them.
+  max_header_bytes: 64KiB
+  # How long a client may take to send its request headers. Default 10s.
+  # Durations are Go duration strings, such as 500ms, 60s or 2m30s.
+  read_header_timeout: 10s
+  # How long a client may take to send a request body; a slower one gets
+  # 408. Default 60s.
+  body_read_timeout: 60s
+  # Idle keep-alive connections are closed after this long. Default 120s.
+  idle_timeout: 120s
+  # After SIGTERM, keep serving this long while /readyz already fails, so
+  # load balancers stop routing here first. Default 0s; set it to a few
+  # seconds behind a load balancer.
+  shutdown_delay: 5s
+  # How long in-flight requests may take to finish once the listeners have
+  # closed. Default 60s.
+  shutdown_grace: 60s
+
+logging:
+  # debug | info | warn | error. Default info.
+  level: info
+  # json | text. Default json.
+  format: json
+
+# State backends. Validated, but nothing connects to them until a later phase.
+storage:
+  # memory (quickstart and dev only; state is lost on restart) | redis.
+  # Default memory.
+  mode: redis
+  # Two Redis roles (DESIGN §11.5). Both are required in redis mode. The
+  # URLs are secrets because they may embed passwords. `make dev-up` starts
+  # matching instances on ports 6379 and 6380.
+  redis:
+    # Evictable cache instance (maxmemory-policy allkeys-lru).
+    cache_url: ${REDIS_CACHE_URL:-redis://localhost:6379/0}
+    # Non-evictable state instance for budgets and limits
+    # (maxmemory-policy noeviction).
+    state_url: ${REDIS_STATE_URL:-redis://localhost:6380/0}
+  ledger:
+    # memory | postgres. Default memory.
+    driver: postgres
+    # Postgres connection string, a secret. Required when driver is postgres.
+    dsn: ${DATABASE_URL}
+
+# Upstream endpoints and their credentials. Keys per provider:
+#   id               names the provider in deployment IDs (model@provider)
+#   type             wire protocol: openai (OpenAI and every OpenAI-compatible
+#                    upstream) | anthropic
+#   base_url         absolute http(s) API root; must not embed credentials
+#   api_key          upstream credential, a secret; optional for self-hosted
+#   tags             matched by policies, e.g. self_hosted, zdr, region_eu
+#   max_concurrency  in-flight requests per replica; 0 (default) is unlimited
+#   forward_headers  client headers that may be forwarded upstream; none by
+#                    default, and Authorization and Cookie never are
+#   timeouts         connect (default 5s), first_token (default 30s), idle,
+#                    the gap between streamed chunks (default 60s), and
+#                    total, the whole upstream call (default 10m)
+providers:
+  - id: openai
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+
+  - id: anthropic
+    type: anthropic
+    base_url: https://api.anthropic.com
+    api_key: ${ANTHROPIC_API_KEY}
+    # Client headers are not forwarded unless listed.
+    forward_headers: [anthropic-beta]
+
+  # Gemini through Google's OpenAI-compatible endpoint.
+  - id: google
+    type: openai
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key: ${GEMINI_API_KEY}
+
+  - id: together
+    type: openai
+    base_url: https://api.together.xyz/v1
+    api_key: ${TOGETHER_API_KEY}
+
+  # Self-hosted vLLM: no API key, tagged so policies can require it.
+  - id: gpu-cluster
+    type: openai
+    base_url: http://vllm.internal:8000/v1
+    tags: [self_hosted, zdr]
+    # Per replica; when saturated, traffic spills over to other deployments.
+    max_concurrency: 64
+    timeouts:
+      connect: 2s
+      first_token: 20s
+      idle: 30s
+
+# Models come from the included catalog (configs/catalog/models.yaml).
+# Each model has an id (what clients send in the "model" field) and a list
+# of deployments, each with a provider (a provider id above) and the
+# upstream_model name sent to that provider.
+
+# Tenants own the gateway API keys that clients send as
+# "Authorization: Bearer sy_…". Config stores only each key's SHA-256 hash;
+# `switchyard keys generate` creates a key, prints it once and prints the
+# entry to paste here. With no tenants, every /v1 request gets 401.
+# Keys per tenant:
+#   id     names the tenant in logs and reports; 1 to 63 characters from
+#          a-z, 0-9, _ and -, starting with a letter or digit; unique
+#   keys   the tenant's API keys; a tenant without keys gets a warning
+# Keys per key:
+#   id     names the key in logs and reports (never the key itself); same
+#          rules as the tenant id, and unique across all tenants
+#   hash   "sha256:" and 64 lowercase hex characters; unique across all
+#          tenants. Never put the key itself here.
+#   tags   matched by policies in later phases, e.g. prod, eu
+# To revoke a key, delete its entry and restart.
+# The hashes below belong to keys nobody has: replace them with your own.
+tenants:
+  - id: acme
+    keys:
+      - id: acme-backend
+        hash: sha256:0f7d5a33e1ad68ae7b2a4b139d4c5bf17737e0db942bfbecc5792bb3436d3e59
+        tags: [prod]
+      - id: acme-ci
+        hash: sha256:0eb9387d9e4b212cd42007efc1e129c69f55b64724268d2b9edbdc45fda4a0c2

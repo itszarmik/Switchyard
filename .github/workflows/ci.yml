@@ -1,0 +1,105 @@
+# Continuous integration: build, test, lint, vulnerability scan, module
+# tidiness and the container image. CI never calls a real provider.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # oldstable is the oldest release go.mod supports.
+        go: [oldstable, stable]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test -race ./...
+      - name: Validate sample configs
+        # Placeholder values only: the example config requires these
+        # variables, and validation never connects to anything.
+        env:
+          DATABASE_URL: postgres://ci:ci@localhost:5432/ci?sslmode=disable
+          OPENAI_API_KEY: ci-placeholder
+          ANTHROPIC_API_KEY: ci-placeholder
+          GEMINI_API_KEY: ci-placeholder
+          TOGETHER_API_KEY: ci-placeholder
+        run: |
+          go run ./cmd/switchyard config validate -c configs/quickstart.yaml
+          go run ./cmd/switchyard config validate -c configs/switchyard.example.yaml
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+      # golangci-lint v2 also reports gofmt and goimports differences.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+      - name: govulncheck
+        run: go tool govulncheck ./...
+
+  tidy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+      - name: go mod tidy
+        run: go mod tidy -diff
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The same build and the same size and UID checks as locally.
+      - name: Build image and check size and user
+        run: make docker-check

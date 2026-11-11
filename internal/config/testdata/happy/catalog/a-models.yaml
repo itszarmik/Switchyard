@@ -1,0 +1,8 @@
+version: 1
+models:
+  - id: llama-3.3-70b
+    deployments:
+      - provider: gpu-cluster
+        upstream_model: meta-llama/Llama-3.3-70B-Instruct
+      - provider: together
+        upstream_model: meta-llama/Llama-3.3-70B-Instruct-Turbo

@@ -1,0 +1,16 @@
+# Build output
+bin/
+dist/
+
+# Test and coverage output
+coverage.*
+*.test
+*.out
+
+# Local environment files; they may hold secrets
+.env
+.env.*
+
+# OS and scratch files
+.DS_Store
+/tmp/

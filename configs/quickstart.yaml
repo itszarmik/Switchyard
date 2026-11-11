@@ -1,0 +1,58 @@
+# Switchyard quickstart configuration.
+#
+# One process, in-memory state and one provider. It starts with no
+# environment variables set:
+#
+#   make run
+#   # or: bin/switchyard serve --config configs/quickstart.yaml
+#
+# It starts without OPENAI_API_KEY, but chat completions need it set and
+# need a gateway API key in the tenants section below. For every key and
+# its default, see configs/switchyard.example.yaml.
+version: 1
+
+# Public API on every interface; the admin listener (/metrics, /admin/v1/*)
+# on loopback only, so it is never reachable from the network.
+server:
+  listen: ":8080"
+  admin_listen: "127.0.0.1:9090"
+
+# JSON logs at info level. Secrets are redacted from every log line.
+logging:
+  level: info
+  format: json
+
+# Memory mode keeps all state in the process and loses it on restart.
+# Use it for the quickstart and development only.
+storage:
+  mode: memory
+  ledger:
+    driver: memory
+
+# Upstream providers. The key is read from the OPENAI_API_KEY environment
+# variable and is empty when that is unset.
+providers:
+  - id: openai
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY:-}
+
+# Models clients can request, and the provider that serves each one.
+models:
+  - id: gpt-5-mini
+    deployments:
+      - provider: openai
+        upstream_model: gpt-5-mini
+
+# Gateway API keys. There are none yet, so every /v1 request gets 401 and
+# validation warns about it. Create a key and paste the printed entry here:
+#
+#   bin/switchyard keys generate
+#
+# The key is printed once; config stores only its SHA-256 hash, e.g.:
+#
+# tenants:
+#   - id: default
+#     keys:
+#       - id: key-4be1c0
+#         hash: sha256:<64 hex characters printed by keys generate>

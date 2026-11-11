@@ -1,0 +1,17 @@
+# Keep the build context small. The Dockerfile copies only go.mod, go.sum,
+# cmd/, internal/ and configs/quickstart.yaml.
+.git
+.github
+bin
+dist
+docs
+test
+coverage.*
+*.out
+*.test
+.env
+.env.*
+**/.DS_Store
+.idea
+.vscode
+tmp
