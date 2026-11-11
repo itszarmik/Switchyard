@@ -1,8 +1,8 @@
 # Switchyard reference configuration.
 #
-# Every key Phase 2 understands, with its default. The layout mirrors
+# Every key Phase 3 understands, with its default. The layout mirrors
 # docs/DESIGN.md §16.3. Later phases add sections (policies, cache) and
-# routing settings; until then, any other key is rejected at load time.
+# more routing settings; until then, any other key is rejected at load time.
 # CI validates this file with `switchyard config validate`.
 #
 # Values may reference the environment or files:
@@ -48,6 +48,11 @@ server:
   # How long a client may take to send a request body; a slower one gets
   # 408. Default 60s.
   body_read_timeout: 60s
+  # How long each write to an API client may take: a whole JSON response, or
+  # one streamed event. A client that stops reading longer is disconnected,
+  # which cancels its upstream call. Time spent writing to the client never
+  # counts toward a provider's idle timeout. Default 60s.
+  write_timeout: 60s
   # Idle keep-alive connections are closed after this long. Default 120s.
   idle_timeout: 120s
   # After SIGTERM, keep serving this long while /readyz already fails, so
@@ -91,12 +96,20 @@ storage:
 #   base_url         absolute http(s) API root; must not embed credentials
 #   api_key          upstream credential, a secret; optional for self-hosted
 #   tags             matched by policies, e.g. self_hosted, zdr, region_eu
-#   max_concurrency  in-flight requests per replica; 0 (default) is unlimited
+#   max_concurrency  in-flight requests per replica; 0 (default) is unlimited.
+#                    A saturated provider is skipped, so traffic spills over
+#                    to the next cheapest deployment; with none left the
+#                    answer is 503 no_healthy_upstream
 #   forward_headers  client headers that may be forwarded upstream; none by
 #                    default, and Authorization and Cookie never are
-#   timeouts         connect (default 5s), first_token (default 30s), idle,
-#                    the gap between streamed chunks (default 60s), and
-#                    total, the whole upstream call (default 10m)
+#   timeouts         connect (default 5s); first_token (default 30s), the wait
+#                    for a stream's first event: streams only, since a
+#                    non-streaming response arrives after the whole
+#                    generation; idle, the gap between streamed chunks
+#                    while the gateway waits for the upstream (default
+#                    60s); and total, the whole upstream call (default 10m).
+#                    A non-streaming call over total falls back without a
+#                    retry on the same deployment
 providers:
   - id: openai
     type: openai
@@ -157,6 +170,63 @@ routing:
   # temperature and top_p are always removed for a deployment without the
   # sampling capability, whatever this says.
   drop_unsupported_params: false
+
+  # Whole-request deadline, across every attempt, backoff and the full
+  # streamed response. A client's X-Switchyard-Timeout-Ms header can only
+  # lower it. A request that runs out of time gets 504 timeout. Default 10m.
+  request_timeout: 10m
+
+  # Retries and fallback. A request is tried on a plan of deployments of the
+  # requested model, the cheapest first; each fallback slot prefers a
+  # provider not already in the plan. A pinned model@provider is a plan of
+  # one, and fallback never switches to another model.
+  fallback:
+    # Plan length, primary plus fallbacks: 1 to 10. Default 3.
+    max_deployments: 3
+    # Retries of the same deployment after a transport error, a timeout or
+    # a 5xx (or a 429 whose Retry-After fits the remaining deadline),
+    # before the next deployment is tried: 0 to 5. Default 1.
+    retries_per_deployment: 1
+    # Exponential backoff with full jitter: retry n sleeps a random time in
+    # [0, min(backoff_max, backoff_base × 2^n)], never past the deadline.
+    # Defaults 250ms and 2s.
+    backoff_base: 250ms
+    backoff_max: 2s
+    # Retry budget: retries to one deployment may not exceed this fraction
+    # of its requests over a sliding 10 s window, in (0, 1]; once spent,
+    # the gateway falls back instead of retrying. Default 0.2.
+    retry_budget_ratio: 0.2
+    # Retries per window that are always allowed. Default 5.
+    retry_budget_min: 5
+
+  # Circuit breaker, one per deployment and replica. Only transport errors,
+  # timeouts, 5xx and upstream 401/402/403 count as failures. It opens after
+  # consecutive_failures in a row, or at failure_ratio over at least
+  # min_requests within window; stays open for open_for; then lets
+  # half_open_probes concurrent requests through: one success closes it,
+  # one failure opens it again.
+  breaker:
+    consecutive_failures: 5   # default 5
+    failure_ratio: 0.5        # default 0.5, in (0, 1]
+    min_requests: 20          # default 20
+    window: 30s               # default 30s
+    open_for: 30s             # default 30s
+    half_open_probes: 3       # default 3
+
+  # After a 429 the deployment is skipped for min(Retry-After, max), or for
+  # default when the 429 has no Retry-After.
+  rate_limit_cooldown:
+    default: 1s   # default 1s
+    max: 30s      # default 30s
+
+  # SSE keep-alives for a slow first token. With a positive interval, a
+  # stream that has not received its first upstream event after that long
+  # is committed: 200, the SSE headers and a ": keep-alive" comment, repeated
+  # every interval until the first event. This is a trade-off: after the
+  # first keep-alive no fallback is possible, and a later failure becomes an
+  # error event in the stream. Use it only for intermediaries with short
+  # idle timeouts. 0s (default) is off; otherwise at least 10ms.
+  stream_keepalive: 0s
 
 # Tenants own the gateway API keys that clients send as
 # "Authorization: Bearer sy_…". Config stores only each key's SHA-256 hash;

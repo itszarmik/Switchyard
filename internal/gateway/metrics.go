@@ -5,6 +5,8 @@ import (
 	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"switchyard/internal/health"
 )
 
 // durationBuckets cover sub-millisecond rejections up to streams that run
@@ -26,7 +28,17 @@ type metrics struct {
 	upstreamRequests *prometheus.CounterVec
 	upstreamTTFT     *prometheus.HistogramVec
 	upstreamDuration *prometheus.HistogramVec
+
+	retries            *prometheus.CounterVec
+	fallbacks          *prometheus.CounterVec
+	transitions        *prometheus.CounterVec
+	cooldowns          *prometheus.CounterVec
+	saturated          *prometheus.CounterVec
+	budgetExhausted    *prometheus.CounterVec
+	registeredCounters []prometheus.Collector
 }
+
+var _ health.Observer = (*metrics)(nil)
 
 // newMetrics creates the metrics and registers them on reg. If one fails to
 // register, those already registered are removed again.
@@ -48,7 +60,7 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 		}, []string{"endpoint"}),
 		upstreamRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "switchyard_upstream_requests_total",
-			Help: "Upstream calls, by provider, catalog model and outcome (ok, client_error, rate_limited, auth, server_error, timeout, transport, canceled).",
+			Help: "Upstream attempts, by provider, catalog model and outcome (ok, transport, timeout, server_error, rate_limited, auth, not_found, context_length, content_filter, client_error, canceled).",
 		}, []string{"provider", "model", "outcome"}),
 		upstreamTTFT: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "switchyard_upstream_ttft_seconds",
@@ -61,18 +73,120 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Buckets: durationBuckets,
 		}, []string{"provider", "model"}),
 	}
+	m.retries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_retries_total",
+		Help: "Retries of the same deployment, by deployment and the failure kind that caused them.",
+	}, []string{"deployment", "kind"})
+	m.fallbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_fallbacks_total",
+		Help: "Moves from one deployment of a plan to the next, by the deployment that failed, the next one, and the failure kind.",
+	}, []string{"from", "to", "kind"})
+	m.transitions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_circuit_transitions_total",
+		Help: "Circuit breaker state changes, by deployment and new state (closed, half_open, open).",
+	}, []string{"deployment", "to"})
+	m.cooldowns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_rate_limit_cooldowns_total",
+		Help: "Rate-limit cooldowns started after an upstream 429, by deployment.",
+	}, []string{"deployment"})
+	m.saturated = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_provider_saturated_total",
+		Help: "Requests turned away from a provider at its max_concurrency, by provider.",
+	}, []string{"provider"})
+	m.budgetExhausted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_retry_budget_exhausted_total",
+		Help: "Retries refused because the deployment's retry budget was spent, by deployment.",
+	}, []string{"deployment"})
 	collectors := []prometheus.Collector{
 		m.requests, m.requestDuration, m.overhead, m.upstreamRequests, m.upstreamTTFT, m.upstreamDuration,
+		m.retries, m.fallbacks, m.transitions, m.cooldowns, m.saturated, m.budgetExhausted,
 	}
+	if err := registerAll(reg, collectors); err != nil {
+		return nil, err
+	}
+	m.registeredCounters = collectors
+	return m, nil
+}
+
+// registerAll registers every collector, or none: if one fails, those
+// already registered are removed again.
+func registerAll(reg prometheus.Registerer, collectors []prometheus.Collector) error {
 	for i, c := range collectors {
 		if err := reg.Register(c); err != nil {
 			for _, prev := range collectors[:i] {
 				reg.Unregister(prev)
 			}
-			return nil, fmt.Errorf("gateway: register metrics: %w", err)
+			return fmt.Errorf("gateway: register metrics: %w", err)
 		}
 	}
-	return m, nil
+	return nil
+}
+
+// registerHealth registers the gauges read from the health tracker. If it
+// fails, the other metrics are removed again.
+func (m *metrics) registerHealth(reg prometheus.Registerer, t *health.Tracker) error {
+	if err := registerAll(reg, []prometheus.Collector{healthCollector{t: t}}); err != nil {
+		for _, c := range m.registeredCounters {
+			reg.Unregister(c)
+		}
+		return err
+	}
+	return nil
+}
+
+// Transition implements health.Observer.
+func (m *metrics) Transition(deployment string, to health.State) {
+	m.transitions.WithLabelValues(deployment, to.String()).Inc()
+}
+
+// Cooldown implements health.Observer.
+func (m *metrics) Cooldown(deployment string) { m.cooldowns.WithLabelValues(deployment).Inc() }
+
+// Saturated implements health.Observer.
+func (m *metrics) Saturated(provider string) { m.saturated.WithLabelValues(provider).Inc() }
+
+// BudgetExhausted implements health.Observer.
+func (m *metrics) BudgetExhausted(deployment string) {
+	m.budgetExhausted.WithLabelValues(deployment).Inc()
+}
+
+var (
+	circuitStateDesc = prometheus.NewDesc("switchyard_circuit_state",
+		"Circuit breaker state by deployment: 0 closed, 1 half-open, 2 open.", []string{"deployment"}, nil)
+	inFlightDesc = prometheus.NewDesc("switchyard_provider_in_flight",
+		"Upstream requests in flight, by provider.", []string{"provider"}, nil)
+)
+
+// healthCollector reports the breaker states and in-flight counts as they
+// are at scrape time, so an open breaker whose time is up shows as
+// half-open even without traffic.
+type healthCollector struct{ t *health.Tracker }
+
+// Describe implements prometheus.Collector.
+func (c healthCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- circuitStateDesc
+	ch <- inFlightDesc
+}
+
+// Collect implements prometheus.Collector.
+func (c healthCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, p := range c.t.Snapshot().Providers {
+		ch <- prometheus.MustNewConstMetric(inFlightDesc, prometheus.GaugeValue, float64(p.InFlight), p.ID)
+		for _, d := range p.Deployments {
+			ch <- prometheus.MustNewConstMetric(circuitStateDesc, prometheus.GaugeValue, float64(stateValue(d.Breaker.State)), d.ID)
+		}
+	}
+}
+
+// stateValue maps a snapshot's state name to the gauge value.
+func stateValue(s string) health.State {
+	switch s {
+	case health.StateOpen.String():
+		return health.StateOpen
+	case health.StateHalfOpen.String():
+		return health.StateHalfOpen
+	}
+	return health.StateClosed
 }
 
 // statusClass maps a status code to its class label, such as "2xx".

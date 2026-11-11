@@ -6,27 +6,29 @@ import (
 	"io"
 	"time"
 
-	"switchyard/internal/catalog"
 	"switchyard/internal/providers"
 	"switchyard/internal/schema"
 )
 
 // ChatCompletions serves one POST /v1/chat/completions request:
 //
-//  1. read and validate the body (413, 400);
+//  1. read and validate the body (413, 400) and the deadline header;
 //  2. resolve the model through the catalog (404 for an unknown model,
-//     400 model_not_supported for a virtual or non-chat model) and choose
-//     the cheapest deployment that has every capability the request needs
-//     (400 no_eligible_model, naming each deployment and why it was
-//     excluded);
-//  3. remove the parameters the deployment cannot honor, if they may be
-//     dropped, and call its adapter; a non-streaming answer is returned
-//     byte for byte;
+//     400 model_not_supported for a virtual or non-chat model) and plan
+//     the deployments that have every capability the request needs, the
+//     cheapest first (400 no_eligible_model, naming each deployment and
+//     why it was excluded; 503 no_healthy_upstream when every eligible
+//     one is unhealthy);
+//  3. execute the plan (see execute): for each attempt, remove the
+//     parameters the deployment cannot honor, if they may be dropped, and
+//     call its adapter; a non-streaming answer is returned byte for byte;
 //  4. for a stream, commit (200 and the SSE headers) only once the first
-//     upstream event has arrived, forward each event as it comes, and end
+//     upstream event has arrived, so that a failure before it can still
+//     be retried or fall back; forward each event as it comes, and end
 //     with [DONE]. Unless the client asked for usage, the usage-only chunk
 //     is dropped and usage on any other chunk is set to null. A failure
-//     after the commit is sent as an error event, without [DONE];
+//     after the commit is sent as an error event, without [DONE], and is
+//     never retried;
 //  5. record the metrics, and annotate the request's access-log line with
 //     the completion fields (see reqctx.Annotate).
 //
@@ -49,60 +51,65 @@ func (g *Gateway) ChatCompletions(ctx context.Context, ex Exchange) {
 	rec.requestedModel = req.Model()
 	rec.stream = req.Stream()
 	markStream(ctx, req.Stream())
-
-	info, sel, ok := g.chooseChat(ex, rec, req, len(body))
+	ctx, cancel, ok := g.withDeadline(ctx, ex, rec)
+	defer cancel()
 	if !ok {
 		return
 	}
-	g.serveChat(ctx, ex, rec, sel, req, info, nil)
+
+	if !g.planChat(ex, rec, req, len(body)) {
+		return
+	}
+	g.execute(ctx, ex, rec, g.chatTry(ex, rec, req, nil))
 }
 
-// chooseChat resolves and selects the deployment for a chat request. When
-// it fails it has already answered the client and returns false.
-func (g *Gateway) chooseChat(ex Exchange, rec *record, req *schema.ChatRequest, size int) (Info, catalog.Selection, bool) {
+// planChat resolves the model of a chat request and plans its
+// deployments into rec. When it fails it has already answered the client
+// and returns false.
+func (g *Gateway) planChat(ex Exchange, rec *record, req *schema.ChatRequest, size int) bool {
 	res, e := g.resolve(req.Model(), rec.endpoint, chatType)
 	if e != nil {
 		rec.respondError(ex, Info{}, e)
-		return Info{}, catalog.Selection{}, false
+		return false
 	}
-	info := Info{Model: res.Model.ID, Alias: res.Alias}
+	rec.info = Info{Model: res.Model.ID, Alias: res.Alias}
 	rec.alias = res.Alias
 	maxTokens, hasMax := req.MaxTokens()
 	images, inline := req.ImageParts()
-	sel, e := g.choose(res, req.RequiredCapabilities(), estimateIn(size, images, inline, res.Model), estimateOut(maxTokens, hasMax), nil)
-	rec.excluded = len(sel.Exclusions)
+	e = g.buildPlan(&rec.plan, res, req.RequiredCapabilities(), estimateIn(size, images, inline, res.Model), estimateOut(maxTokens, hasMax), nil)
+	rec.excluded = len(rec.plan.exclusions)
 	if e != nil {
-		rec.respondError(ex, info, e)
-		return info, sel, false
+		rec.respondError(ex, rec.info, e)
+		return false
 	}
-	return info, sel, true
+	return true
 }
 
-// serveChat sends req to the chosen deployment and answers the client.
-// conv, when set, translates the response for the client (the completions
-// shim); it is nil for chat completions, which are forwarded as is.
-func (g *Gateway) serveChat(ctx context.Context, ex Exchange, rec *record, sel catalog.Selection, req *schema.ChatRequest, info Info, conv converter) {
-	d := sel.Deployment
-	rec.deployment = d
-	info.Provider = d.Provider
-	req, info.DroppedParams = req.Without(dropFields(sel.Dropped)...)
-	rec.dropped = info.DroppedParams
-
-	adapter := g.adapters[d.Provider]
-	preq := &providers.Request{
-		Chat: req, UpstreamModel: d.UpstreamModel, Header: ex.Header(),
-		MaxOutputTokens: d.Model.MaxOutputTokens, Capabilities: d.Capabilities,
-		NoStreamUsage: !d.Capabilities.Has(schema.CapStreamUsage),
+// chatTry returns the attempt function of a chat request. conv, when set,
+// translates the response for the client (the completions shim); it is
+// nil for chat completions, which are forwarded as is.
+func (g *Gateway) chatTry(ex Exchange, rec *record, req *schema.ChatRequest, conv converter) tryFunc {
+	return func(ctx context.Context, e *planEntry, info *Info) attempt {
+		d := e.d
+		info.Provider = d.Provider
+		r, dropped := req.Without(dropFields(e.dropped)...)
+		info.DroppedParams = dropped
+		rec.dropped = dropped
+		adapter := g.adapters[d.Provider]
+		preq := &providers.Request{
+			Chat: r, UpstreamModel: d.UpstreamModel, Header: ex.Header(),
+			MaxOutputTokens: d.Model.MaxOutputTokens, Capabilities: d.Capabilities,
+			NoStreamUsage: !d.Capabilities.Has(schema.CapStreamUsage),
+		}
+		if r.Stream() {
+			return g.streamAttempt(ctx, ex, rec, info, r.IncludeUsage(), conv, func(ctx context.Context) (providers.Stream, error) {
+				return adapter.ChatStream(ctx, preq)
+			})
+		}
+		start := time.Now()
+		resp, err := adapter.Chat(ctx, preq)
+		return g.responseAttempt(ex, rec, start, resp, err, info, conv)
 	}
-	if req.Stream() {
-		rec.upstreamStart = time.Now()
-		s, err := adapter.ChatStream(ctx, preq)
-		g.serveStream(ex, rec, s, err, info, req.IncludeUsage(), conv)
-		return
-	}
-	rec.upstreamStart = time.Now()
-	resp, err := adapter.Chat(ctx, preq)
-	g.serveResponse(ex, rec, resp, err, info, conv)
 }
 
 // converter translates a successful upstream response, and each stream
@@ -113,69 +120,20 @@ type converter interface {
 	chunk(c *schema.ChatChunk) ([]byte, bool)
 }
 
-// serveResponse answers with a non-streaming upstream result.
-func (g *Gateway) serveResponse(ex Exchange, rec *record, resp *providers.Response, err error, info Info, conv converter) {
-	rec.upstreamEnd(err)
-	if err != nil {
-		rec.upstreamFailed(err)
-		info.UpstreamRequestID = rec.upstreamRequestID
-		rec.respondError(ex, info, upstreamError(err))
-		return
-	}
-	rec.served = true
-	rec.ttft = resp.TTFT
-	rec.usage = resp.Usage
-	rec.upstreamRequestID = resp.UpstreamRequestID
-	info.UpstreamRequestID = resp.UpstreamRequestID
-	body := resp.Body
-	if conv != nil {
-		out, cerr := conv.response(body)
-		if cerr != nil {
-			rec.errorMessage = "could not translate the upstream response"
-			rec.respondError(ex, info, badUpstreamResponse())
-			return
+// pump commits the stream, unless keep-alives already did, and forwards
+// its events until it ends. It adds the time spent waiting on the
+// upstream to *wait and returns the kind of the stream's end ("" when it
+// completed, canceled when the client went away) and its error, if any.
+func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage bool, wait *time.Duration, conv converter) (providers.Kind, error) {
+	if !rec.committed {
+		start := time.Now()
+		err := ex.StartStream(info)
+		rec.committed = true
+		rec.wroteClient(start)
+		if err != nil {
+			rec.errorCode = codeClientGone
+			return providers.KindCanceled, clientGone(err)
 		}
-		body = out
-	}
-	start := time.Now()
-	ex.Respond(info, resp.Status, body)
-	rec.wroteClient(start)
-}
-
-// serveStream answers with an upstream stream, or with the error that
-// prevented it from starting.
-func (g *Gateway) serveStream(ex Exchange, rec *record, s providers.Stream, err error, info Info, wantUsage bool, conv converter) {
-	if err != nil {
-		rec.upstreamEnd(err)
-		rec.upstreamFailed(err)
-		info.UpstreamRequestID = rec.upstreamRequestID
-		rec.respondError(ex, info, upstreamError(err))
-		return
-	}
-	defer func() { _ = s.Close() }()
-	wait := time.Since(rec.upstreamStart)
-	rec.served = true
-	rec.ttft = s.TTFT()
-	rec.upstreamRequestID = s.UpstreamRequestID()
-	info.UpstreamRequestID = s.UpstreamRequestID()
-
-	// The commit point: the first upstream event is in hand.
-	rec.outcome = pump(ex, rec, s, info, wantUsage, &wait, conv)
-	rec.usage = s.Usage()
-	rec.upstreamWait = wait
-	rec.upstreamDuration = time.Since(rec.upstreamStart)
-}
-
-// pump commits the stream and forwards its events until it ends. It adds
-// the time spent waiting on the upstream to *wait and returns the upstream
-// outcome.
-func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage bool, wait *time.Duration, conv converter) string {
-	start := time.Now()
-	err := ex.StartStream(info)
-	rec.wroteClient(start)
-	if err != nil {
-		rec.errorCode = codeClientGone
-		return string(providers.KindCanceled)
 	}
 	for {
 		waitStart := time.Now()
@@ -188,10 +146,11 @@ func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage boo
 				rec.errorCode = codeClientGone
 			}
 			rec.wroteClient(start)
-			return providers.OutcomeOK
+			return "", nil
 		case err != nil:
 			rec.upstreamFailed(err)
-			if outcome(err) == providers.KindCanceled {
+			kind := outcome(err)
+			if kind == providers.KindCanceled {
 				rec.errorCode = codeClientGone
 			} else {
 				rec.errorCode = codeUpstreamError
@@ -199,7 +158,7 @@ func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage boo
 				_ = ex.Send(streamErrorEvent(err))
 				rec.wroteClient(start)
 			}
-			return providers.Outcome(err)
+			return kind, err
 		case chunk.IsUsageOnly() && !wantUsage:
 			continue
 		}
@@ -224,9 +183,15 @@ func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage boo
 		if err != nil {
 			// The client is gone; closing the stream cancels the upstream.
 			rec.errorCode = codeClientGone
-			return string(providers.KindCanceled)
+			return providers.KindCanceled, clientGone(err)
 		}
 	}
+}
+
+// clientGone is the error of a stream whose client went away, after a
+// write to it failed with err.
+func clientGone(err error) error {
+	return &providers.Error{Kind: providers.KindCanceled, Message: "the client went away", Err: err}
 }
 
 // outcome returns the failure kind of an adapter error.

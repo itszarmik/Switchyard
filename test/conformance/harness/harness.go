@@ -93,6 +93,9 @@ type Config struct {
 	KeyHash string
 	// LogLevel is the gateway's log level; default info.
 	LogLevel string
+	// Routing, when set, is written as the routing section, for example
+	// {"fallback": {"retries_per_deployment": 0}}.
+	Routing map[string]any
 }
 
 // YAML renders c as a switchyard config file. Both listeners bind
@@ -137,6 +140,7 @@ func (c Config) YAML() ([]byte, error) {
 			Provs   []provider        `yaml:"providers"`
 			Models  []model           `yaml:"models"`
 			Tenants []tenant          `yaml:"tenants,omitempty"`
+			Routing map[string]any    `yaml:"routing,omitempty"`
 		}
 	)
 	dur := func(d time.Duration) string {
@@ -171,6 +175,7 @@ func (c Config) YAML() ([]byte, error) {
 		},
 		Logging: map[string]string{"level": level, "format": "json"},
 		Provs:   []provider{p},
+		Routing: c.Routing,
 	}
 	for _, m := range c.Models {
 		f.Models = append(f.Models, model{ID: m.ID, Capabilities: m.Capabilities,

@@ -168,8 +168,8 @@ func New(p config.Provider) (*Adapter, error) {
 // CloseIdleConnections closes the provider's idle pooled connections.
 func (a *Adapter) CloseIdleConnections() { a.client.CloseIdleConnections() }
 
-// Chat implements providers.Adapter. first_token bounds the wait for the
-// response headers, and total bounds the whole call including the body.
+// Chat implements providers.Adapter. total bounds the whole call
+// including the body; first_token does not apply (see post).
 func (a *Adapter) Chat(ctx context.Context, req *providers.Request) (*providers.Response, error) {
 	return a.post(ctx, a.endpoint, req.Chat.EncodeFor(req.UpstreamModel, !req.NoStreamUsage), req.Header, maxResponseBytes)
 }
@@ -198,10 +198,11 @@ func (a *Adapter) Embed(ctx context.Context, req *providers.EmbedRequest) (*prov
 }
 
 // post sends a non-streaming request to endpoint and reads a response body
-// of at most limit bytes. first_token bounds the wait for the response
-// headers, and total bounds the whole call including the body.
+// of at most limit bytes. total bounds the whole call including the body;
+// first_token does not apply, because the response headers arrive only
+// after the whole generation.
 func (a *Adapter) post(ctx context.Context, endpoint string, body []byte, header http.Header, limit int) (*providers.Response, error) {
-	c := a.newCall(ctx)
+	c := a.newCall(ctx, false)
 	defer c.stop()
 
 	resp, err := a.do(c, endpoint, body, header, false)
@@ -210,7 +211,6 @@ func (a *Adapter) post(ctx context.Context, endpoint string, body []byte, header
 	}
 	defer func() { _ = resp.Body.Close() }()
 	ttft := time.Since(c.start)
-	c.phase.Stop() // the first token has arrived; total still applies
 	rid := a.requestID(resp.Header)
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -240,7 +240,7 @@ func (a *Adapter) post(ctx context.Context, endpoint string, body []byte, header
 // event has arrived. first_token bounds the wait for the first event, idle
 // each gap between events, and total the whole call.
 func (a *Adapter) stream(ctx context.Context, endpoint string, body []byte, header http.Header) (providers.Stream, error) {
-	c := a.newCall(ctx)
+	c := a.newCall(ctx, true)
 	resp, err := a.do(c, endpoint, body, header, true)
 	if err != nil {
 		c.stop()
@@ -254,6 +254,7 @@ func (a *Adapter) stream(ctx context.Context, endpoint string, body []byte, head
 	}
 	s := newStream(a, c, resp.Body, rid)
 	first, err := s.read()
+	c.pause() // until the caller asks for the next chunk
 	s.ttft = time.Since(c.start)
 	switch {
 	case errors.Is(err, io.EOF):
@@ -300,23 +301,36 @@ func (a *Adapter) do(c *call, endpoint string, body []byte, header http.Header, 
 	return resp, nil
 }
 
-// statusError turns a non-2xx response into an error. Only client errors
-// keep the upstream body, and only when it is an OpenAI error envelope
-// without the provider key (see clientErrorBody): a 401 or 403 body may
-// echo parts of our credential, and 5xx bodies are the upstream's
-// internals.
+// statusError turns a non-2xx response into an error, classified by
+// status and, for a 400, by the OpenAI error code:
+//
+//   - 401, 402 and 403 are our credential or account (KindAuth);
+//   - 429 is KindRateLimited, with Retry-After;
+//   - 404 is KindNotFound;
+//   - code context_length_exceeded is KindContextLength, and codes
+//     content_policy_violation and content_filter are KindContentFilter;
+//   - any other 4xx is KindClientError;
+//   - 5xx and anything else are KindServerError.
+//
+// Only the 4xx kinds other than KindAuth keep the upstream body, and only
+// when it is an OpenAI error envelope without the provider key (see
+// clientErrorBody): a 401 or 403 body may echo parts of our credential,
+// and 5xx bodies are the upstream's internals.
 func (a *Adapter) statusError(resp *http.Response, rid string) *providers.Error {
 	e := &providers.Error{Status: resp.StatusCode, Provider: a.id, UpstreamRequestID: rid}
 	code := resp.StatusCode
 	switch {
-	case code == http.StatusUnauthorized || code == http.StatusForbidden:
+	case code == http.StatusUnauthorized || code == http.StatusPaymentRequired || code == http.StatusForbidden:
 		e.Kind = providers.KindAuth
-		e.Message = fmt.Sprintf("upstream rejected the provider credential (HTTP %d)", code)
+		e.Message = fmt.Sprintf("upstream rejected the provider credential or account (HTTP %d)", code)
 		return e
 	case code == http.StatusTooManyRequests:
 		e.Kind = providers.KindRateLimited
 		e.Message = "upstream rate limit reached (HTTP 429)"
 		e.RetryAfter = retryAfter(resp.Header, time.Now())
+	case code == http.StatusNotFound:
+		e.Kind = providers.KindNotFound
+		e.Message = "upstream does not know the model (HTTP 404)"
 	case code >= 400 && code <= 499:
 		e.Kind = providers.KindClientError
 		e.Message = fmt.Sprintf("upstream rejected the request (HTTP %d)", code)
@@ -330,10 +344,39 @@ func (a *Adapter) statusError(resp *http.Response, rid string) *providers.Error 
 		return e
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
-	if err == nil && len(body) <= maxErrorBodyBytes {
-		e.Body = a.clientErrorBody(body)
+	if err != nil || len(body) > maxErrorBodyBytes {
+		return e
+	}
+	e.Body = a.clientErrorBody(body)
+	if e.Kind == providers.KindClientError {
+		switch errorCode(body) {
+		case "context_length_exceeded":
+			e.Kind = providers.KindContextLength
+			e.Message = fmt.Sprintf("request exceeds the model's context window (HTTP %d)", code)
+		case "content_policy_violation", "content_filter":
+			e.Kind = providers.KindContentFilter
+			e.Message = fmt.Sprintf("upstream content filter rejected the request (HTTP %d)", code)
+		}
 	}
 	return e
+}
+
+// errorCode returns the code of an OpenAI error envelope, or "" if body is
+// not one or its code is not a string.
+func errorCode(body []byte) string {
+	var env struct {
+		Error struct {
+			Code json.RawMessage `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &env) != nil {
+		return ""
+	}
+	var c string
+	if json.Unmarshal(env.Error.Code, &c) != nil {
+		return ""
+	}
+	return c
 }
 
 // clientErrorBody returns the client-error body to forward, or nil when

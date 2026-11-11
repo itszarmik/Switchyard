@@ -5,10 +5,12 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"strconv"
 
 	"switchyard/internal/apierror"
 	"switchyard/internal/catalog"
 	"switchyard/internal/config"
+	"switchyard/internal/health"
 	"switchyard/internal/schema"
 )
 
@@ -89,12 +91,46 @@ func estimateOut(maxTokens int64, ok bool) int64 {
 // request, or "" if it can. It runs before the catalog's hard filters.
 type filter func(d *catalog.Deployment) string
 
-// choose picks the deployment that serves a request among res.Candidates:
-// first those that pass keep (and have an adapter), then the catalog's
-// hard filters and ranking. Every excluded candidate is reported, in
-// candidate order, in Selection.Exclusions or in the no_eligible_model
-// error.
-func (g *Gateway) choose(res catalog.Resolution, required schema.CapabilitySet, estIn, estOut int64, keep filter) (catalog.Selection, *Error) {
+// maxPlan is the longest plan, routing.fallback.max_deployments at most.
+const maxPlan = 10
+
+// planEntry is one deployment of a plan.
+type planEntry struct {
+	d *catalog.Deployment
+	// dropped lists the capabilities whose parameters are removed for d.
+	dropped []schema.Capability
+	health  *health.Deployment
+	prov    *health.Provider
+}
+
+// plan is the ordered list of deployments a request may be sent to: the
+// primary and its fallbacks.
+type plan struct {
+	entries []planEntry
+	model   string
+	pinned  bool
+	// exclusions explains every candidate that is not in the plan because
+	// it is ineligible or unhealthy, in candidate order.
+	exclusions []catalog.Exclusion
+}
+
+// buildPlan plans a request among res.Candidates:
+//
+//  1. candidates that fail keep (or have no adapter) are excluded, then
+//     the catalog's hard filters; with nothing left the answer is 400
+//     no_eligible_model;
+//  2. eligible candidates whose breaker is open, that are in a rate-limit
+//     cooldown or whose provider is at max_concurrency are skipped; with
+//     nothing left the answer is 503 no_healthy_upstream;
+//  3. the plan takes the cheapest remaining candidate, then up to
+//     max_deployments−1 fallbacks, each the cheapest remaining candidate
+//     of a provider not yet in the plan while there is one.
+//
+// Every excluded candidate is reported, in candidate order, in
+// plan.exclusions or in the error.
+//
+// The plan is built into p, which the request's record holds.
+func (g *Gateway) buildPlan(p *plan, res catalog.Resolution, required schema.CapabilitySet, estIn, estOut int64, keep filter) *Error {
 	// Candidates excluded before the catalog's filters. The candidate
 	// list is copied only when one is.
 	var pre []catalog.Exclusion
@@ -118,23 +154,119 @@ func (g *Gateway) choose(res catalog.Resolution, required schema.CapabilitySet, 
 	}
 	sub := res
 	sub.Candidates = cands
-	sel, err := g.catalog.Select(sub, required, estIn, estOut, g.drop)
-	var ne *catalog.NoEligibleError
-	if err != nil && !errors.As(err, &ne) {
-		return sel, &Error{Status: http.StatusInternalServerError, Type: apierror.TypeServer, Code: "internal_error", Message: "Could not choose a deployment."}
+	ranking, err := g.catalog.Rank(sub, required, estIn, estOut, g.drop)
+	p.model, p.pinned = res.Model.ID, res.Pinned
+	if err != nil {
+		var ne *catalog.NoEligibleError
+		if !errors.As(err, &ne) {
+			return &Error{Status: http.StatusInternalServerError, Type: apierror.TypeServer, Code: "internal_error", Message: "Could not choose a deployment."}
+		}
+		p.exclusions = merge(res.Candidates, pre, ne.Exclusions)
+		return noEligibleModel(res.Model.ID, p.exclusions)
 	}
-	exclusions := sel.Exclusions
-	if ne != nil {
-		exclusions = ne.Exclusions
+
+	// Health: skip what cannot take the request now. The skip reasons
+	// join the exclusions.
+	var healthy [maxCandidates]int
+	nh := 0
+	var skipped []catalog.Exclusion
+	for i, c := range ranking.Candidates {
+		h, pv := g.deps[c.Deployment.ID], g.provs[c.Deployment.Provider]
+		reason := h.Skip()
+		if reason == "" && pv.Saturated() {
+			reason = "provider at max_concurrency " + strconv.Itoa(pv.Max())
+		}
+		if reason != "" {
+			skipped = append(skipped, catalog.Exclusion{Deployment: c.Deployment.ID, Reason: reason})
+			continue
+		}
+		if nh < len(healthy) {
+			healthy[nh] = i
+			nh++
+		}
 	}
-	if len(pre) > 0 {
-		exclusions = inCandidateOrder(res.Candidates, append(pre, exclusions...))
+	p.exclusions = merge(res.Candidates, pre, ranking.Exclusions, skipped)
+	if nh == 0 {
+		return noHealthyUpstream(res.Model.ID, p.exclusions)
 	}
-	if ne != nil {
-		return catalog.Selection{Exclusions: exclusions}, noEligibleModel(res.Model.ID, exclusions)
+
+	// The plan, preferring provider diversity.
+	limit := min(g.routing.Fallback.MaxDeployments, nh, maxPlan)
+	if res.Pinned {
+		limit = 1
 	}
-	sel.Exclusions = exclusions
-	return sel, nil
+	p.entries = make([]planEntry, 0, limit)
+	for len(p.entries) < limit {
+		var pick *catalog.Candidate
+		for _, idx := range healthy[:nh] {
+			c := &ranking.Candidates[idx]
+			if p.has(c.Deployment) {
+				continue
+			}
+			if pick == nil {
+				pick = c // the cheapest remaining, if no provider is new
+			}
+			if !p.hasProvider(c.Deployment.Provider) {
+				pick = c
+				break
+			}
+		}
+		if pick == nil {
+			break
+		}
+		p.entries = append(p.entries, planEntry{
+			d: pick.Deployment, dropped: pick.Dropped,
+			health: g.deps[pick.Deployment.ID], prov: g.provs[pick.Deployment.Provider],
+		})
+	}
+	return nil
+}
+
+// maxCandidates bounds the candidates a plan is chosen from; a model with
+// more deployments than this plans among its cheapest maxCandidates
+// healthy ones.
+const maxCandidates = 64
+
+// has reports whether d is in the plan.
+func (p *plan) has(d *catalog.Deployment) bool {
+	for i := range p.entries {
+		if p.entries[i].d == d {
+			return true
+		}
+	}
+	return false
+}
+
+// hasProvider reports whether the plan already has a deployment of
+// provider.
+func (p *plan) hasProvider(provider string) bool {
+	for i := range p.entries {
+		if p.entries[i].d.Provider == provider {
+			return true
+		}
+	}
+	return false
+}
+
+// merge returns the exclusions of the lists, one per deployment, in the
+// order of cands. It returns a single list as is.
+func merge(cands []*catalog.Deployment, lists ...[]catalog.Exclusion) []catalog.Exclusion {
+	var only []catalog.Exclusion
+	n := 0
+	for _, l := range lists {
+		if len(l) > 0 {
+			only = l
+			n++
+		}
+	}
+	if n <= 1 {
+		return only
+	}
+	var all []catalog.Exclusion
+	for _, l := range lists {
+		all = append(all, l...)
+	}
+	return inCandidateOrder(cands, all)
 }
 
 // inCandidateOrder sorts exclusions, one per deployment, into the order of

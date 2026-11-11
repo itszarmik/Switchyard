@@ -49,8 +49,11 @@ func price(in, out string) config.Pricing {
 	return p
 }
 
+// testConfig is a gateway config for the P1 pipeline tests: one attempt
+// per request, on the cheapest deployment only.
 func testConfig() *config.Config {
 	return &config.Config{
+		Routing: config.Routing{Fallback: config.Fallback{MaxDeployments: 1}},
 		Providers: []config.Provider{
 			{ID: "fake", Type: "openai", BaseURL: "http://127.0.0.1:1/v1"},
 			{ID: "anth", Type: "anthropic", BaseURL: "https://api.anthropic.test"},
@@ -176,7 +179,8 @@ func TestListModels(t *testing.T) {
 	}
 }
 
-// metricValue returns a counter's value, or a histogram's sample count,
+// metricValue returns a counter's or gauge's value, or a histogram's
+// sample count,
 // for the series with the given label values (in label-name order), or 0
 // if there is no such series.
 func metricValue(t *testing.T, reg *prometheus.Registry, name string, labels ...string) float64 {
@@ -199,6 +203,9 @@ func metricValue(t *testing.T, reg *prometheus.Registry, name string, labels ...
 			}
 			if c := m.GetCounter(); c != nil {
 				return c.GetValue()
+			}
+			if g := m.GetGauge(); g != nil {
+				return g.GetValue()
 			}
 			return float64(m.GetHistogram().GetSampleCount())
 		}
@@ -326,6 +333,10 @@ func (f *fakeExchange) StartStream(info Info) error {
 	f.info = info
 	f.add("start")
 	return f.fail("start")
+}
+func (f *fakeExchange) Comment(text string) error {
+	f.add(": " + text)
+	return f.fail(": " + text)
 }
 func (f *fakeExchange) Send(data []byte) error {
 	f.add("send " + string(data))

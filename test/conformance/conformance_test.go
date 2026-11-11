@@ -17,13 +17,15 @@ import (
 	"switchyard/test/fakeupstream"
 )
 
-// Provider timeouts of the gateway under test. first_token is short so the
-// timeout case is quick; idle and total leave room for slow machines.
+// Provider timeouts of the gateway under test. first_token, which bounds
+// a stream's first event, and total, which bounds a non-streaming call,
+// are short so the timeout cases are quick; idle leaves room for slow
+// machines, and total for the suite's longest stream.
 const (
 	connectTimeout    = 2 * time.Second
 	firstTokenTimeout = time.Second
 	idleTimeout       = 5 * time.Second
-	totalTimeout      = 30 * time.Second
+	totalTimeout      = 3 * time.Second
 )
 
 // maxCancelLatency is the acceptance bound for a client disconnect to
@@ -87,8 +89,21 @@ func startGateway(t *testing.T, baseURL, wire string) (*harness.Gateway, string)
 		},
 		Models:  []harness.Model{{ID: catalogModel, UpstreamModel: upstreamModel, Capabilities: caps}},
 		KeyHash: hash,
+		Routing: singleAttempt,
 	}, harness.RunOptions{Race: raceEnabled})
 	return g, key
+}
+
+// singleAttempt is the routing of the conformance gateway: every request
+// makes exactly one upstream attempt and no failure changes how the next
+// request is routed. The suite checks how the gateway maps each upstream
+// answer for the SDK, so each case must reach the upstream once whatever
+// the cases before it did; retries, fallback, breakers and cooldowns have
+// their own tests (reliability_test.go).
+var singleAttempt = map[string]any{
+	"fallback":            map[string]any{"retries_per_deployment": 0},
+	"breaker":             map[string]any{"consecutive_failures": 1000000, "min_requests": 1000000},
+	"rate_limit_cooldown": map[string]any{"default": "1ns", "max": "1ns"},
 }
 
 func TestConformanceDirect(t *testing.T) {

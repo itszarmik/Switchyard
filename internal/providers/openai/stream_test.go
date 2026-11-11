@@ -337,3 +337,34 @@ func TestStreamReusesConnection(t *testing.T) {
 		})
 	}
 }
+
+// TestIdleExcludesCallerTime checks that the idle timeout measures only
+// the wait for the upstream: a caller that holds each chunk longer than
+// idle (as the gateway does while a slow client reads) does not time the
+// stream out, because the upstream had sent the next event long before.
+func TestIdleExcludesCallerTime(t *testing.T) {
+	const idle = 100 * time.Millisecond
+	chunk := "data: {\"choices\":[{\"index\":0}]}\n\n"
+	u := newUpstream(t, sseHandler([]string{chunk}, func(_ *upstream, w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(idle / 5)
+		_, _ = io.WriteString(w, chunk+chunk+"data: [DONE]\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	p := testProvider(u.URL)
+	p.Timeouts.Idle = config.Duration(idle)
+	a := newAdapter(t, p)
+	s, err := a.ChatStream(ctxWithTimeout(t), chatRequest(t, streamBody, nil))
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	for i := range 3 {
+		time.Sleep(4 * idle) // the caller holds the previous chunk
+		if _, err := s.Next(); err != nil {
+			t.Fatalf("Next %d: %v", i, err)
+		}
+	}
+	if _, err := s.Next(); !errors.Is(err, io.EOF) {
+		t.Errorf("Next after the last chunk = %v, want io.EOF", err)
+	}
+}

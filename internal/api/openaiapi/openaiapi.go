@@ -37,6 +37,8 @@ const (
 	headerAlias             = "X-Switchyard-Alias"
 	headerDroppedParams     = "X-Switchyard-Dropped-Params"
 	headerShim              = "X-Switchyard-Shim"
+	headerAttempts          = "X-Switchyard-Attempts"
+	headerRouteReason       = "X-Switchyard-Route-Reason"
 )
 
 // Defaults for the zero values of Options.
@@ -231,6 +233,15 @@ func (e *exchange) Send(data []byte) error {
 	return e.sw.WriteData(data)
 }
 
+// Comment implements gateway.Exchange.
+func (e *exchange) Comment(text string) error {
+	e.setWriteDeadline()
+	if err := e.sw.WriteComment(text); err != nil {
+		return fmt.Errorf("openaiapi: %w", err)
+	}
+	return nil
+}
+
 // Done implements gateway.Exchange.
 func (e *exchange) Done() error {
 	e.setWriteDeadline()
@@ -271,6 +282,12 @@ func setInfo(h http.Header, info gateway.Info) {
 	}
 	if info.UpstreamRequestID != "" {
 		h.Set(headerUpstreamRequestID, info.UpstreamRequestID)
+	}
+	if info.Attempts > 0 {
+		h.Set(headerAttempts, strconv.Itoa(info.Attempts))
+	}
+	if info.RouteReason != "" {
+		h.Set(headerRouteReason, info.RouteReason)
 	}
 }
 

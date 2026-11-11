@@ -54,6 +54,23 @@ func (w *Writer) WriteDone() error {
 	return w.WriteData([]byte(doneData))
 }
 
+// WriteComment writes one comment line, ": <text>\n\n", and flushes it.
+// Readers ignore comments; they keep idle connections alive. Line breaks
+// in text are replaced with spaces, so the comment stays one line.
+func (w *Writer) WriteComment(text string) error {
+	w.buf.Reset()
+	w.buf.WriteString(": ")
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c == '\r' || c == '\n' {
+			c = ' '
+		}
+		w.buf.WriteByte(c)
+	}
+	w.buf.WriteString("\n\n")
+	return w.send()
+}
+
 // IsDone reports whether data is the payload of the [DONE] sentinel.
 func IsDone(data []byte) bool {
 	return string(data) == doneData

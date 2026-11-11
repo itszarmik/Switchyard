@@ -209,10 +209,20 @@ func (st *loadState) load(data []byte) *Config {
 		st.expandTree(root, "")
 		st.decode(root, cfg)
 	}
-	applyDefaults(cfg)
+	applyDefaults(cfg, st.explicit)
 	st.applyOverrides(cfg)
 	st.validate(cfg)
 	return cfg
+}
+
+// explicit reports whether the files set the config path to a value other
+// than null.
+func (st *loadState) explicit(path string) bool {
+	p, ok := st.pos[path]
+	if !ok || p.node == nil {
+		return false
+	}
+	return p.node.Kind != yaml.ScalarNode || p.node.ShortTag() != nullTag
 }
 
 func (st *loadState) hasErrors() bool {

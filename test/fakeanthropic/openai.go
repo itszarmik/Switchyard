@@ -38,6 +38,16 @@ func (u *OpenAIUpstream) Reset() { u.s.Reset() }
 // Script sets FromOpenAI(b) as the behavior.
 func (u *OpenAIUpstream) Script(b fakeupstream.Behavior) { u.s.Script(FromOpenAI(b)) }
 
+// Sequence scripts the next requests one by one, each translated with
+// FromOpenAI; see Server.Sequence.
+func (u *OpenAIUpstream) Sequence(bs ...fakeupstream.Behavior) {
+	out := make([]Behavior, len(bs))
+	for i, b := range bs {
+		out[i] = FromOpenAI(b)
+	}
+	u.s.Sequence(out...)
+}
+
 // Requests returns a snapshot of the recorded requests, oldest first.
 func (u *OpenAIUpstream) Requests() []Request { return u.s.Requests() }
 
@@ -54,7 +64,7 @@ func (u *OpenAIUpstream) Await(ctx context.Context, n int) ([]Request, error) {
 
 // FromOpenAI translates a fakeupstream behavior into the equivalent
 // Anthropic one. Status, Header, TTFT, ChunkDelay, Fault,
-// FaultAfterChunks and ExtraFields carry over unchanged; FaultAfterChunks
+// FaultAfterChunks, ExtraFields and Hold carry over unchanged; FaultAfterChunks
 // then counts Anthropic events, which are not one to one with OpenAI
 // chunks. An OpenAI error envelope in Body becomes an Anthropic error
 // with the same message and the documented type for the status; its param
@@ -64,7 +74,7 @@ func FromOpenAI(b fakeupstream.Behavior) Behavior {
 	out := Behavior{
 		Status: b.Status, Header: b.Header.Clone(), TTFT: b.TTFT, ChunkDelay: b.ChunkDelay,
 		Fault: b.Fault, FaultAfterChunks: b.FaultAfterChunks, ExtraFields: b.ExtraFields,
-		Body: b.Body,
+		Body: b.Body, Hold: b.Hold,
 	}
 	if b.Body != nil {
 		var env struct {

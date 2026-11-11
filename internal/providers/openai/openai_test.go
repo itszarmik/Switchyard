@@ -303,8 +303,18 @@ func TestChatStatusErrors(t *testing.T) {
 		{name: "400 error string", status: 400, body: `{"error":"bad"}`, kind: providers.KindClientError},
 		{name: "400 echoing the key", status: 400, body: `{"error":{"message":"bad key ` + providerKey + `","type":"invalid_request_error"}}`, kind: providers.KindClientError},
 		{name: "429 echoing the key", status: 429, body: `{"error":{"message":"limit for ` + providerKey + `"}}`, kind: providers.KindRateLimited},
-		{name: "404", status: 404, body: envelope, kind: providers.KindClientError, keepBody: true},
+		{name: "404", status: 404, body: envelope, kind: providers.KindNotFound, keepBody: true},
 		{name: "422", status: 422, body: envelope, kind: providers.KindClientError, keepBody: true},
+		{name: "413", status: 413, body: envelope, kind: providers.KindClientError, keepBody: true},
+		{name: "400 context_length_exceeded", status: 400, kind: providers.KindContextLength, keepBody: true,
+			body: `{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}`},
+		{name: "400 content_policy_violation", status: 400, kind: providers.KindContentFilter, keepBody: true,
+			body: `{"error":{"message":"Your request was rejected by the safety system.","type":"invalid_request_error","param":null,"code":"content_policy_violation"}}`},
+		{name: "400 content_filter", status: 400, kind: providers.KindContentFilter, keepBody: true,
+			body: `{"error":{"message":"filtered","type":"invalid_request_error","param":"prompt","code":"content_filter"}}`},
+		{name: "400 numeric code", status: 400, kind: providers.KindClientError, keepBody: true,
+			body: `{"error":{"message":"bad","type":"invalid_request_error","param":null,"code":400}}`},
+		{name: "402", status: 402, body: envelope, kind: providers.KindAuth},
 		{name: "429 seconds", status: 429, body: envelope, header: map[string]string{"Retry-After": "7"}, kind: providers.KindRateLimited, keepBody: true, retryAfter: 7 * time.Second},
 		{name: "429 ms", status: 429, body: envelope, header: map[string]string{"Retry-After-Ms": "1500"}, kind: providers.KindRateLimited, keepBody: true, retryAfter: 1500 * time.Millisecond},
 		{name: "401 never keeps the body", status: 401, body: `{"error":{"message":"Incorrect API key provided: sk-provi***cdef"}}`, kind: providers.KindAuth},
@@ -404,12 +414,6 @@ func TestChatTimeouts(t *testing.T) {
 		message string
 	}{
 		{
-			name:    "first_token bounds the response headers",
-			handler: func(u *upstream, _ http.ResponseWriter, r *http.Request) { u.hang(r) },
-			set:     func(p *config.ProviderTimeouts) { p.FirstToken = config.Duration(short) },
-			message: "first_token timeout",
-		},
-		{
 			name: "total bounds the body",
 			handler: func(u *upstream, w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusOK)
@@ -438,9 +442,49 @@ func TestChatTimeouts(t *testing.T) {
 			if !strings.Contains(pe.Message, tt.message) {
 				t.Errorf("message = %q, want it to mention %q", pe.Message, tt.message)
 			}
+			if pe.Timeout != providers.TimeoutTotal || providers.Retryable(err, false) {
+				t.Errorf("Timeout = %q, Retryable = %v; want total, not retryable", pe.Timeout, providers.Retryable(err, false))
+			}
 			waitCanceled(t, u)
 		})
 	}
+}
+
+// TestNonStreamIgnoresFirstToken checks that first_token does not bound a
+// non-streaming call, whose response headers arrive only after the whole
+// generation: total and the caller's deadline do.
+func TestNonStreamIgnoresFirstToken(t *testing.T) {
+	const short = 50 * time.Millisecond
+	u := newUpstream(t, func(_ *upstream, w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(4 * short)
+		_, _ = io.WriteString(w, `{"id":"c","object":"chat.completion","choices":[]}`)
+	})
+	p := testProvider(u.URL)
+	p.Timeouts.FirstToken = config.Duration(short)
+	a := newAdapter(t, p)
+	t.Run("chat", func(t *testing.T) {
+		if _, err := a.Chat(ctxWithTimeout(t), chatRequest(t, `{"model":"m","messages":[{}]}`, nil)); err != nil {
+			t.Fatalf("Chat: %v", err)
+		}
+	})
+	t.Run("completion", func(t *testing.T) {
+		req, err := schema.DecodeCompletionRequest([]byte(`{"model":"m","prompt":"hi"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Completion(ctxWithTimeout(t), &providers.CompletionRequest{Completion: req, UpstreamModel: "u"}); err != nil {
+			t.Fatalf("Completion: %v", err)
+		}
+	})
+	t.Run("embed", func(t *testing.T) {
+		req, err := schema.DecodeEmbeddingRequest([]byte(`{"model":"m","input":"hi"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Embed(ctxWithTimeout(t), &providers.EmbedRequest{Embedding: req, UpstreamModel: "u"}); err != nil {
+			t.Fatalf("Embed: %v", err)
+		}
+	})
 }
 
 // waitCanceled waits until the upstream saw its request canceled.
@@ -475,6 +519,31 @@ func TestChatCanceledByCaller(t *testing.T) {
 		t.Fatal("Chat did not return after cancel")
 	}
 	waitCanceled(t, u)
+}
+
+// TestCallerDeadlineIsATimeout checks that the deadline of the caller's
+// context, the gateway's request deadline, is a timeout and not a
+// cancellation, for calls and for streams before their first event.
+func TestCallerDeadlineIsATimeout(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			u := newUpstream(t, func(u *upstream, _ http.ResponseWriter, r *http.Request) { u.hang(r) })
+			a := newAdapter(t, testProvider(u.URL))
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			var err error
+			if stream {
+				_, err = a.ChatStream(ctx, chatRequest(t, `{"model":"m","messages":[{}],"stream":true}`, nil))
+			} else {
+				_, err = a.Chat(ctx, chatRequest(t, `{"model":"m","messages":[{}]}`, nil))
+			}
+			pe := wantKind(t, err, providers.KindTimeout)
+			if !strings.Contains(pe.Message, "deadline") {
+				t.Errorf("message = %q, want it to name the deadline", pe.Message)
+			}
+			waitCanceled(t, u)
+		})
+	}
 }
 
 // TestUpstreamRequestID checks that the upstream's x-request-id, which is
@@ -588,8 +657,11 @@ func TestKeyNeverEchoed(t *testing.T) {
 						})
 						a := newAdapter(t, testProvider(u.URL+"/v1"))
 						kind := providers.KindClientError
-						if status == http.StatusTooManyRequests {
+						switch status {
+						case http.StatusTooManyRequests:
 							kind = providers.KindRateLimited
+						case http.StatusNotFound:
+							kind = providers.KindNotFound
 						}
 						pe := wantKind(t, call(t, a), kind)
 						if pe.Body != nil {

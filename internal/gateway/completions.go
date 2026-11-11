@@ -16,16 +16,17 @@ import (
 const ShimChat = "chat"
 
 // Completions serves one POST /v1/completions request, in the legacy
-// OpenAI shape. The model is resolved and the deployment chosen as for chat
-// completions. A deployment with capability completions on an OpenAI-wire
-// provider gets the request natively, forwarded losslessly with the model
-// replaced. Any other deployment is served through the chat shim: the
-// prompt becomes one user message, and the chat answer (or each stream
-// chunk) is translated back into a text_completion, marked by
-// X-Switchyard-Shim: chat. Legacy parameters the shim cannot honor (echo,
-// suffix, logprobs, best_of above 1, several prompts) prefer a native
-// deployment, and get a 400 unsupported_parameter when none can serve the
-// request.
+// OpenAI shape. The model is resolved and the deployments planned as for
+// chat completions, and the plan executed the same way. A deployment with
+// capability completions on an OpenAI-wire provider gets the request
+// natively, forwarded losslessly with the model replaced. Any other
+// deployment is served through the chat shim: the prompt becomes one user
+// message, and the chat answer (or each stream chunk) is translated back
+// into a text_completion, marked by X-Switchyard-Shim: chat. Each attempt
+// uses whichever its deployment needs. Legacy parameters the shim cannot
+// honor (echo, suffix, logprobs, best_of above 1, several prompts) plan
+// only native deployments, and get a 400 unsupported_parameter when none
+// can serve the request.
 func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 	rec := g.newRecord(ctx, EndpointCompletions)
 	defer rec.finish()
@@ -43,13 +44,18 @@ func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 	rec.requestedModel = req.Model()
 	rec.stream = req.Stream()
 	markStream(ctx, req.Stream())
+	ctx, cancel, ok := g.withDeadline(ctx, ex, rec)
+	defer cancel()
+	if !ok {
+		return
+	}
 
 	res, e := g.resolve(req.Model(), rec.endpoint, chatType)
 	if e != nil {
 		rec.respondError(ex, Info{}, e)
 		return
 	}
-	info := Info{Model: res.Model.ID, Alias: res.Alias}
+	rec.info = Info{Model: res.Model.ID, Alias: res.Alias}
 	rec.alias = res.Alias
 	estIn := estimateIn(len(body), 0, 0, res.Model)
 	maxTokens, hasMax := req.MaxTokens()
@@ -59,18 +65,21 @@ func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 		// Only a native deployment can serve this request.
 		required := req.RequiredCapabilities()
 		required[schema.CapCompletions] = struct{}{}
-		sel, e := g.choose(res, required, estIn, estOut, func(d *catalog.Deployment) string {
+		e := g.buildPlan(&rec.plan, res, required, estIn, estOut, func(d *catalog.Deployment) string {
 			if !g.native(d) {
 				return "lacks capability completions"
 			}
 			return ""
 		})
-		rec.excluded = len(sel.Exclusions)
+		rec.excluded = len(rec.plan.exclusions)
 		if e != nil {
-			rec.respondError(ex, info, invalidRequest(shimErr))
+			if e.Code == codeNoEligible {
+				e = invalidRequest(shimErr)
+			}
+			rec.respondError(ex, rec.info, e)
 			return
 		}
-		g.serveNative(ctx, ex, rec, sel, req, info)
+		g.execute(ctx, ex, rec, g.completionTry(ex, rec, req, nil))
 		return
 	}
 
@@ -78,21 +87,16 @@ func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 	if err != nil {
 		// The shim builds the chat request itself; only a field of the
 		// wrong type, such as a non-boolean stream, can fail here.
-		rec.respondError(ex, info, invalidRequest(err))
+		rec.respondError(ex, rec.info, invalidRequest(err))
 		return
 	}
-	sel, e := g.choose(res, chat.RequiredCapabilities(), estIn, estOut, nil)
-	rec.excluded = len(sel.Exclusions)
+	e = g.buildPlan(&rec.plan, res, chat.RequiredCapabilities(), estIn, estOut, nil)
+	rec.excluded = len(rec.plan.exclusions)
 	if e != nil {
-		rec.respondError(ex, info, e)
+		rec.respondError(ex, rec.info, e)
 		return
 	}
-	if g.native(sel.Deployment) {
-		g.serveNative(ctx, ex, rec, sel, req, info)
-		return
-	}
-	info.Shim = ShimChat
-	g.serveChat(ctx, ex, rec, sel, chat, info, completionShim{})
+	g.execute(ctx, ex, rec, g.completionTry(ex, rec, req, chat))
 }
 
 // native reports whether d serves legacy completions natively.
@@ -101,28 +105,37 @@ func (g *Gateway) native(d *catalog.Deployment) bool {
 	return ok && d.ProviderType == "openai" && d.Capabilities.Has(schema.CapCompletions)
 }
 
-// serveNative forwards a legacy completion to a deployment that serves it
-// natively.
-func (g *Gateway) serveNative(ctx context.Context, ex Exchange, rec *record, sel catalog.Selection, req *schema.CompletionRequest, info Info) {
-	d := sel.Deployment
-	rec.deployment = d
-	info.Provider = d.Provider
-	req, info.DroppedParams = req.Without(dropFields(sel.Dropped)...)
-	rec.dropped = info.DroppedParams
-
-	adapter := g.adapters[d.Provider].(providers.Completer)
-	creq := &providers.CompletionRequest{
-		Completion: req, UpstreamModel: d.UpstreamModel, Header: ex.Header(),
-		NoStreamUsage: !d.Capabilities.Has(schema.CapStreamUsage),
+// completionTry returns the attempt function of a legacy completion: a
+// native call on a deployment that serves completions, else the chat shim
+// with chat, the request translated (nil when only native deployments are
+// planned).
+func (g *Gateway) completionTry(ex Exchange, rec *record, req *schema.CompletionRequest, chat *schema.ChatRequest) tryFunc {
+	shim := g.chatTry(ex, rec, chat, completionShim{})
+	return func(ctx context.Context, e *planEntry, info *Info) attempt {
+		d := e.d
+		if !g.native(d) {
+			info.Shim = ShimChat
+			return shim(ctx, e, info)
+		}
+		info.Shim = ""
+		info.Provider = d.Provider
+		r, dropped := req.Without(dropFields(e.dropped)...)
+		info.DroppedParams = dropped
+		rec.dropped = dropped
+		adapter := g.adapters[d.Provider].(providers.Completer)
+		creq := &providers.CompletionRequest{
+			Completion: r, UpstreamModel: d.UpstreamModel, Header: ex.Header(),
+			NoStreamUsage: !d.Capabilities.Has(schema.CapStreamUsage),
+		}
+		if r.Stream() {
+			return g.streamAttempt(ctx, ex, rec, info, r.IncludeUsage(), nil, func(ctx context.Context) (providers.Stream, error) {
+				return adapter.CompletionStream(ctx, creq)
+			})
+		}
+		start := time.Now()
+		resp, err := adapter.Completion(ctx, creq)
+		return g.responseAttempt(ex, rec, start, resp, err, info, nil)
 	}
-	rec.upstreamStart = time.Now()
-	if req.Stream() {
-		s, err := adapter.CompletionStream(ctx, creq)
-		g.serveStream(ex, rec, s, err, info, req.IncludeUsage(), nil)
-		return
-	}
-	resp, err := adapter.Completion(ctx, creq)
-	g.serveResponse(ex, rec, resp, err, info, nil)
 }
 
 // completionShim translates chat answers into legacy text completions.

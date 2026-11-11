@@ -137,7 +137,7 @@ type (
 )
 
 // translate builds the Messages request body for req (DESIGN §6.2). It
-// returns a KindClientError *providers.Error for a request the Messages API
+// returns a KindUnsupported *providers.Error for a request the Messages API
 // cannot express, or that needs a capability the deployment lacks; nothing
 // is sent upstream then.
 func (a *Adapter) translate(req *providers.Request, stream bool) ([]byte, error) {
@@ -145,10 +145,10 @@ func (a *Adapter) translate(req *providers.Request, stream bool) ([]byte, error)
 	out := messagesRequest{Model: req.UpstreamModel, Stream: stream}
 
 	if _, ok := present(c, "functions"); ok {
-		return nil, a.clientError("functions", "the deprecated functions parameter is not supported; use tools")
+		return nil, a.unsupported("functions", "the deprecated functions parameter is not supported; use tools")
 	}
 	if _, ok := present(c, "function_call"); ok {
-		return nil, a.clientError("function_call", "the deprecated function_call parameter is not supported; use tool_choice")
+		return nil, a.unsupported("function_call", "the deprecated function_call parameter is not supported; use tool_choice")
 	}
 
 	if err := a.translateMessages(req, &out); err != nil {
@@ -172,7 +172,7 @@ func (a *Adapter) translate(req *providers.Request, stream bool) ([]byte, error)
 			many = []string{one}
 		case json.Unmarshal(raw, &many) == nil:
 		default:
-			return nil, a.clientError("stop", "stop must be a string or an array of strings")
+			return nil, a.unsupported("stop", "stop must be a string or an array of strings")
 		}
 		for _, s := range many {
 			if s != "" {
@@ -230,7 +230,7 @@ func (a *Adapter) translateMessages(req *providers.Request, out *messagesRequest
 	raw, _ := req.Chat.Field("messages")
 	var msgs []openAIMessage
 	if err := json.Unmarshal(raw, &msgs); err != nil {
-		return a.clientError("messages", "messages must be an array of message objects")
+		return a.unsupported("messages", "messages must be an array of message objects")
 	}
 	for i, m := range msgs {
 		where := fmt.Sprintf("messages[%d]", i)
@@ -259,7 +259,7 @@ func (a *Adapter) translateMessages(req *providers.Request, out *messagesRequest
 		case "tool":
 			role = "user"
 			if m.ToolCallID == "" {
-				return a.clientError("messages", "%s.tool_call_id is required", where)
+				return a.unsupported("messages", "%s.tool_call_id is required", where)
 			}
 			result := block{Type: "tool_result", ToolUseID: toolUseID(m.ToolCallID)}
 			var s string
@@ -278,9 +278,9 @@ func (a *Adapter) translateMessages(req *providers.Request, out *messagesRequest
 			}
 			blocks = []block{result}
 		case "function":
-			return a.clientError("messages", "%s: the deprecated function role is not supported; use tool messages", where)
+			return a.unsupported("messages", "%s: the deprecated function role is not supported; use tool messages", where)
 		default:
-			return a.clientError("messages", "%s.role must be system, developer, user, assistant or tool", where)
+			return a.unsupported("messages", "%s.role must be system, developer, user, assistant or tool", where)
 		}
 		if len(blocks) == 0 {
 			continue // an empty message adds nothing
@@ -292,7 +292,7 @@ func (a *Adapter) translateMessages(req *providers.Request, out *messagesRequest
 		out.Messages = append(out.Messages, message{Role: role, Content: blocks})
 	}
 	if len(out.Messages) == 0 {
-		return a.clientError("messages", "at least one user or assistant message with content is required")
+		return a.unsupported("messages", "at least one user or assistant message with content is required")
 	}
 	return nil
 }
@@ -309,7 +309,7 @@ func (a *Adapter) parseContent(raw json.RawMessage, where string) ([]openAIPart,
 	}
 	var parts []openAIPart
 	if err := json.Unmarshal(raw, &parts); err != nil {
-		return nil, a.clientError("messages", "%s.content must be a string or an array of content parts", where)
+		return nil, a.unsupported("messages", "%s.content must be a string or an array of content parts", where)
 	}
 	return parts, nil
 }
@@ -325,7 +325,7 @@ func (a *Adapter) textBlocks(raw json.RawMessage, where string) ([]block, error)
 	var out []block
 	for j, p := range parts {
 		if p.Type != "text" {
-			return nil, a.clientError("messages", "%s.content[%d]: only text parts are supported here", where, j)
+			return nil, a.unsupported("messages", "%s.content[%d]: only text parts are supported here", where, j)
 		}
 		if p.Text != "" {
 			out = append(out, block{Type: "text", Text: p.Text})
@@ -354,10 +354,10 @@ func (a *Adapter) userBlocks(raw json.RawMessage, where string, caps schema.Capa
 			}
 		case "image_url":
 			if !caps.Has(schema.CapVision) {
-				return nil, a.clientError("messages", "%s.content[%d]: this deployment does not accept images (capability vision)", where, j)
+				return nil, a.unsupported("messages", "%s.content[%d]: this deployment does not accept images (capability vision)", where, j)
 			}
 			if p.ImageURL == nil {
-				return nil, a.clientError("messages", "%s.content[%d].image_url is required", where, j)
+				return nil, a.unsupported("messages", "%s.content[%d].image_url is required", where, j)
 			}
 			src, err := a.imageSource(p.ImageURL.URL, fmt.Sprintf("%s.content[%d]", where, j))
 			if err != nil {
@@ -365,7 +365,7 @@ func (a *Adapter) userBlocks(raw json.RawMessage, where string, caps schema.Capa
 			}
 			out = append(out, block{Type: "image", Source: src})
 		default:
-			return nil, a.clientError("messages", "%s.content[%d]: content parts of type %q are not supported", where, j, safeName(p.Type))
+			return nil, a.unsupported("messages", "%s.content[%d]: content parts of type %q are not supported", where, j, safeName(p.Type))
 		}
 	}
 	return out, nil
@@ -379,17 +379,17 @@ func (a *Adapter) imageSource(u, where string) (*imageSource, error) {
 		mediaType, isBase64 := strings.CutSuffix(meta, ";base64")
 		mediaType = strings.ToLower(mediaType)
 		if !ok || !isBase64 || data == "" {
-			return nil, a.clientError("messages", "%s: an image data URL must be base64-encoded", where)
+			return nil, a.unsupported("messages", "%s: an image data URL must be base64-encoded", where)
 		}
 		if !imageMediaTypes[mediaType] {
-			return nil, a.clientError("messages", "%s: image type %q is not supported; use image/jpeg, image/png, image/gif or image/webp", where, safeName(mediaType))
+			return nil, a.unsupported("messages", "%s: image type %q is not supported; use image/jpeg, image/png, image/gif or image/webp", where, safeName(mediaType))
 		}
 		return &imageSource{Type: "base64", MediaType: mediaType, Data: data}, nil
 	}
 	if len(u) > len("https://") && strings.EqualFold(u[:len("https://")], "https://") {
 		return &imageSource{Type: "url", URL: u}, nil
 	}
-	return nil, a.clientError("messages", "%s: an image URL must be an https URL or a base64 data URL", where)
+	return nil, a.unsupported("messages", "%s: an image URL must be an https URL or a base64 data URL", where)
 }
 
 // assistantBlocks maps an assistant message: its text (and refusal) parts
@@ -397,7 +397,7 @@ func (a *Adapter) imageSource(u, where string) (*imageSource, error) {
 // parsed arguments object.
 func (a *Adapter) assistantBlocks(m openAIMessage, where string) ([]block, error) {
 	if len(m.FunctionCall) > 0 && !bytes.Equal(bytes.TrimSpace(m.FunctionCall), []byte("null")) {
-		return nil, a.clientError("messages", "%s: the deprecated function_call is not supported; use tool_calls", where)
+		return nil, a.unsupported("messages", "%s: the deprecated function_call is not supported; use tool_calls", where)
 	}
 	parts, err := a.parseContent(m.Content, where)
 	if err != nil {
@@ -411,7 +411,7 @@ func (a *Adapter) assistantBlocks(m openAIMessage, where string) ([]block, error
 		case "refusal":
 			text = p.Refusal
 		default:
-			return nil, a.clientError("messages", "%s.content[%d]: content parts of type %q are not supported", where, j, safeName(p.Type))
+			return nil, a.unsupported("messages", "%s.content[%d]: content parts of type %q are not supported", where, j, safeName(p.Type))
 		}
 		if text != "" {
 			out = append(out, block{Type: "text", Text: text})
@@ -420,14 +420,14 @@ func (a *Adapter) assistantBlocks(m openAIMessage, where string) ([]block, error
 	for j, tc := range m.ToolCalls {
 		at := fmt.Sprintf("%s.tool_calls[%d]", where, j)
 		if tc.Type != "" && tc.Type != "function" {
-			return nil, a.clientError("messages", "%s: tool calls of type %q are not supported", at, safeName(tc.Type))
+			return nil, a.unsupported("messages", "%s: tool calls of type %q are not supported", at, safeName(tc.Type))
 		}
 		if tc.ID == "" || tc.Function.Name == "" {
-			return nil, a.clientError("messages", "%s: id and function.name are required", at)
+			return nil, a.unsupported("messages", "%s: id and function.name are required", at)
 		}
 		input, ok := argumentsObject(tc.Function.Arguments)
 		if !ok {
-			return nil, a.clientError("messages", "%s.function.arguments must be a JSON object", at)
+			return nil, a.unsupported("messages", "%s.function.arguments must be a JSON object", at)
 		}
 		out = append(out, block{Type: "tool_use", ID: toolUseID(tc.ID), Name: tc.Function.Name, Input: input})
 	}
@@ -483,13 +483,13 @@ func (a *Adapter) translateTools(c *schema.ChatRequest, out *messagesRequest) er
 	for j, raw := range c.Tools() {
 		var t openAITool
 		if err := json.Unmarshal(raw, &t); err != nil || t.Function == nil {
-			return a.clientError("tools", "tools[%d] must be a function tool", j)
+			return a.unsupported("tools", "tools[%d] must be a function tool", j)
 		}
 		if t.Type != "function" {
-			return a.clientError("tools", "tools[%d]: tools of type %q are not supported", j, safeName(t.Type))
+			return a.unsupported("tools", "tools[%d]: tools of type %q are not supported", j, safeName(t.Type))
 		}
 		if t.Function.Name == "" {
-			return a.clientError("tools", "tools[%d].function.name is required", j)
+			return a.unsupported("tools", "tools[%d].function.name is required", j)
 		}
 		schemaRaw := t.Function.Parameters
 		if len(schemaRaw) == 0 || bytes.Equal(bytes.TrimSpace(schemaRaw), []byte("null")) {
@@ -525,12 +525,12 @@ func (a *Adapter) translateTools(c *schema.ChatRequest, out *messagesRequest) er
 			case "required":
 				choice.Type = "any"
 			default:
-				return a.clientError("tool_choice", "tool_choice must be auto, none, required or a function")
+				return a.unsupported("tool_choice", "tool_choice must be auto, none, required or a function")
 			}
 		case json.Unmarshal(raw, &named) == nil && named.Type == "function" && named.Function.Name != "":
 			choice = &toolChoice{Type: "tool", Name: named.Function.Name}
 		default:
-			return a.clientError("tool_choice", "tool_choice must be auto, none, required or a function")
+			return a.unsupported("tool_choice", "tool_choice must be auto, none, required or a function")
 		}
 	}
 	if raw, ok := present(c, "parallel_tool_calls"); ok && string(bytes.TrimSpace(raw)) == "false" && choice.Type != "none" {
@@ -553,7 +553,7 @@ func (a *Adapter) translateResponseFormat(req *providers.Request, out *messagesR
 	}
 	var rf openAIResponseFormat
 	if err := json.Unmarshal(raw, &rf); err != nil {
-		return a.clientError("response_format", "response_format must be an object")
+		return a.unsupported("response_format", "response_format must be an object")
 	}
 	switch rf.Type {
 	case "", "text":
@@ -561,7 +561,7 @@ func (a *Adapter) translateResponseFormat(req *providers.Request, out *messagesR
 	case "json_object":
 		// Checked for the same reason as vision in userBlocks.
 		if !req.Capabilities.Has(schema.CapJSONMode) {
-			return a.clientError("response_format", "response_format json_object needs the capability json_mode, and this deployment does not declare it")
+			return a.unsupported("response_format", "response_format json_object needs the capability json_mode, and this deployment does not declare it")
 		}
 	case "json_schema":
 		if rf.JSONSchema == nil || len(rf.JSONSchema.Schema) == 0 ||
@@ -569,13 +569,13 @@ func (a *Adapter) translateResponseFormat(req *providers.Request, out *messagesR
 			break // no schema: any JSON object will do
 		}
 		if !req.Capabilities.Has(schema.CapJSONSchema) {
-			return a.clientError("response_format",
+			return a.unsupported("response_format",
 				"response_format json_schema needs native structured output (capability json_schema), and this deployment does not declare it")
 		}
 		out.OutputConfig = &outputConfig{Format: &outputFormat{Type: "json_schema", Schema: structuredSchema(rf.JSONSchema.Schema)}}
 		return nil
 	default:
-		return a.clientError("response_format", "response_format type %q is not supported", safeName(rf.Type))
+		return a.unsupported("response_format", "response_format type %q is not supported", safeName(rf.Type))
 	}
 	out.System = append(out.System, block{Type: "text", Text: JSONObjectInstruction})
 	return nil

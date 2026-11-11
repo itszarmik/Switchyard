@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -116,7 +117,82 @@ func (st *loadState) validate(c *Config) {
 	models, modelPaths := st.validateModels(c.Models, providers)
 	st.validateAliases(c.Aliases, models, modelPaths)
 	st.validateTenants(c.Tenants)
+	st.validateRouting(&c.Routing)
 	st.checkLiteralSecrets(c)
+}
+
+// Upper bounds of the routing settings.
+const (
+	maxPlanDeployments       = 10
+	maxRetriesPerDeployment  = 5
+	maxRetryBudgetMin        = 10000
+	maxBreakerCount          = 1000000
+	maxHalfOpenProbes        = 1000
+	maxRoutingIntervalLength = 24 * time.Hour
+)
+
+func (st *loadState) validateRouting(r *Routing) {
+	st.checkDurationRange("routing.request_timeout", r.RequestTimeout, maxRoutingIntervalLength)
+	f := &r.Fallback
+	st.checkIntRange("routing.fallback.max_deployments", f.MaxDeployments, 1, maxPlanDeployments)
+	st.checkIntRange("routing.fallback.retries_per_deployment", f.RetriesPerDeployment, 0, maxRetriesPerDeployment)
+	st.checkDurationRange("routing.fallback.backoff_base", f.BackoffBase, maxRoutingIntervalLength)
+	st.checkDurationRange("routing.fallback.backoff_max", f.BackoffMax, maxRoutingIntervalLength)
+	if f.BackoffBase > 0 && f.BackoffMax > 0 && f.BackoffMax < f.BackoffBase {
+		st.errorAt("routing.fallback.backoff_max", "must not be less than routing.fallback.backoff_base")
+	}
+	st.checkRatio("routing.fallback.retry_budget_ratio", f.RetryBudgetRatio)
+	st.checkIntRange("routing.fallback.retry_budget_min", f.RetryBudgetMin, 0, maxRetryBudgetMin)
+
+	b := &r.Breaker
+	st.checkIntRange("routing.breaker.consecutive_failures", b.ConsecutiveFailures, 1, maxBreakerCount)
+	st.checkRatio("routing.breaker.failure_ratio", b.FailureRatio)
+	st.checkIntRange("routing.breaker.min_requests", b.MinRequests, 1, maxBreakerCount)
+	st.checkDurationRange("routing.breaker.window", b.Window, maxRoutingIntervalLength)
+	st.checkDurationRange("routing.breaker.open_for", b.OpenFor, maxRoutingIntervalLength)
+	st.checkIntRange("routing.breaker.half_open_probes", b.HalfOpenProbes, 1, maxHalfOpenProbes)
+
+	c := &r.RateLimitCooldown
+	st.checkDurationRange("routing.rate_limit_cooldown.default", c.Default, maxRoutingIntervalLength)
+	st.checkDurationRange("routing.rate_limit_cooldown.max", c.Max, maxRoutingIntervalLength)
+	if c.Default > 0 && c.Max > 0 && c.Default > c.Max {
+		st.errorAt("routing.rate_limit_cooldown.default", "must not be greater than routing.rate_limit_cooldown.max")
+	}
+	switch {
+	case r.StreamKeepalive < 0:
+		st.errorAt("routing.stream_keepalive", "must not be negative; use 0s to turn keep-alives off")
+	case r.StreamKeepalive > 0 && r.StreamKeepalive < Duration(minStreamKeepalive):
+		st.errorAt("routing.stream_keepalive", fmt.Sprintf("must be 0s (off) or at least %s", minStreamKeepalive))
+	case time.Duration(r.StreamKeepalive) > maxRoutingIntervalLength:
+		st.errorAt("routing.stream_keepalive", fmt.Sprintf("must be at most %s", maxRoutingIntervalLength))
+	}
+}
+
+// minStreamKeepalive keeps keep-alives from flooding the client.
+const minStreamKeepalive = 10 * time.Millisecond
+
+// checkIntRange reports an error unless lo <= v <= hi.
+func (st *loadState) checkIntRange(path string, v, lo, hi int) {
+	if v < lo || v > hi {
+		st.errorAt(path, fmt.Sprintf("must be between %d and %d, got %d", lo, hi, v))
+	}
+}
+
+// checkDurationRange reports an error unless 0 < d <= hi.
+func (st *loadState) checkDurationRange(path string, d Duration, hi time.Duration) {
+	switch {
+	case d <= 0:
+		st.errorAt(path, "must be greater than 0")
+	case time.Duration(d) > hi:
+		st.errorAt(path, fmt.Sprintf("must be at most %s", hi))
+	}
+}
+
+// checkRatio reports an error unless 0 < v <= 1.
+func (st *loadState) checkRatio(path string, v float64) {
+	if v <= 0 || v > 1 {
+		st.errorAt(path, fmt.Sprintf("must be greater than 0 and at most 1, got %s", strconv.FormatFloat(v, 'g', -1, 64)))
+	}
 }
 
 func (st *loadState) validateServer(s *Server) {
@@ -134,6 +210,7 @@ func (st *loadState) validateServer(s *Server) {
 	st.checkByteRange("server.max_header_bytes", s.MaxHeaderBytes, 4*kib, mib)
 	st.checkPositive("server.read_header_timeout", s.ReadHeaderTimeout)
 	st.checkPositive("server.body_read_timeout", s.BodyReadTimeout)
+	st.checkPositive("server.write_timeout", s.WriteTimeout)
 	st.checkPositive("server.idle_timeout", s.IdleTimeout)
 	st.checkPositive("server.shutdown_grace", s.ShutdownGrace)
 	if s.ShutdownDelay < 0 {

@@ -67,6 +67,8 @@ func TestChatPassthrough(t *testing.T) {
 		"X-Switchyard-Model":               "gpt-test",
 		"X-Switchyard-Provider":            "fake",
 		"X-Switchyard-Upstream-Request-Id": "req-up-1",
+		"X-Switchyard-Attempts":            "1",
+		"X-Switchyard-Route-Reason":        "cheapest_eligible",
 		"Openai-Processing-Ms":             "", // upstream headers are not copied
 	} {
 		if v := resp.Header.Get(k); v != want {
@@ -166,6 +168,8 @@ func TestChatStream(t *testing.T) {
 				"X-Switchyard-Model":               "gpt-test",
 				"X-Switchyard-Provider":            "fake",
 				"X-Switchyard-Upstream-Request-Id": "req-up-1",
+				"X-Switchyard-Attempts":            "1",
+				"X-Switchyard-Route-Reason":        "cheapest_eligible",
 			} {
 				if v := resp.Header.Get(k); v != want {
 					t.Errorf("header %s = %q, want %q", k, v, want)
@@ -355,7 +359,7 @@ func TestUpstreamErrors(t *testing.T) {
 		outcome    string
 	}{
 		{name: "400 envelope", status: 400, body: envelope, wantStatus: 400, wantBody: envelope, outcome: "client_error"},
-		{name: "404 envelope", status: 404, body: envelope, wantStatus: 404, wantBody: envelope, outcome: "client_error"},
+		{name: "404 envelope", status: 404, body: envelope, wantStatus: 404, wantBody: envelope, outcome: "not_found"},
 		{name: "422 envelope", status: 422, body: envelope, wantStatus: 422, wantBody: envelope, outcome: "client_error"},
 		{name: "400 not an envelope", status: 400, body: "<html>bad</html>", wantStatus: 400, wantCode: "upstream_error", wantType: "invalid_request_error", outcome: "client_error"},
 		{
@@ -456,9 +460,9 @@ func TestUpstreamUnreachableAndTimeouts(t *testing.T) {
 			wantStatus: http.StatusBadGateway, wantCode: "upstream_error", outcome: "transport",
 		},
 		{
-			name:       "first_token, no headers",
+			name:       "total, no headers",
 			handler:    func(u *upstream, _ http.ResponseWriter, r *http.Request) { u.hang(r) },
-			mutate:     func(c *config.Config) { c.Providers[0].Timeouts.FirstToken = config.Duration(short) },
+			mutate:     func(c *config.Config) { c.Providers[0].Timeouts.Total = config.Duration(short) },
 			wantStatus: http.StatusGatewayTimeout, wantCode: "timeout", outcome: "timeout",
 		},
 		{

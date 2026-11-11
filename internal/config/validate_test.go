@@ -85,7 +85,7 @@ func TestValidationRules(t *testing.T) {
 		{"header bytes too large", v1 + "server: {max_header_bytes: 2MiB}\n", []want{errAt("server.max_header_bytes", "must be between 4KiB and 1MiB")}},
 
 		// durations (zero means default; negatives are rejected when parsed)
-		{"timeouts set", v1 + "server: {read_header_timeout: 1s, body_read_timeout: 30s, idle_timeout: 1m, shutdown_grace: 5s, shutdown_delay: 3s}\n", nil},
+		{"timeouts set", v1 + "server: {read_header_timeout: 1s, body_read_timeout: 30s, write_timeout: 2m, idle_timeout: 1m, shutdown_grace: 5s, shutdown_delay: 3s}\n", nil},
 		{"zero timeout takes the default", v1 + "server: {idle_timeout: 0s}\n", nil},
 		{"negative timeout", v1 + "server: {shutdown_grace: -1s}\n", []want{errAt("server.shutdown_grace", "must not be negative")}},
 		{"negative delay", v1 + "server: {shutdown_delay: -1s}\n", []want{errAt("server.shutdown_delay", "must not be negative")}},
@@ -261,9 +261,10 @@ func TestValidationRules(t *testing.T) {
 // parsed, so they are exercised on a Config directly.
 func TestValidateUnreachableRules(t *testing.T) {
 	cfg := &Config{Version: 1, Providers: []Provider{{ID: "a", Type: "openai", BaseURL: "https://a.example"}}}
-	applyDefaults(cfg)
+	applyDefaults(cfg, nil)
 	cfg.Server.ReadHeaderTimeout = 0
 	cfg.Server.BodyReadTimeout = 0
+	cfg.Server.WriteTimeout = 0
 	cfg.Server.IdleTimeout = 0
 	cfg.Server.ShutdownGrace = 0
 	cfg.Server.ShutdownDelay = -1
@@ -277,6 +278,7 @@ func TestValidateUnreachableRules(t *testing.T) {
 	checkProblems(t, st.problems,
 		errAt("server.read_header_timeout", "greater than 0"),
 		errAt("server.body_read_timeout", "greater than 0"),
+		errAt("server.write_timeout", "greater than 0"),
 		errAt("server.idle_timeout", "greater than 0"),
 		errAt("server.shutdown_grace", "greater than 0"),
 		errAt("server.shutdown_delay", "must not be negative"),

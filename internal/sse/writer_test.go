@@ -93,3 +93,25 @@ func FuzzRoundTrip(f *testing.F) {
 		}
 	})
 }
+
+func TestWriterComment(t *testing.T) {
+	for _, tt := range []struct{ text, want string }{
+		{"keep-alive", ": keep-alive\n\n"},
+		{"two\nlines\r", ": two lines \n\n"},
+	} {
+		var buf bytes.Buffer
+		flushes := 0
+		w := NewWriter(&buf, func() error { flushes++; return nil })
+		if err := w.WriteComment(tt.text); err != nil {
+			t.Fatalf("WriteComment: %v", err)
+		}
+		if got := buf.String(); got != tt.want || flushes != 1 {
+			t.Errorf("wrote %q with %d flushes, want %q and 1", got, flushes, tt.want)
+		}
+		// A reader skips it.
+		r := NewReader(strings.NewReader(buf.String()+"data: x\n\n"), ReaderOptions{})
+		if ev, err := r.Next(); err != nil || string(ev.Data) != "x" {
+			t.Errorf("reader got %q, %v", ev.Data, err)
+		}
+	}
+}

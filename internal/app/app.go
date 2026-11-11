@@ -4,7 +4,8 @@
 //
 // The public listener serves the built-in health routes without
 // authentication and the OpenAI-compatible /v1 routes behind the API key
-// middleware.
+// middleware. The admin listener adds GET /admin/v1/providers, the
+// deployments' health, to its built-in routes.
 package app
 
 import (
@@ -83,12 +84,16 @@ func New(snap *config.Snapshot, logOutput io.Writer) (*App, error) {
 	}
 	store := auth.NewStore(cfg.Tenants)
 	authenticate := auth.Middleware(store)
-	routes := openaiapi.Routes(gw, openaiapi.Options{BodyReadTimeout: cfg.Server.BodyReadTimeout.Std()})
+	routes := openaiapi.Routes(gw, openaiapi.Options{
+		BodyReadTimeout: cfg.Server.BodyReadTimeout.Std(),
+		WriteTimeout:    cfg.Server.WriteTimeout.Std(),
+	})
 	for _, r := range routes {
 		// Instrument goes outside authentication, so that rejected
 		// requests count in the API metrics too.
 		srv.Handle(r.Pattern, gw.Instrument(r.Endpoint, authenticate(r.Handler)))
 	}
+	srv.HandleAdmin("GET /admin/v1/providers", gw.ProvidersHandler())
 
 	logger.Info("config loaded",
 		"config_version", snap.Version(),

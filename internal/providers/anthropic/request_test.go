@@ -324,7 +324,7 @@ func TestTranslateRequestErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := a.translate(request(t, tt.body, tt.caps...), false)
-			pe := wantKind(t, err, providers.KindClientError)
+			pe := wantKind(t, err, providers.KindUnsupported)
 			if pe.Status != 400 {
 				t.Errorf("status = %d, want 400", pe.Status)
 			}

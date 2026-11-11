@@ -223,6 +223,7 @@ func (x *recExchange) RespondError(info Info, e *Error) {
 	x.res.info, x.res.status, x.res.err = info, e.Status, e
 }
 func (x *recExchange) StartStream(info Info) error { x.res.info, x.res.status = info, 200; return nil }
+func (x *recExchange) Comment(string) error        { return nil }
 func (x *recExchange) Send(data []byte) error {
 	x.res.events = append(x.res.events, string(data))
 	return nil

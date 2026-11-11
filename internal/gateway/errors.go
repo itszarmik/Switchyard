@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"switchyard/internal/apierror"
 	"switchyard/internal/catalog"
@@ -18,6 +19,8 @@ const (
 	codeModelNotFound   = "model_not_found"
 	codeModelNotSupport = "model_not_supported"
 	codeNoEligible      = "no_eligible_model"
+	codeNoHealthy       = "no_healthy_upstream"
+	codeInvalidTimeout  = "invalid_timeout"
 	codeUpstreamError   = "upstream_error"
 	codeTimeout         = "timeout"
 	codeRateLimited     = "rate_limit_exceeded"
@@ -79,6 +82,38 @@ func noEligibleModel(model string, exclusions []catalog.Exclusion) *Error {
 	}
 }
 
+// noHealthyUpstream is the answer when every deployment that could serve
+// the request was skipped for its health: an open breaker, a rate-limit
+// cooldown or a saturated provider. The message names each one and why.
+func noHealthyUpstream(model string, exclusions []catalog.Exclusion) *Error {
+	parts := make([]string, len(exclusions))
+	for i, x := range exclusions {
+		parts[i] = x.Deployment + " (" + x.Reason + ")"
+	}
+	return &Error{
+		Status: http.StatusServiceUnavailable, Type: apierror.TypeServer, Code: codeNoHealthy,
+		Message: fmt.Sprintf("No deployment of the model `%s` is available right now: %s.", model, strings.Join(parts, "; ")),
+	}
+}
+
+// deadlineExceeded is the answer when the request's deadline expired
+// before any upstream answered.
+func deadlineExceeded(d time.Duration) *Error {
+	return &Error{
+		Status: http.StatusGatewayTimeout, Type: apierror.TypeServer, Code: codeTimeout,
+		Message: fmt.Sprintf("The request did not complete within its deadline of %s.", d),
+	}
+}
+
+// invalidTimeout is the answer for an unusable X-Switchyard-Timeout-Ms.
+func invalidTimeout() *Error {
+	return &Error{
+		Status: http.StatusBadRequest, Type: apierror.TypeInvalidRequest, Code: codeInvalidTimeout,
+		Param:   HeaderTimeoutMs,
+		Message: "The " + HeaderTimeoutMs + " header must be a positive whole number of milliseconds.",
+	}
+}
+
 // badUpstreamResponse is the answer when a successful upstream response
 // cannot be translated for the client.
 func badUpstreamResponse() *Error {
@@ -90,23 +125,27 @@ func badUpstreamResponse() *Error {
 
 // upstreamError maps an adapter failure onto the response the client gets.
 //
-//   - 4xx other than 401/403: the upstream status, with the upstream body
-//     if it is an error envelope and a generic envelope otherwise; 429
-//     keeps Retry-After.
-//   - 401/403: 502 with a generic message. The upstream body is never
-//     echoed; it can contain fragments of our credential.
+//   - the kinds that pass through (rate_limited, not_found,
+//     context_length, content_filter, client_error): the upstream status,
+//     with the upstream body if it is an error envelope and a generic
+//     envelope otherwise; 429 keeps Retry-After.
+//   - auth (401/402/403): 502 with a generic message. The upstream body is
+//     never echoed; it can contain fragments of our credential.
 //   - 5xx and malformed streams: 502 naming the upstream status.
 //   - connection errors: 502.
-//   - first-token or total timeout: 504.
+//   - timeouts: 504.
 //   - client cancellation: 499.
 func upstreamError(err error) *Error {
 	var pe *providers.Error
 	if !errors.As(err, &pe) {
 		pe = &providers.Error{Kind: providers.KindTransport, Message: "connection to the upstream failed"}
 	}
-	switch pe.Kind {
-	case providers.KindClientError, providers.KindRateLimited:
+	switch {
+	case pe.Kind.PassesThrough():
 		e := &Error{Status: pe.Status, RetryAfter: pe.RetryAfter, Body: pe.Body}
+		if e.Status == 0 {
+			e.Status = http.StatusBadGateway
+		}
 		if e.Body == nil {
 			e.Type = apierror.TypeInvalidRequest
 			e.Code = codeUpstreamError
@@ -118,23 +157,23 @@ func upstreamError(err error) *Error {
 			}
 		}
 		return e
-	case providers.KindAuth:
+	case pe.Kind == providers.KindAuth:
 		return &Error{
 			Status: http.StatusBadGateway, Type: apierror.TypeServer, Code: codeUpstreamError,
 			Message: "The upstream provider could not authenticate the gateway.",
 		}
-	case providers.KindServerError:
+	case pe.Kind == providers.KindServerError:
 		msg := fmt.Sprintf("The upstream provider failed: %s.", pe.Message)
 		if pe.Status != 0 {
 			msg = fmt.Sprintf("The upstream provider returned HTTP %d.", pe.Status)
 		}
 		return &Error{Status: http.StatusBadGateway, Type: apierror.TypeServer, Code: codeUpstreamError, Message: msg}
-	case providers.KindTimeout:
+	case pe.Kind == providers.KindTimeout:
 		return &Error{
 			Status: http.StatusGatewayTimeout, Type: apierror.TypeServer, Code: codeTimeout,
 			Message: fmt.Sprintf("The upstream provider did not respond in time: %s.", pe.Message),
 		}
-	case providers.KindCanceled:
+	case pe.Kind == providers.KindCanceled:
 		return &Error{
 			Status: StatusClientClosedRequest, Type: apierror.TypeInvalidRequest, Code: codeCanceled,
 			Message: "The request was canceled by the client.",

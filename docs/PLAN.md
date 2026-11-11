@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P2 complete** and committed on `main`. Next: P3. CI and the live smoke tests have not run yet. |
+| Status | Design approved. **P0–P3 complete** and committed on `main`. Next: P4. CI and the live smoke tests have not run yet. |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -183,15 +183,34 @@ The access log and completion log are now one line per request (DESIGN §15.1). 
 
 **Acceptance** (all tested against scripted fake upstreams)
 
-- [ ] When the primary returns 503, the fallback serves the request and the client sees 200. Headers and logs show the chain.
-- [ ] A 429 with `Retry-After: 1` is retried after at least 1 s when the deadline allows. Otherwise the next candidate is tried immediately.
-- [ ] A 400 is never retried or failed over: exactly one upstream call is made.
-- [ ] Refusals and content-filter responses are never retried on another provider.
-- [ ] Nothing is retried after the first byte has been sent. If the upstream drops mid-stream, the client's stream ends with an error event that the SDK raises.
-- [ ] A breaker opens after the configured number of failures, traffic shifts away, and a half-open probe restores it.
-- [ ] Total request time never exceeds the deadline by more than 50 ms.
-- [ ] In a full-outage simulation, retries stay within the retry budget, with no amplification beyond the configured ratio.
-- [ ] When a self-hosted deployment reaches `max_concurrency`, traffic spills over to the next cheapest deployment.
+- [x] When the primary returns 503, the fallback serves the request and the client sees 200. Headers and logs show the chain.
+- [x] A 429 with `Retry-After: 1` is retried after at least 1 s when the deadline allows. Otherwise the next candidate is tried immediately.
+- [x] A 400 is never retried or failed over: exactly one upstream call is made.
+- [x] Refusals and content-filter responses are never retried on another provider.
+- [x] Nothing is retried after the first byte has been sent. If the upstream drops mid-stream, the client's stream ends with an error event that the SDK raises.
+- [x] A breaker opens after the configured number of failures, traffic shifts away, and a half-open probe restores it.
+- [x] Total request time never exceeds the deadline by more than 50 ms.
+- [x] In a full-outage simulation, retries stay within the retry budget, with no amplification beyond the configured ratio.
+- [x] When a self-hosted deployment reaches `max_concurrency`, traffic spills over to the next cheapest deployment.
+
+**P3 outcome.**
+
+All nine criteria pass. Each has its own test that runs the real binary against scripted fake upstreams.
+
+Independent security and correctness reviews found 9 issues, and all are fixed with regression tests. The main ones:
+
+- A slow-reading client could trip a deployment's circuit breaker for every tenant. The idle timer now measures only time spent waiting on the upstream.
+- Long non-streaming generations hit the first-token timeout and triggered repeated, billed retries. Non-streaming calls are now bounded by the total timeout, and a total timeout is never retried on the same deployment.
+- An Anthropic-side translation limit stopped fallback to other providers.
+- A panic could leak concurrency slots and half-open probe slots.
+
+The rules that came out of the fixes:
+
+- A half-open probe is released, and the breaker closed, at the first event.
+- Genuine upstream failures after the first event still count toward the breaker.
+- A total timeout or a slow client after the first event does not count.
+
+Overhead is about +0.1 ms p99 against P2, measured alternating with the P2 build. The noisy machine fails the 5 ms gate for both builds.
 
 ## P4: Cost accounting, ledger and budgets
 

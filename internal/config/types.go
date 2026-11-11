@@ -53,6 +53,11 @@ type Server struct {
 	// BodyReadTimeout bounds how long a client may take to send a request
 	// body to an API endpoint; a slower one gets 408. Default 60s.
 	BodyReadTimeout Duration `yaml:"body_read_timeout"`
+	// WriteTimeout bounds each write to an API client: a whole JSON
+	// response, or one streamed event. A client that stops reading cannot
+	// hold its request, and the upstream call behind it, longer. Default
+	// 60s.
+	WriteTimeout Duration `yaml:"write_timeout"`
 	// IdleTimeout closes idle keep-alive connections. Default 120s.
 	IdleTimeout Duration `yaml:"idle_timeout"`
 	// ShutdownDelay is how long the server keeps serving after SIGTERM while
@@ -127,9 +132,14 @@ type Provider struct {
 type ProviderTimeouts struct {
 	// Connect bounds TCP and TLS connection setup. Default 5s.
 	Connect Duration `yaml:"connect"`
-	// FirstToken bounds the wait for the first response byte. Default 30s.
+	// FirstToken bounds a stream's wait for its first event. It applies to
+	// streams only: a non-streaming response arrives only after the whole
+	// generation, so Total and the request's deadline bound it instead.
+	// Default 30s.
 	FirstToken Duration `yaml:"first_token"`
-	// Idle bounds the gap between streamed chunks. Default 60s.
+	// Idle bounds the gap between streamed chunks, measured only while
+	// the gateway waits for the upstream, not while it writes to its
+	// client. Default 60s.
 	Idle Duration `yaml:"idle"`
 	// Total bounds the whole upstream call, including the full streamed
 	// response. Default 10m.
@@ -236,6 +246,73 @@ type Routing struct {
 	// removed for a deployment without capability sampling whatever this
 	// says.
 	DropUnsupportedParams bool `yaml:"drop_unsupported_params"`
+	// RequestTimeout is the whole-request deadline, across every attempt,
+	// backoff and the full streamed response. A client's
+	// X-Switchyard-Timeout-Ms header can only lower it. Default 10m.
+	RequestTimeout Duration `yaml:"request_timeout"`
+	// Fallback bounds retries and fallback plans (DESIGN §14.2, §14.3).
+	Fallback Fallback `yaml:"fallback"`
+	// Breaker configures the per-deployment circuit breakers (§14.4).
+	Breaker Breaker `yaml:"breaker"`
+	// RateLimitCooldown is how long a deployment is skipped after a 429.
+	RateLimitCooldown RateLimitCooldown `yaml:"rate_limit_cooldown"`
+	// StreamKeepalive, when positive, commits a streaming response that
+	// has not received its first upstream event after this long: the
+	// gateway sends 200, the SSE headers and a ": keep-alive" comment,
+	// repeated at this interval until the first event. After the first
+	// keep-alive no fallback is possible, and a failure becomes an error
+	// event in the stream. Default 0s (off).
+	StreamKeepalive Duration `yaml:"stream_keepalive"`
+}
+
+// Fallback bounds the attempts the gateway makes for one request.
+type Fallback struct {
+	// MaxDeployments is the plan length: the primary deployment plus its
+	// fallbacks, 1 to 10. Default 3.
+	MaxDeployments int `yaml:"max_deployments"`
+	// RetriesPerDeployment is how many times a deployment is retried after
+	// a retryable failure before the next one is tried, 0 to 5. Default 1.
+	RetriesPerDeployment int `yaml:"retries_per_deployment"`
+	// BackoffBase and BackoffMax shape the exponential backoff with full
+	// jitter before retry n: a random sleep in [0, min(max, base×2^n)].
+	// Defaults 250ms and 2s.
+	BackoffBase Duration `yaml:"backoff_base"`
+	BackoffMax  Duration `yaml:"backoff_max"`
+	// RetryBudgetRatio caps the retries to one deployment at this fraction
+	// of its requests over a sliding 10 s window, in (0, 1]. Default 0.2.
+	RetryBudgetRatio float64 `yaml:"retry_budget_ratio"`
+	// RetryBudgetMin is the number of retries per window that are always
+	// allowed, whatever the ratio says. Default 5.
+	RetryBudgetMin int `yaml:"retry_budget_min"`
+}
+
+// Breaker configures a deployment's circuit breaker. It opens after
+// ConsecutiveFailures failures in a row, or when at least MinRequests
+// requests within Window failed at a ratio of at least FailureRatio. It
+// stays open for OpenFor, then lets HalfOpenProbes concurrent probes
+// through: one success closes it, one failure opens it again.
+type Breaker struct {
+	// ConsecutiveFailures, default 5.
+	ConsecutiveFailures int `yaml:"consecutive_failures"`
+	// FailureRatio, in (0, 1]. Default 0.5.
+	FailureRatio float64 `yaml:"failure_ratio"`
+	// MinRequests, default 20.
+	MinRequests int `yaml:"min_requests"`
+	// Window, default 30s.
+	Window Duration `yaml:"window"`
+	// OpenFor, default 30s.
+	OpenFor Duration `yaml:"open_for"`
+	// HalfOpenProbes, default 3.
+	HalfOpenProbes int `yaml:"half_open_probes"`
+}
+
+// RateLimitCooldown is how long a deployment is skipped after a 429:
+// min(Retry-After, or Default without one, Max).
+type RateLimitCooldown struct {
+	// Default applies to a 429 without Retry-After. Default 1s.
+	Default Duration `yaml:"default"`
+	// Max caps the cooldown. Default 30s.
+	Max Duration `yaml:"max"`
 }
 
 // Secret holds a sensitive value such as an API key, a DSN or a URL that may

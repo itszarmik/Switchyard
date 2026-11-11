@@ -833,3 +833,60 @@ func TestDelays(t *testing.T) {
 		t.Errorf("non-streaming response after %s, want at least the %s TTFT", d, ttft)
 	}
 }
+
+func TestSequenceAndHold(t *testing.T) {
+	s := newServer(t, fakeupstream.Options{})
+	s.Script(fakeupstream.Behavior{Status: 500})
+	s.Sequence(fakeupstream.Behavior{Status: 503}, fakeupstream.RateLimited("1"), fakeupstream.Behavior{})
+	for i, want := range []int{503, 429, 200, 500, 500} {
+		if r := post(t, s, requestBody("m", i%2 == 0, "")); r.status != want {
+			t.Errorf("request %d: status %d, want %d", i, r.status, want)
+		}
+	}
+	s.Reset()
+	s.Sequence(fakeupstream.Behavior{Status: 503})
+	s.Reset() // drops the sequence
+	if r := post(t, s, requestBody("m", false, "")); r.status != 200 {
+		t.Errorf("after Reset: status %d", r.status)
+	}
+
+	release := make(chan struct{})
+	s.Script(fakeupstream.Behavior{Hold: release})
+	done := make(chan int, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+		defer cancel()
+		r, err := do(ctx, t, http.MethodPost, s.BaseURL()+"/chat/completions", "", requestBody("m", false, ""))
+		if err != nil {
+			done <- 0
+			return
+		}
+		done <- r.status
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+	defer cancel()
+	if err := s.WaitReceived(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+		t.Fatal("a held request was answered")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if status := <-done; status != 200 {
+		t.Errorf("released request: status %d", status)
+	}
+}
+
+func TestFinishReason(t *testing.T) {
+	s := newServer(t, fakeupstream.Options{})
+	s.Script(fakeupstream.Behavior{FinishReason: "content_filter"})
+	for _, stream := range []bool{false, true} {
+		r := post(t, s, requestBody("m", stream, ""))
+		if r.status != 200 || !strings.Contains(string(r.body), `"finish_reason":"content_filter"`) ||
+			strings.Contains(string(r.body), `"finish_reason":"stop"`) {
+			t.Errorf("stream=%v: %d %s", stream, r.status, r.body)
+		}
+	}
+}

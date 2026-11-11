@@ -407,10 +407,48 @@ func TestAPIRequestsCounted(t *testing.T) {
 	for _, want := range []string{
 		`switchyard_requests_total{endpoint="/v1/chat/completions",status_class="4xx"} 4`,
 		`switchyard_request_duration_seconds_count{endpoint="/v1/chat/completions",stream="false"} 4`,
+		`switchyard_circuit_state{deployment="gpt-5-mini@openai"} 0`,
+		`switchyard_provider_in_flight{provider="openai"} 0`,
 	} {
 		if !strings.Contains(string(metrics), want) {
 			t.Errorf("/metrics has no %s", want)
 		}
+	}
+
+	// The provider report is served on the admin listener only, without
+	// secrets.
+	resp, err = c.Get(r.admin + "/admin/v1/providers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var rep struct {
+		Providers []struct {
+			ID          string
+			Deployments []struct {
+				ID      string
+				Breaker struct{ State string }
+			}
+		}
+	}
+	if resp.StatusCode != http.StatusOK || json.Unmarshal(report, &rep) != nil || len(rep.Providers) != 2 ||
+		rep.Providers[1].ID != "openai" || len(rep.Providers[1].Deployments) != 1 ||
+		rep.Providers[1].Deployments[0].Breaker.State != "closed" {
+		t.Errorf("/admin/v1/providers: status %d, body %s", resp.StatusCode, report)
+	}
+	for _, secret := range secrets {
+		if strings.Contains(string(report), secret) {
+			t.Errorf("/admin/v1/providers contains a secret: %s", report)
+		}
+	}
+	resp, err = c.Get(r.public + "/admin/v1/providers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("public /admin/v1/providers: status %d, want 404", resp.StatusCode)
 	}
 	r.stop(t)
 

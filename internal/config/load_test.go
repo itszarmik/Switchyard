@@ -42,6 +42,7 @@ func TestLoadHappyPath(t *testing.T) {
 			MaxHeaderBytes:    64 * kib,
 			ReadHeaderTimeout: Duration(10 * time.Second),
 			BodyReadTimeout:   Duration(60 * time.Second),
+			WriteTimeout:      Duration(60 * time.Second),
 			IdleTimeout:       Duration(120 * time.Second),
 			ShutdownGrace:     Duration(60 * time.Second),
 		},
@@ -87,6 +88,7 @@ func TestLoadHappyPath(t *testing.T) {
 			}},
 			{ID: "beta", Keys: []APIKey{{ID: "beta-1", Hash: "sha256:" + strings.Repeat("a", 64)}}},
 		},
+		Routing: DefaultRouting(),
 	}
 	if diff := cmp.Diff(want, cfg, cmp.Comparer(func(a, b Secret) bool { return a.Value() == b.Value() })); diff != "" {
 		t.Errorf("Config mismatch (-want +got):\n%s", diff)

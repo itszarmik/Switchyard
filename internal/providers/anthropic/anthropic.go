@@ -168,14 +168,15 @@ func New(p config.Provider) (*Adapter, error) {
 func (a *Adapter) CloseIdleConnections() { a.client.CloseIdleConnections() }
 
 // Chat implements providers.Adapter. The response body is a chat.completion
-// translated from the upstream Message. first_token bounds the wait for the
-// response headers, and total bounds the whole call including the body.
+// translated from the upstream Message. total bounds the whole call
+// including the body. first_token does not apply: the response headers
+// arrive only after the whole generation.
 func (a *Adapter) Chat(ctx context.Context, req *providers.Request) (*providers.Response, error) {
 	body, err := a.translate(req, false)
 	if err != nil {
 		return nil, err
 	}
-	c := a.newCall(ctx)
+	c := a.newCall(ctx, false)
 	defer c.stop()
 
 	resp, err := a.do(c, req, body, false)
@@ -184,7 +185,6 @@ func (a *Adapter) Chat(ctx context.Context, req *providers.Request) (*providers.
 	}
 	defer func() { _ = resp.Body.Close() }()
 	ttft := time.Since(c.start)
-	c.phase.Stop() // the first token has arrived; total still applies
 	rid := a.requestID(resp.Header)
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -219,7 +219,7 @@ func (a *Adapter) ChatStream(ctx context.Context, req *providers.Request) (provi
 	if err != nil {
 		return nil, err
 	}
-	c := a.newCall(ctx)
+	c := a.newCall(ctx, true)
 	resp, err := a.do(c, req, body, true)
 	if err != nil {
 		c.stop()
@@ -279,14 +279,22 @@ func (a *Adapter) do(c *call, req *providers.Request, body []byte, stream bool) 
 	return resp, nil
 }
 
+// promptTooLong is the lower-cased start of the message of Anthropic's 400
+// for a request that exceeds the context window, such as "prompt is too
+// long: 210000 tokens > 200000 maximum".
+const promptTooLong = "prompt is too long"
+
 // statusError turns a non-2xx response into an error.
 //
 //   - 401, 402 and 403 are the gateway's own credential or account
 //     problem (KindAuth). Their body is never read: it may echo parts of
 //     the key, and the client has no use for it.
-//   - 429 is KindRateLimited with Retry-After; other 4xx are
-//     KindClientError. Both keep the Anthropic error, re-shaped into an
-//     OpenAI envelope, unless it contains the provider key.
+//   - 429 is KindRateLimited with Retry-After; 404 is KindNotFound; 413,
+//     and a 400 whose message says the prompt is too long, are
+//     KindContextLength; other 4xx are KindClientError. All of them keep
+//     the Anthropic error, re-shaped into an OpenAI envelope, unless it
+//     contains the provider key. (Anthropic refusals are not errors: they
+//     arrive as a 200 with stop_reason refusal.)
 //   - 5xx, 529 overloaded_error included, and anything else are
 //     KindServerError, without the body.
 //
@@ -314,6 +322,13 @@ func (a *Adapter) statusError(resp *http.Response, rid string) *providers.Error 
 		e.Kind = providers.KindRateLimited
 		e.Message = "upstream rate limit reached (HTTP 429)" + suffix
 		e.RetryAfter = retryAfter(resp.Header, time.Now())
+	case code == http.StatusNotFound:
+		e.Kind = providers.KindNotFound
+		e.Message = "upstream does not know the model (HTTP 404)" + suffix
+	case code == http.StatusRequestEntityTooLarge ||
+		(code == http.StatusBadRequest && env != nil && strings.Contains(strings.ToLower(env.Error.Message), promptTooLong)):
+		e.Kind = providers.KindContextLength
+		e.Message = fmt.Sprintf("request exceeds the model's context window (HTTP %d)%s", code, suffix)
 	case code >= 400 && code <= 499:
 		e.Kind = providers.KindClientError
 		e.Message = fmt.Sprintf("upstream rejected the request (HTTP %d)%s", code, suffix)
@@ -353,13 +368,15 @@ func (a *Adapter) containsKey(b []byte) bool {
 	return a.apiKey != "" && bytes.Contains(b, []byte(a.apiKey))
 }
 
-// clientError is a request the adapter rejects before calling the
-// upstream, because it cannot be expressed in the Messages API. It is
-// answered like an upstream 400, with an OpenAI envelope naming param.
-func (a *Adapter) clientError(param, format string, args ...any) *providers.Error {
+// unsupported is a request the adapter rejects before calling the
+// upstream, because it cannot be expressed in the Messages API (or needs a
+// capability the deployment lacks). Its kind is KindUnsupported, so the
+// request falls back to a deployment that may serve it; if none does, it
+// is answered like an upstream 400, with an OpenAI envelope naming param.
+func (a *Adapter) unsupported(param, format string, args ...any) *providers.Error {
 	msg := fmt.Sprintf(format, args...)
 	return &providers.Error{
-		Kind: providers.KindClientError, Status: http.StatusBadRequest, Provider: a.id,
+		Kind: providers.KindUnsupported, Status: http.StatusBadRequest, Provider: a.id,
 		Message: "request cannot be sent to an Anthropic deployment: " + msg,
 		Body:    openAIEnvelope(msg, "invalid_request_error", param, "invalid_value"),
 	}

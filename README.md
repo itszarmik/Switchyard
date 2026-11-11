@@ -7,7 +7,7 @@ Switchyard is a cost-aware, OpenAI-compatible LLM inference gateway written in G
 
 ## Status
 
-**Phase 2: catalog and multi-provider adapters.** Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment of the requested model that has every capability the request needs, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Fallback, budgets, cost-aware model choice and caching come in later phases ([docs/PLAN.md](docs/PLAN.md)).
+**Phase 3: reliability.** Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment of the requested model that has every capability the request needs, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Budgets, cost-aware model choice and caching come in later phases ([docs/PLAN.md](docs/PLAN.md)).
 
 ## Quickstart
 
@@ -269,14 +269,16 @@ curl -N localhost:8080/v1/chat/completions \
 |---|---|
 | `X-Request-Id` | The gateway's request ID, also in every log line for the request. |
 | `X-Switchyard-Model` | The catalog model that served the request. |
-| `X-Switchyard-Provider` | The provider id of the chosen deployment. |
+| `X-Switchyard-Provider` | The provider id of the deployment that answered (on an error, of the last one tried). |
+| `X-Switchyard-Attempts` | The number of upstream attempts, retries and fallbacks included. |
+| `X-Switchyard-Route-Reason` | `cheapest_eligible`, `pinned` (a `model@provider` request), or `fallback:<kind>` when a fallback answered, `<kind>` being the failure that caused the first fallback, such as `fallback:server_error`. |
 | `X-Switchyard-Alias` | The alias the client sent, when it sent one. |
 | `X-Switchyard-Dropped-Params` | The request parameters removed because the deployment cannot honor them, such as `n, temperature`. |
 | `X-Switchyard-Shim` | `chat` when a legacy completion was served through Chat Completions. |
-| `X-Switchyard-Upstream-Request-Id` | The provider's own `x-request-id`, for support tickets. Omitted unless it is at most 128 bytes of printable ASCII. |
+| `X-Switchyard-Upstream-Request-Id` | The provider's own `x-request-id`, from the attempt that answered, for support tickets. Omitted unless it is at most 128 bytes of printable ASCII. |
 | `Retry-After` | On 429, copied from the provider. |
 
-Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no`. The response is committed only when the first upstream event arrives, so failures before that get a normal error status.
+Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no`. The response is committed only when the first upstream event arrives, so failures before that are retried or fall back, and otherwise get a normal error status. A client can shorten its request's deadline with the request header `X-Switchyard-Timeout-Ms: <milliseconds>`; it can never extend it past `routing.request_timeout`.
 
 **Errors.** Every error uses OpenAI's envelope, `{"error":{"message","type","param","code"}}`, so SDKs raise their usual exceptions.
 
@@ -290,13 +292,18 @@ Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `
 | Virtual model (`auto…`), or a model of the wrong type (an embedding model on chat, a chat model on embeddings) | 400 | `model_not_supported` |
 | No deployment has every capability the request needs, or fits the context window | 400 | `no_eligible_model`; the message names each deployment and why it was excluded |
 | A legacy completion parameter the chat shim cannot honor | 400 | `unsupported_parameter`; `param` names it |
-| Provider 4xx (other than 401/403), including 429 | the provider's status | the provider's body |
-| Provider 401/403: the gateway's credential is wrong | 502 | `upstream_error` (the body is never echoed) |
+| `X-Switchyard-Timeout-Ms` not a positive whole number | 400 | `invalid_timeout` |
+| A request an adapter cannot translate (for example a content part or tool type the Anthropic Messages API cannot express), when no other deployment in the plan could serve it | 400 | `invalid_value`; `param` names the field |
+| Every eligible deployment is unhealthy: breaker open, rate-limit cooldown, or provider at `max_concurrency` | 503 | `no_healthy_upstream`; the message names each deployment and why |
+| Provider 4xx (other than 401/402/403), including 429 | the provider's status | the provider's body |
+| Provider 401/402/403: the gateway's credential or account is wrong | 502 | `upstream_error` (the body is never echoed) |
 | Provider 5xx, connection failure | 502 | `upstream_error` |
-| First-token or total timeout | 504 | `timeout` |
+| First-token (streams), idle or total timeout, or the request's deadline | 504 | `timeout` |
 | Provider failure after the stream started | an SSE `data: {"error":…}` event, then the stream closes without `[DONE]` | `upstream_error` |
 
-Each request is logged at INFO as one `request` access-log line. For the chat, completions and embeddings endpoints it also carries the tenant, key id, requested model, chosen `deployment`, the number of `excluded` deployments, latency, TTFT, gateway overhead and token counts, plus the `alias` and the `dropped_params` (comma-separated) when there are any, never the prompt or the response.
+When a request was retried or fell back and every attempt failed, the answer is the most informative failure: 504 if the deadline expired, the provider's 429 if every failure was a rate limit, and otherwise, in order of preference, a context-length or not-found error, a 5xx, a timeout, an authentication failure, a connection failure, and last an adapter's local rejection (`unsupported`), which is the answer only when every attempt was rejected so. The `X-Switchyard-Provider` and `X-Switchyard-Upstream-Request-Id` headers are those of the attempt whose failure is the answer.
+
+Each request is logged at INFO as one `request` access-log line. For the chat, completions and embeddings endpoints it also carries the tenant, key id, requested model, the `deployment` of the last attempt, the number of `excluded` deployments, `attempts`, `attempt_chain` (each attempt as `deployment:outcome`, such as `m@a:server_error,m@a:server_error,m@b:ok`, at most ten), `fallback_reason` (the failure kind that caused the first fallback, when there was one), `deadline_ms`, latency, TTFT, gateway overhead and token counts, plus the `alias` and the `dropped_params` (comma-separated) when there are any, never the prompt or the response.
 
 **Legacy completions.** `POST /v1/completions` takes the legacy OpenAI shape (`prompt` a string or an array of strings; token arrays get 400). A deployment with the `completions` capability on an OpenAI-wire provider gets the request natively and losslessly. Any other deployment is served through the chat shim, marked `X-Switchyard-Shim: chat`: the prompt becomes one user message; `max_tokens`, `temperature`, `top_p`, `stop`, `n`, `stream`, `stream_options`, `user`, `seed` and the penalties carry over (other legacy fields, such as `logit_bias`, are not sent); and the answer, streamed or not, comes back as `text_completion` objects with `choices[].text`. The shim cannot honor `echo`, `suffix`, `logprobs`, `best_of` above 1 or more than one prompt: such a request goes to a native deployment if the model has one, and otherwise gets 400 `unsupported_parameter`. Capability filtering and dropping work as for chat. The legacy default of 16 `max_tokens` is not applied by the shim.
 
@@ -305,9 +312,74 @@ curl localhost:8080/v1/completions -H "Authorization: Bearer $SWITCHYARD_API_KEY
   -H "Content-Type: application/json" -d '{"model":"gpt-6-luna","prompt":"Say hello","max_tokens":20}'
 ```
 
-**Embeddings.** `POST /v1/embeddings` takes `model`, `input` (a string, an array of strings, or token arrays, which are passed through), `encoding_format` (`float` or `base64`), `dimensions` and `user`, and is forwarded losslessly. The model must be an embedding model. Among its deployments, the one with the lowest input price serves it, so the provider may change but the model never does. Only OpenAI-wire providers serve embeddings; an Anthropic deployment is excluded with "provider does not serve embeddings".
+**Embeddings.** `POST /v1/embeddings` takes `model`, `input` (a string, an array of strings, or token arrays, which are passed through), `encoding_format` (`float` or `base64`), `dimensions` and `user`, and is forwarded losslessly. The model must be an embedding model. Its deployments are tried cheapest input price first, with retries and fallback as for chat, so the provider may change but the model never does. Only OpenAI-wire providers serve embeddings; an Anthropic deployment is excluded with "provider does not serve embeddings".
 
 **Models.** `GET /v1/models` lists every catalog model, chat and embedding, then every alias, all with `owned_by: "switchyard"`. Metrics (`switchyard_requests_total`, which also counts requests rejected for a bad key, `switchyard_upstream_requests_total`, `switchyard_overhead_duration_seconds` and others) are on the admin listener's `/metrics`.
+
+## Reliability
+
+Every request runs on a **plan**: the deployments of the requested model that can serve it, cheapest first, at most `routing.fallback.max_deployments` (default 3). Each fallback slot prefers a provider that is not in the plan yet. A pinned `model@provider` is a plan of one, and fallback never switches to a different model. Deployments that are unhealthy right now are left out of the plan: an open circuit breaker, a rate-limit cooldown, or a provider at its `max_concurrency`. If that leaves none, the answer is 503 `no_healthy_upstream`, naming each deployment and why ("circuit open", "rate-limit cooldown 4s", "provider at max_concurrency 64"). A request that no deployment could honor at all still gets 400 `no_eligible_model`.
+
+Each plan entry gets up to `1 + retries_per_deployment` attempts, then the next entry is tried. What happens after a failure depends on its kind:
+
+| Kind | Typical upstream signal | Retry the same deployment | Fall back | Counts toward the breaker |
+|---|---|---|---|---|
+| `transport` | connection refused or reset, DNS, TLS | yes | yes | yes |
+| `timeout` | connect, first token, idle between chunks, total | yes, except a non-streaming call's `total` timeout | yes | yes |
+| `server_error` | 500, 502, 503, 504, Anthropic 529 | yes | yes | yes |
+| `rate_limited` | 429 | only if `Retry-After` fits the remaining deadline | yes | no; a cooldown starts instead |
+| `auth` | 401, 402, 403 on the gateway's credential | no | yes | yes, and an ERROR log line |
+| `not_found` | 404, unknown upstream model | no | yes | no |
+| `context_length` | OpenAI `context_length_exceeded`; Anthropic "prompt is too long" or 413 | no | yes | no |
+| `content_filter` | OpenAI `content_policy_violation` or `content_filter` | no | no | no |
+| `client_error` | any other 400 or 422 | no | no | no |
+| `unsupported` | the adapter cannot translate the request (Anthropic: file or audio parts, the deprecated `functions`, non-function tools, a `response_format` the deployment lacks the capability for); nothing is sent upstream | no | yes | no |
+| `canceled` | the client went away | no | no | no |
+
+A successful answer is never retried, including one whose `finish_reason` is `content_filter` and an Anthropic refusal (`stop_reason: refusal`): a refused request is never sent to another provider.
+
+- **Retries** wait with exponential backoff and full jitter, a random time in `[0, min(backoff_max, backoff_base × 2^n)]` before retry n, or the provider's `Retry-After` for a 429. A wait that does not fit the remaining deadline is skipped and the next deployment is tried at once. Each deployment also has a **retry budget**: its retries may not exceed `retry_budget_ratio` (default 20 %) of its requests over a sliding 10 s window, plus `retry_budget_min` (default 5) that are always allowed. Once it is spent, the gateway falls back instead of retrying, so an outage cannot turn into a retry storm.
+- **Deadline.** `routing.request_timeout` (default 10m) bounds the whole request, across every attempt, backoff and the full streamed response. `X-Switchyard-Timeout-Ms` can lower it. Each attempt also has its provider's own `timeouts`. When the deadline expires the answer is 504 `timeout`.
+- **Provider timeouts.** `connect` bounds connection setup. `first_token` applies to streams only: it bounds the wait for the first event. A non-streaming response arrives only after the whole generation, so `first_token` does not apply to it (chat, completions or embeddings); `total` and the request's deadline bound it, and a non-streaming call that exceeds `total` falls back to the next deployment without a retry on the same one, which would repeat a long, billed generation (it still counts toward the breaker). `idle` bounds each gap between stream events, measured only while the gateway waits for the upstream: time spent writing to a slow client does not count. `total` bounds the whole upstream call.
+- **Slow clients.** `server.write_timeout` (default 60s) bounds each write to the client, a whole JSON response or one stream event. A client that stops reading for longer is disconnected, which cancels its upstream call; that is not counted against the deployment.
+- **Streams** are retried or fall back only until the first upstream event. Once the response has started, nothing is retried: a failure is sent as an error event, which the OpenAI SDKs raise, and the stream closes.
+- **Circuit breakers**, one per deployment and replica, open after `consecutive_failures` failures in a row, or when at least `min_requests` requests within `window` failed at `failure_ratio` or more. Only the kinds marked above count. An open breaker skips the deployment for `open_for`, then lets `half_open_probes` concurrent requests through: one success closes it, one failure opens it again. A timeout caused by the request's own deadline, or a client that went away, is not counted against the deployment. A half-open probe ends when the upstream answers, for a stream at its first event, so a probe that is a long stream closes the breaker at once. Upstream failures after that point still count, as any failure does: an idle timeout, a dropped connection, an error event mid-stream. The provider's `total` timeout mid-stream (the request's own budget), and a client that went away or stopped reading for longer than `server.write_timeout`, do not.
+- **Rate-limit cooldowns.** After a 429, the deployment is skipped for `Retry-After` (or `rate_limit_cooldown.default` without one), at most `rate_limit_cooldown.max`.
+- **Concurrency.** A provider's `max_concurrency` caps its in-flight requests on each replica; a saturated provider is skipped without queueing, so traffic spills over to the next cheapest deployment.
+- **Keep-alives** (`routing.stream_keepalive`, off by default): for intermediaries that close idle connections while a model is slow to start, a stream that has not received its first upstream event after that long is committed, with 200, the SSE headers and a `: keep-alive` comment, repeated at that interval until the first event. SDKs ignore the comments. This is a trade-off: after the first keep-alive, fallback is no longer possible, and a later failure becomes an error event in the stream.
+
+All of it is configured under `routing`, shown here with the defaults (each key is documented in [configs/switchyard.example.yaml](configs/switchyard.example.yaml)):
+
+```yaml
+routing:
+  request_timeout: 10m
+  fallback:
+    max_deployments: 3          # 1..10
+    retries_per_deployment: 1   # 0..5
+    backoff_base: 250ms
+    backoff_max: 2s
+    retry_budget_ratio: 0.2     # (0, 1]
+    retry_budget_min: 5
+  breaker:
+    consecutive_failures: 5
+    failure_ratio: 0.5          # (0, 1]
+    min_requests: 20
+    window: 30s
+    open_for: 30s
+    half_open_probes: 3
+  rate_limit_cooldown:
+    default: 1s
+    max: 30s
+  stream_keepalive: 0s          # 0s is off
+```
+
+**Visibility.** Besides the response headers and log fields above, the admin listener's `/metrics` has `switchyard_retries_total{deployment,kind}`, `switchyard_fallbacks_total{from,to,kind}`, `switchyard_circuit_state{deployment}` (0 closed, 1 half-open, 2 open), `switchyard_circuit_transitions_total{deployment,to}`, `switchyard_rate_limit_cooldowns_total{deployment}`, `switchyard_provider_in_flight{provider}`, `switchyard_provider_saturated_total{provider}` and `switchyard_retry_budget_exhausted_total{deployment}`. `switchyard_upstream_requests_total` counts every attempt, by outcome. `GET /admin/v1/providers` on the admin listener reports, for every provider, its `in_flight` count and `max_concurrency`, and for each of its deployments the breaker state and the time of its next transition, `cooldown_until`, the recent request and failure counts, the retry budget used, and the TTFT and tokens-per-second statistics (EWMAs, seeded from the catalog's `latency_hint` until there are 20 samples), with their sample counts. It holds no secrets.
+
+```sh
+curl -s localhost:9090/admin/v1/providers | jq '.providers[].deployments[] | {id, breaker: .breaker.state, cooldown_until}'
+```
+
+All of this state is per replica and kept in memory.
 
 ## Docker
 
@@ -406,7 +478,9 @@ internal/
   auth/             gateway API keys: hashing, store, middleware
   catalog/          models, deployments, prices; resolution, selection, lint
   config/           schema, loading, ${…} expansion, includes, validation, snapshot
-  gateway/          request pipeline, routing, completions shim, metrics, log fields
+  gateway/          request pipeline, plans and the retry/fallback executor, completions shim,
+                    metrics, log fields, /admin/v1/providers
+  health/           per-replica breakers, cooldowns, retry budgets, concurrency, latency stats
   providers/        adapter interfaces; openai/ (OpenAI wire) and anthropic/ (Messages API)
   schema/           lossless chat, legacy completion and embedding requests; capabilities
   server/           listeners, middleware, health checks, graceful shutdown
@@ -419,7 +493,7 @@ test/
   fakeanthropic/    scriptable fake Messages API (make record-fixtures records real ones)
   fixtures/         Anthropic fixtures, handcrafted from the docs until recorded
   conformance/      OpenAI SDK conformance suite, direct and through the gateway (OpenAI and
-                    Anthropic upstreams), plus the P2 acceptance cases
+                    Anthropic upstreams), plus the P2 and P3 acceptance cases
   load/             overhead benchmark (make bench-overhead)
   smoke/            opt-in live smoke test (make smoke)
 configs/            quickstart.yaml, switchyard.example.yaml, catalog/

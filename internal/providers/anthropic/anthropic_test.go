@@ -137,9 +137,9 @@ func TestStatusErrors(t *testing.T) {
 		{fixture: "error_401_authentication_error.json", status: 401, kind: providers.KindAuth},
 		{fixture: "error_402_billing_error.json", status: 402, kind: providers.KindAuth},
 		{fixture: "error_403_permission_error.json", status: 403, kind: providers.KindAuth},
-		{fixture: "error_404_not_found_error.json", status: 404, kind: providers.KindClientError,
+		{fixture: "error_404_not_found_error.json", status: 404, kind: providers.KindNotFound,
 			body: `{"error":{"message":"model: claude-nonexistent","type":"invalid_request_error","param":null,"code":"not_found_error"}}`},
-		{fixture: "error_413_request_too_large.json", status: 413, kind: providers.KindClientError,
+		{fixture: "error_413_request_too_large.json", status: 413, kind: providers.KindContextLength,
 			body: `{"error":{"message":"Request exceeds the maximum allowed number of bytes.","type":"invalid_request_error","param":null,"code":"request_too_large"}}`},
 		{fixture: "error_429_rate_limit_error.json", status: 429, header: map[string]string{"Retry-After": "7"},
 			kind: providers.KindRateLimited, retryAfter: 7 * time.Second,
@@ -293,7 +293,10 @@ func TestKeyNeverEchoed(t *testing.T) {
 	})
 }
 
-func TestClientErrorIsNotSent(t *testing.T) {
+// TestUnsupportedIsNotSent checks that a request the adapter cannot
+// translate is rejected locally, as KindUnsupported, without an upstream
+// call.
+func TestUnsupportedIsNotSent(t *testing.T) {
 	f := newFake(t)
 	a := newAdapter(t, testProvider(f.BaseURL()))
 	body := `{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{"}}]}]}`
@@ -304,7 +307,7 @@ func TestClientErrorIsNotSent(t *testing.T) {
 		} else {
 			_, err = a.Chat(ctxWithTimeout(t), request(t, body))
 		}
-		_ = wantKind(t, err, providers.KindClientError)
+		_ = wantKind(t, err, providers.KindUnsupported)
 	}
 	if n := len(f.Requests()); n != 0 {
 		t.Errorf("upstream received %d requests, want none", n)
@@ -369,12 +372,6 @@ func TestChatTimeouts(t *testing.T) {
 		message string
 	}{
 		{
-			name:    "first_token bounds the response headers",
-			handler: func(u *upstream, _ http.ResponseWriter, r *http.Request) { u.hang(r) },
-			set:     func(p *config.ProviderTimeouts) { p.FirstToken = config.Duration(short) },
-			message: "first_token timeout",
-		},
-		{
 			name: "total bounds the body",
 			handler: func(u *upstream, w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusOK)
@@ -398,12 +395,33 @@ func TestChatTimeouts(t *testing.T) {
 			p := testProvider(u.URL)
 			tt.set(&p.Timeouts)
 			a := newAdapter(t, p)
-			pe := wantKind(t, doCall(t, a, false), providers.KindTimeout)
+			err := doCall(t, a, false)
+			pe := wantKind(t, err, providers.KindTimeout)
 			if !strings.Contains(pe.Message, tt.message) {
 				t.Errorf("message = %q, want it to mention %q", pe.Message, tt.message)
 			}
+			if pe.Timeout != providers.TimeoutTotal || providers.Retryable(err, false) {
+				t.Errorf("Timeout = %q, Retryable = %v; want total, not retryable", pe.Timeout, providers.Retryable(err, false))
+			}
 			waitCanceled(t, u)
 		})
+	}
+}
+
+// TestNonStreamIgnoresFirstToken checks that first_token does not bound a
+// non-streaming call, whose response headers arrive only after the whole
+// generation: total and the caller's deadline do.
+func TestNonStreamIgnoresFirstToken(t *testing.T) {
+	const short = 50 * time.Millisecond
+	u := newUpstream(t, func(_ *upstream, w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(4 * short)
+		_, _ = w.Write(fixture(t, "message_text.json"))
+	})
+	p := testProvider(u.URL)
+	p.Timeouts.FirstToken = config.Duration(short)
+	a := newAdapter(t, p)
+	if err := doCall(t, a, false); err != nil {
+		t.Fatalf("Chat: %v", err)
 	}
 }
 
@@ -434,6 +452,31 @@ func TestCanceledByCaller(t *testing.T) {
 				_ = wantKind(t, err, providers.KindCanceled)
 			case <-time.After(testTimeout):
 				t.Fatal("the call did not return after cancel")
+			}
+			waitCanceled(t, u)
+		})
+	}
+}
+
+// TestCallerDeadlineIsATimeout checks that the deadline of the caller's
+// context, the gateway's request deadline, is a timeout and not a
+// cancellation.
+func TestCallerDeadlineIsATimeout(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			u := newUpstream(t, func(u *upstream, _ http.ResponseWriter, r *http.Request) { u.hang(r) })
+			a := newAdapter(t, testProvider(u.URL))
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			var err error
+			if stream {
+				_, err = a.ChatStream(ctx, request(t, streamBody))
+			} else {
+				_, err = a.Chat(ctx, request(t, plainBody))
+			}
+			pe := wantKind(t, err, providers.KindTimeout)
+			if !strings.Contains(pe.Message, "deadline") {
+				t.Errorf("message = %q, want it to name the deadline", pe.Message)
 			}
 			waitCanceled(t, u)
 		})
@@ -510,6 +553,7 @@ func TestCallsFromFake(t *testing.T) {
 	f := newFake(t)
 	p := testProvider(f.BaseURL())
 	p.Timeouts.FirstToken = config.Duration(200 * time.Millisecond)
+	p.Timeouts.Total = config.Duration(time.Second) // bounds the non-streaming hang
 	a := newAdapter(t, p)
 
 	f.Script(fakeanthropic.Behavior{Fault: fakeanthropic.FaultDrop})
@@ -534,5 +578,49 @@ func TestCallsFromFake(t *testing.T) {
 	resp, err := a.Chat(ctxWithTimeout(t), request(t, plainBody))
 	if err != nil || !strings.Contains(string(resp.Body), `"finish_reason":"content_filter"`) {
 		t.Errorf("refusal: %v, %s", err, resp.Body)
+	}
+}
+
+// TestErrorKinds classifies the errors whose kind depends on the body.
+func TestErrorKinds(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		kind   providers.Kind
+	}{
+		{"prompt is too long", 400,
+			`{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210012 tokens > 200000 maximum"}}`,
+			providers.KindContextLength},
+		{"other invalid request", 400,
+			`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: Field required"}}`,
+			providers.KindClientError},
+		{"422", 422,
+			`{"type":"error","error":{"type":"invalid_request_error","message":"unprocessable"}}`,
+			providers.KindClientError},
+		{"404 without a body", 404, "", providers.KindNotFound},
+		{"413 without a body", 413, "", providers.KindContextLength},
+		{"529 overloaded", 529,
+			`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`,
+			providers.KindServerError},
+	}
+	for _, tt := range tests {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%v", tt.name, stream), func(t *testing.T) {
+				f := newFake(t)
+				var body []byte
+				if tt.body != "" {
+					body = []byte(tt.body)
+				} else {
+					body = []byte("{}")
+				}
+				f.Script(fakeanthropic.Behavior{Status: tt.status, Body: body})
+				a := newAdapter(t, testProvider(f.BaseURL()))
+				pe := wantKind(t, doCall(t, a, stream), tt.kind)
+				if pe.Status != tt.status {
+					t.Errorf("status = %d, want %d", pe.Status, tt.status)
+				}
+			})
+		}
 	}
 }

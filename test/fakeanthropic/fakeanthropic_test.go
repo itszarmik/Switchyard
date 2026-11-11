@@ -365,3 +365,37 @@ func TestClientGoneIsRecorded(t *testing.T) {
 		t.Error("Reset kept the records")
 	}
 }
+
+func TestSequenceAndHold(t *testing.T) {
+	s := newServer(t)
+	s.OpenAI().Sequence(fakeupstream.Behavior{Status: 529}, fakeupstream.Behavior{})
+	s.Script(Behavior{Status: 500})
+	for i, want := range []int{529, 200, 500} {
+		if got, _, b := post(t, s, body(""), nil); got != want {
+			t.Errorf("request %d: status %d, want %d: %s", i, got, want, b)
+		}
+	}
+	s.Reset()
+
+	release := make(chan struct{})
+	s.Script(Behavior{Hold: release})
+	done := make(chan int, 1)
+	go func() {
+		status, _, _ := post(t, s, body(""), nil)
+		done <- status
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	if err := s.WaitReceived(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+		t.Fatal("a held request was answered")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if status := <-done; status != 200 {
+		t.Errorf("released request: status %d", status)
+	}
+}

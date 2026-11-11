@@ -11,7 +11,9 @@
 // model is echoed, and every response carries an x-request-id header.
 //
 // Errors, delays and connection faults are scripted per test with
-// [Server.Script]. Every request is recorded, including when its client went
+// [Server.Script], or request by request with [Server.Sequence] (such as
+// "503, 503, then 200"), and [Behavior.Hold] keeps requests in flight
+// until a test releases them. Every request is recorded, including when its client went
 // away, so tests can assert what reached the upstream and how quickly a
 // cancellation propagated.
 package fakeupstream
@@ -72,6 +74,13 @@ type Behavior struct {
 	Fault Fault
 	// FaultAfterChunks is how many stream events are sent before Fault.
 	FaultAfterChunks int
+	// FinishReason, when set, replaces the finish_reason of every choice,
+	// for example content_filter for a filtered answer.
+	FinishReason string
+	// Hold, when set, makes the request wait, before anything is sent,
+	// until Hold is closed (or the client goes away, or the server closes),
+	// so that tests can keep requests in flight.
+	Hold <-chan struct{}
 	// ExtraFields are added to the top level of every completion and every
 	// stream chunk, to model fields a client or gateway does not know. Each
 	// value must be valid JSON.
@@ -133,6 +142,7 @@ type Server struct {
 
 	mu       sync.Mutex
 	behavior Behavior
+	queue    []Behavior // per-request behaviors, see Sequence
 	records  []*record
 	changed  chan struct{} // closed and replaced whenever a request is recorded
 }
@@ -174,9 +184,26 @@ func (s *Server) Script(b Behavior) {
 	s.mu.Unlock()
 }
 
-// Reset restores the default behavior and forgets the recorded requests.
+// Sequence scripts the next requests one by one: the first request
+// received from now on gets bs[0], the second bs[1], and so on; once they
+// are used up, requests get the behavior set by Script. It replaces any
+// sequence not used up yet.
+func (s *Server) Sequence(bs ...Behavior) {
+	q := make([]Behavior, len(bs))
+	for i, b := range bs {
+		b.Header = b.Header.Clone()
+		q[i] = b
+	}
+	s.mu.Lock()
+	s.queue = q
+	s.mu.Unlock()
+}
+
+// Reset restores the default behavior, drops any sequence and forgets the
+// recorded requests.
 func (s *Server) Reset() {
 	s.mu.Lock()
+	s.queue = nil
 	s.behavior = Behavior{}
 	s.records = nil
 	s.mu.Unlock()
@@ -285,10 +312,33 @@ func (s *Server) update(rec *record, f func(*Request)) {
 	s.mu.Unlock()
 }
 
-func (s *Server) currentBehavior() Behavior {
+// nextBehavior returns the behavior of a new request: the next one of
+// the sequence, if any is left, else the scripted one.
+func (s *Server) nextBehavior() Behavior {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.queue) > 0 {
+		b := s.queue[0]
+		s.queue = s.queue[1:]
+		return b
+	}
 	return s.behavior
+}
+
+// hold waits for b.Hold, if set. It returns false if the client went away
+// or the server is closing first.
+func (s *Server) hold(ctx context.Context, b Behavior) bool {
+	if b.Hold == nil {
+		return true
+	}
+	select {
+	case <-b.Hold:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-s.closing:
+		return false
+	}
 }
 
 // serveHTTP records the request, watches for the client going away, and
@@ -378,9 +428,12 @@ func maskKey(key string) string {
 
 // chat serves POST /v1/chat/completions.
 func (s *Server) chat(ctx context.Context, out *responder, body []byte) {
-	b := s.currentBehavior()
+	b := s.nextBehavior()
 	for name, values := range b.Header {
 		out.w.Header()[name] = append([]string(nil), values...)
+	}
+	if !s.hold(ctx, b) {
+		return
 	}
 
 	if b.Status != 0 {
@@ -406,6 +459,11 @@ func (s *Server) chat(ctx context.Context, out *responder, body []byte) {
 	}
 
 	p := newPlan(req, strings.TrimPrefix(out.w.Header().Get("X-Request-Id"), "req_fake_"))
+	if b.FinishReason != "" {
+		for i := range p.choices {
+			p.choices[i].finish = b.FinishReason
+		}
+	}
 	if req.stream {
 		s.stream(ctx, out, b, p)
 		return

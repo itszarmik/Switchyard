@@ -39,7 +39,8 @@ func newStream(a *Adapter, c *call, body io.ReadCloser, rid string) *stream {
 	return &stream{a: a, c: c, body: body, r: sse.NewReader(body, sse.ReaderOptions{}), rid: rid}
 }
 
-// Next implements providers.Stream.
+// Next implements providers.Stream. The idle timeout runs only while Next
+// waits for the upstream, not between calls.
 func (s *stream) Next() (*schema.ChatChunk, error) {
 	if p := s.pending; p != nil {
 		s.pending = nil
@@ -51,7 +52,9 @@ func (s *stream) Next() (*schema.ChatChunk, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
+	s.c.resume()
 	chunk, err := s.read()
+	s.c.pause()
 	if errors.Is(err, io.EOF) {
 		s.done = true
 	} else if err != nil {

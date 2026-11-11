@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"switchyard/internal/config"
 	"switchyard/internal/schema"
@@ -84,6 +85,15 @@ type Deployment struct {
 	Tags []string
 	// Pricing is what the deployment costs.
 	Pricing Pricing
+	// LatencyHint is the operator's latency estimate, which seeds the
+	// latency statistics until there are measurements.
+	LatencyHint LatencyHint
+}
+
+// LatencyHint is an operator's latency estimate. Zero values are unknown.
+type LatencyHint struct {
+	TTFT         time.Duration
+	TokensPerSec float64
 }
 
 // Pricing is in USD per million tokens.
@@ -208,6 +218,10 @@ func New(cfg *config.Config) (*Catalog, error) {
 					CacheWrite:  cd.Pricing.CacheWrite.Float64(),
 					Known:       config.PricingKnown(m.Type, cd.Pricing),
 				},
+				LatencyHint: LatencyHint{
+					TTFT:         time.Duration(cd.LatencyHint.TTFTMs) * time.Millisecond,
+					TokensPerSec: cd.LatencyHint.TokensPerSec,
+				},
 			}
 			if cd.Capabilities != nil {
 				d.Capabilities = capabilitySet(cd.Capabilities)
@@ -289,7 +303,27 @@ func (c *Catalog) resolveTarget(name string) (Resolution, error) {
 	return Resolution{}, ErrUnknownModel
 }
 
-// Select returns the cheapest eligible candidate of res.
+// Candidate is an eligible deployment, as ranked by Rank.
+type Candidate struct {
+	Deployment *Deployment
+	// Dropped lists, sorted, the droppable capabilities the request needs
+	// but the deployment lacks (see Selection.Dropped).
+	Dropped []schema.Capability
+	// Cost is the estimated cost in USD, or 0 if pricing is unknown.
+	Cost float64
+}
+
+// Ranking is the outcome of Rank.
+type Ranking struct {
+	// Candidates are the eligible deployments, cheapest first.
+	Candidates []Candidate
+	// Exclusions explains every candidate that was not eligible, in
+	// candidate order.
+	Exclusions []Exclusion
+}
+
+// Rank applies the hard filters to every candidate of res and returns the
+// eligible ones, cheapest first, with the exclusions.
 //
 // The hard filters are: every capability in required must be in the
 // deployment's capabilities, except droppable ones (see
@@ -302,9 +336,9 @@ func (c *Catalog) resolveTarget(name string) (Resolution, error) {
 // price, and ties keep config order. estIn and estOut are token counts,
 // and negative values count as 0; their sum saturates at math.MaxInt64.
 //
-// With no eligible candidate, Select returns a *NoEligibleError with an
+// With no eligible candidate, Rank returns a *NoEligibleError with an
 // Exclusion for every candidate.
-func (c *Catalog) Select(res Resolution, required schema.CapabilitySet, estIn, estOut int64, drop bool) (Selection, error) {
+func (c *Catalog) Rank(res Resolution, required schema.CapabilitySet, estIn, estOut int64, drop bool) (Ranking, error) {
 	estIn, estOut = max(estIn, 0), max(estOut, 0)
 	// The context the request needs. Both estimates are non-negative, so
 	// a negative sum overflowed: the need saturates instead of wrapping
@@ -314,12 +348,7 @@ func (c *Catalog) Select(res Resolution, required schema.CapabilitySet, estIn, e
 		needed = math.MaxInt64
 	}
 	need := required.Sorted()
-	var (
-		best       *Deployment
-		bestDrop   []schema.Capability
-		bestCost   float64
-		exclusions []Exclusion
-	)
+	var out Ranking
 	for _, d := range res.Candidates {
 		var lacks, dropped []schema.Capability
 		// Without sampling, temperature is removed anyway, so a need for
@@ -344,22 +373,42 @@ func (c *Catalog) Select(res Resolution, required schema.CapabilitySet, estIn, e
 			reasons = append(reasons, "context "+strconv.FormatInt(cw, 10)+" < "+strconv.FormatInt(needed, 10)+" needed")
 		}
 		if len(reasons) > 0 {
-			exclusions = append(exclusions, Exclusion{Deployment: d.ID, Reason: strings.Join(reasons, "; ")})
+			out.Exclusions = append(out.Exclusions, Exclusion{Deployment: d.ID, Reason: strings.Join(reasons, "; ")})
 			continue
 		}
-		cost := d.Pricing.estimate(estIn, estOut)
-		if best == nil || cheaper(d, cost, best, bestCost) {
-			best, bestDrop, bestCost = d, dropped, cost
+		if out.Candidates == nil {
+			out.Candidates = make([]Candidate, 0, len(res.Candidates))
 		}
+		out.Candidates = append(out.Candidates, Candidate{Deployment: d, Dropped: dropped, Cost: d.Pricing.estimate(estIn, estOut)})
 	}
-	if best == nil {
+	if len(out.Candidates) == 0 {
 		model := ""
 		if res.Model != nil {
 			model = res.Model.ID
 		}
-		return Selection{}, &NoEligibleError{Model: model, Exclusions: exclusions}
+		return Ranking{}, &NoEligibleError{Model: model, Exclusions: out.Exclusions}
 	}
-	return Selection{Deployment: best, Dropped: bestDrop, Exclusions: exclusions}, nil
+	slices.SortStableFunc(out.Candidates, func(a, b Candidate) int {
+		switch {
+		case cheaper(a.Deployment, a.Cost, b.Deployment, b.Cost):
+			return -1
+		case cheaper(b.Deployment, b.Cost, a.Deployment, a.Cost):
+			return 1
+		}
+		return 0
+	})
+	return out, nil
+}
+
+// Select returns the cheapest eligible candidate of res: the first of
+// Rank's candidates, with the same filters, ranking and errors.
+func (c *Catalog) Select(res Resolution, required schema.CapabilitySet, estIn, estOut int64, drop bool) (Selection, error) {
+	r, err := c.Rank(res, required, estIn, estOut, drop)
+	if err != nil {
+		return Selection{}, err
+	}
+	best := r.Candidates[0]
+	return Selection{Deployment: best.Deployment, Dropped: best.Dropped, Exclusions: r.Exclusions}, nil
 }
 
 // cheaper reports whether candidate d at cost ranks strictly before best at

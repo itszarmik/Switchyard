@@ -14,12 +14,12 @@ import (
 const reasonNoEmbeddings = "provider does not serve embeddings"
 
 // Embeddings serves one POST /v1/embeddings request. The model must be an
-// embedding model. Among its deployments, the one with the lowest input
-// price is chosen (the embeddings_by_input selection: no output tokens),
-// so the provider may change but the model never does: candidates are only
-// ever deployments of the requested model. The request is forwarded
-// losslessly with the model replaced, and the answer returned byte for
-// byte.
+// embedding model. Its deployments are planned by input price (the
+// embeddings_by_input ranking: no output tokens), the cheapest first, and
+// the plan executed as for chat completions, so the provider may change
+// but the model never does: candidates are only ever deployments of the
+// requested model. The request is forwarded losslessly with the model
+// replaced, and the answer returned byte for byte.
 func (g *Gateway) Embeddings(ctx context.Context, ex Exchange) {
 	rec := g.newRecord(ctx, EndpointEmbeddings)
 	defer rec.finish()
@@ -35,36 +35,41 @@ func (g *Gateway) Embeddings(ctx context.Context, ex Exchange) {
 		return
 	}
 	rec.requestedModel = req.Model()
+	ctx, cancel, ok := g.withDeadline(ctx, ex, rec)
+	defer cancel()
+	if !ok {
+		return
+	}
 
 	res, e := g.resolve(req.Model(), rec.endpoint, config.ModelTypeEmbedding)
 	if e != nil {
 		rec.respondError(ex, Info{}, e)
 		return
 	}
-	info := Info{Model: res.Model.ID, Alias: res.Alias}
+	rec.info = Info{Model: res.Model.ID, Alias: res.Alias}
 	rec.alias = res.Alias
 	// The context filter applies per input, so the estimate is the
 	// largest input's.
-	sel, e := g.choose(res, schema.CapabilitySet{}, req.LargestInputTokens(res.Model.TokenRatio), 0,
+	e = g.buildPlan(&rec.plan, res, schema.CapabilitySet{}, req.LargestInputTokens(res.Model.TokenRatio), 0,
 		func(d *catalog.Deployment) string {
 			if _, ok := g.adapters[d.Provider].(providers.Embedder); !ok {
 				return reasonNoEmbeddings
 			}
 			return ""
 		})
-	rec.excluded = len(sel.Exclusions)
+	rec.excluded = len(rec.plan.exclusions)
 	if e != nil {
-		rec.respondError(ex, info, e)
+		rec.respondError(ex, rec.info, e)
 		return
 	}
-	d := sel.Deployment
-	rec.deployment = d
-	info.Provider = d.Provider
-
-	embedder := g.adapters[d.Provider].(providers.Embedder)
-	rec.upstreamStart = time.Now()
-	resp, err := embedder.Embed(ctx, &providers.EmbedRequest{
-		Embedding: req, UpstreamModel: d.UpstreamModel, Header: ex.Header(),
+	g.execute(ctx, ex, rec, func(ctx context.Context, e *planEntry, info *Info) attempt {
+		d := e.d
+		info.Provider = d.Provider
+		embedder := g.adapters[d.Provider].(providers.Embedder)
+		start := time.Now()
+		resp, err := embedder.Embed(ctx, &providers.EmbedRequest{
+			Embedding: req, UpstreamModel: d.UpstreamModel, Header: ex.Header(),
+		})
+		return g.responseAttempt(ex, rec, start, resp, err, info, nil)
 	})
-	g.serveResponse(ex, rec, resp, err, info, nil)
 }

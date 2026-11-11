@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -537,4 +538,115 @@ func TestDroppableVocabulary(t *testing.T) {
 	if len(schema.Vocabulary()) != 16 || schema.Capability("telepathy").Known() {
 		t.Errorf("vocabulary = %v", schema.Vocabulary())
 	}
+}
+
+func TestRank(t *testing.T) {
+	c := newTestCatalog(t)
+	tests := []struct {
+		name     string
+		model    string
+		required schema.CapabilitySet
+		drop     bool
+		want     []string // candidate IDs, cheapest first
+		dropped  [][]schema.Capability
+		excluded []string
+	}{
+		{
+			name: "cheapest first, unknown price last", model: "gpt",
+			want:    []string{"gpt@gpu", "gpt@together", "gpt@openai"},
+			dropped: [][]schema.Capability{nil, nil, nil},
+		},
+		{
+			name: "two providers", model: "llama",
+			want:    []string{"llama@gpu", "llama@together"},
+			dropped: [][]schema.Capability{nil, nil},
+		},
+		{
+			name: "excluded deployments are listed", model: "llama", required: caps(schema.CapN),
+			want: []string{"llama@together"}, dropped: [][]schema.Capability{nil}, excluded: []string{"llama@gpu"},
+		},
+		{
+			name: "each candidate has its own dropped list", model: "llama", required: caps(schema.CapN), drop: true,
+			want:    []string{"llama@gpu", "llama@together"},
+			dropped: [][]schema.Capability{{schema.CapN}, nil},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := c.Resolve(tt.model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := c.Rank(res, tt.required, 100, 100, tt.drop)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			var dropped [][]schema.Capability
+			for _, cand := range r.Candidates {
+				got = append(got, cand.Deployment.ID)
+				dropped = append(dropped, cand.Dropped)
+			}
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("candidates (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.dropped, dropped); diff != "" {
+				t.Errorf("dropped (-want +got):\n%s", diff)
+			}
+			var excluded []string
+			for _, x := range r.Exclusions {
+				excluded = append(excluded, x.Deployment)
+			}
+			if diff := cmp.Diff(tt.excluded, excluded); diff != "" {
+				t.Errorf("exclusions (-want +got):\n%s", diff)
+			}
+			// Select agrees with the head of the ranking.
+			sel, err := c.Select(res, tt.required, 100, 100, tt.drop)
+			if err != nil || sel.Deployment != r.Candidates[0].Deployment {
+				t.Errorf("Select = %v, %v; Rank's first is %s", sel.Deployment, err, r.Candidates[0].Deployment.ID)
+			}
+		})
+	}
+
+	t.Run("none eligible", func(t *testing.T) {
+		res, _ := c.Resolve("claude")
+		_, err := c.Rank(res, caps(schema.CapN), 1, 1, false)
+		var ne *NoEligibleError
+		if !errors.As(err, &ne) || len(ne.Exclusions) != 1 {
+			t.Errorf("err = %v", err)
+		}
+	})
+	t.Run("ties keep config order", func(t *testing.T) {
+		cfg := loadConfig(t, `version: 1
+providers:
+  - {id: a, type: openai, base_url: 'https://a.example/v1'}
+  - {id: b, type: openai, base_url: 'https://b.example/v1'}
+  - {id: c, type: openai, base_url: 'https://c.example/v1'}
+models:
+  - id: m
+    deployments:
+      - {provider: c, upstream_model: m, pricing: {input: 1, output: 1}}
+      - {provider: a, upstream_model: m, pricing: {input: 1, output: 1}}
+      - {provider: b, upstream_model: m, pricing: {input: 1, output: 1}, latency_hint: {ttft_ms: 400, tokens_per_sec: 80}}
+`)
+		cat, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, _ := cat.Resolve("m")
+		r, err := cat.Rank(res, nil, 10, 10, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, cand := range r.Candidates {
+			got = append(got, cand.Deployment.ID)
+		}
+		if diff := cmp.Diff([]string{"m@c", "m@a", "m@b"}, got); diff != "" {
+			t.Errorf("order (-want +got):\n%s", diff)
+		}
+		if h := r.Candidates[2].Deployment.LatencyHint; h.TTFT != 400*time.Millisecond || h.TokensPerSec != 80 {
+			t.Errorf("latency hint %+v", h)
+		}
+	})
 }

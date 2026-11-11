@@ -95,8 +95,13 @@ func newStream(a *Adapter, c *call, body io.ReadCloser, rid string, includeUsage
 	}
 }
 
-// Next implements providers.Stream.
+// Next implements providers.Stream. The idle timeout runs only while Next
+// waits for the upstream, not between calls.
 func (s *stream) Next() (*schema.ChatChunk, error) {
+	if len(s.pending) == 0 && !s.done && s.err == nil {
+		s.c.resume()
+		defer s.c.pause()
+	}
 	for {
 		if len(s.pending) > 0 {
 			c := s.pending[0]
