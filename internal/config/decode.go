@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -100,6 +101,33 @@ func (st *loadState) decodeValueAt(at, n *yaml.Node, v reflect.Value, path strin
 			return
 		}
 		v.SetInt(i)
+
+	case reflect.Map:
+		if isNull {
+			v.SetZero()
+			return
+		}
+		if n.Kind != yaml.MappingNode {
+			st.typeError(at, n, v.Type(), path, "expected a mapping")
+			return
+		}
+		st.decodeMap(n, v, path)
+
+	case reflect.Float32, reflect.Float64:
+		if isNull {
+			return
+		}
+		var f float64
+		tag := n.ShortTag()
+		if n.Kind != yaml.ScalarNode || (tag != intTag && tag != floatTag) || n.Decode(&f) != nil {
+			st.typeError(at, n, v.Type(), path, "expected a number")
+			return
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			st.typeError(at, n, v.Type(), path, "expected a finite number")
+			return
+		}
+		v.SetFloat(f)
 
 	case reflect.Bool:
 		if isNull {
@@ -248,6 +276,56 @@ func (st *loadState) decodeStruct(n *yaml.Node, v reflect.Value, path string) {
 			st.failed[joinPath(path, s)] = true
 		}
 	}
+}
+
+// decodeMap decodes mapping n into map v, whose keys are strings. Entry
+// paths are the map's path and the key joined with a dot, as for struct
+// fields (for example models[0].quality.coding or aliases.fast); a key that
+// looks like a credential is shown as hiddenKey. Duplicate keys are errors,
+// including keys that come from different files, such as aliases defined in
+// two included files.
+func (st *loadState) decodeMap(n *yaml.Node, v reflect.Value, path string) {
+	if v.Type().Key().Kind() != reflect.String {
+		st.nodeError(n, path, "internal error: unsupported config map key type "+v.Type().Key().String())
+		return
+	}
+	m := reflect.MakeMap(v.Type())
+	seen := make(map[string]*yaml.Node)
+	for _, p := range st.mappingPairs(n, path) {
+		k, val := p.key, p.val
+		at := k
+		if p.via != nil {
+			at = p.via
+		}
+		if k.Kind != yaml.ScalarNode {
+			st.addProblem(SeverityError, at, path, "mapping keys must be strings")
+			continue
+		}
+		key := k.Value
+		childPath := joinPath(path, shownKey(key))
+		if first, dup := seen[key]; dup {
+			st.nodeError(at, childPath, "duplicate key (first set at "+st.nodeWhere(first, at)+")")
+			continue
+		}
+		seen[key] = k
+		elem := reflect.New(v.Type().Elem()).Elem()
+		if p.via != nil {
+			st.decodeValueAt(p.via, val, elem, childPath)
+		} else {
+			st.decodeValue(val, elem, childPath)
+		}
+		m.SetMapIndex(reflect.ValueOf(key).Convert(v.Type().Key()), elem)
+	}
+	v.Set(m)
+}
+
+// nodeWhere formats the location of node n for a message about node at:
+// "line N" when both are in the same file, else "FILE:N".
+func (st *loadState) nodeWhere(n, at *yaml.Node) string {
+	if f := st.fileOf[n]; f != st.fileOf[at] {
+		return f + ":" + strconv.Itoa(n.Line)
+	}
+	return "line " + strconv.Itoa(n.Line)
 }
 
 // fieldSet maps the yaml names of a struct's fields to their indexes.

@@ -1,8 +1,8 @@
 # Switchyard reference configuration.
 #
-# Every key Phase 1 understands, with its default. The layout mirrors
-# docs/DESIGN.md §16.3. Later phases add sections (policies, routing,
-# cache); until then, any other key is rejected at load time.
+# Every key Phase 2 understands, with its default. The layout mirrors
+# docs/DESIGN.md §16.3. Later phases add sections (policies, cache) and
+# routing settings; until then, any other key is rejected at load time.
 # CI validates this file with `switchyard config validate`.
 #
 # Values may reference the environment or files:
@@ -21,9 +21,11 @@
 version: 1
 
 # Glob patterns of additional files, relative to this file's directory.
-# Included files may define only list sections (providers, models); their
-# entries are appended in sorted file-name order, and a duplicate ID is an
-# error. The model catalog lives in configs/catalog/.
+# Included files may define only providers, models and aliases; list
+# entries are appended in sorted file-name order, and a duplicate ID or an
+# alias defined twice is an error. The model catalog lives in
+# configs/catalog/ (see configs/catalog/README.md); check its prices and
+# sources with `switchyard catalog lint`.
 include:
   - catalog/*.yaml
 
@@ -132,9 +134,29 @@ providers:
       idle: 30s
 
 # Models come from the included catalog (configs/catalog/models.yaml).
-# Each model has an id (what clients send in the "model" field) and a list
-# of deployments, each with a provider (a provider id above) and the
-# upstream_model name sent to that provider.
+# Each model has an id (what clients send in the "model" field), a type
+# (chat, the default, or embedding), limits, capabilities and a list of
+# deployments, each with a provider (a provider id above), the
+# upstream_model name sent to that provider and its pricing. A request is
+# only sent to a deployment that has every capability it needs; among
+# those, the cheapest serves it. "model@provider" pins one deployment.
+
+# Aliases: extra model names clients may send. Each maps to a catalog
+# model id or to a pinned deployment (model@provider). Alias names follow
+# the model id rules and must not collide with a model id. Default none.
+aliases:
+  fast: claude-haiku-5-5
+  smart: claude-opus-5-5
+  gpt: gpt-6.1-sol@openai
+
+routing:
+  # Remove optional parameters a deployment cannot honor (n, logprobs,
+  # seed, frequency/presence penalties, temperature above 1,
+  # parallel_tool_calls: true) instead of excluding it, and list them in
+  # the X-Switchyard-Dropped-Params response header. Default false.
+  # temperature and top_p are always removed for a deployment without the
+  # sampling capability, whatever this says.
+  drop_unsupported_params: false
 
 # Tenants own the gateway API keys that clients send as
 # "Authorization: Bearer sy_…". Config stores only each key's SHA-256 hash;

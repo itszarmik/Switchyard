@@ -51,11 +51,32 @@ const (
 	receivedTimeout = 2 * time.Second
 )
 
+// upstreamFake is the method set of *fakeupstream.Server the suite uses.
+// fakeanthropic's OpenAI view has it too, so the suite can run against a
+// gateway whose deployment is Anthropic-backed.
+type upstreamFake interface {
+	BaseURL() string
+	Reset()
+	Script(fakeupstream.Behavior)
+	Requests() []fakeupstream.Request
+	WaitReceived(ctx context.Context, n int) error
+	Await(ctx context.Context, n int) ([]fakeupstream.Request, error)
+}
+
+// Upstream wire protocols the suite runs against.
+const (
+	wireOpenAI    = "openai"
+	wireAnthropic = "anthropic"
+)
+
 // suite runs the conformance cases against one base URL.
 type suite struct {
 	baseURL  string
 	apiKey   string
-	upstream *fakeupstream.Server
+	upstream upstreamFake
+	// anthropic is set when the gateway's deployment is Anthropic-backed:
+	// the upstream receives translated Messages API requests.
+	anthropic bool
 	// gateway is set when baseURL is the gateway rather than the fake.
 	// Assertions about gateway headers, forwarding, 404 model_not_found,
 	// auth and error mapping apply only then.
@@ -65,16 +86,28 @@ type suite struct {
 
 // runSuite drives the official SDK against baseURL with apiKey. upstream is
 // the fake behind it: baseURL is either upstream.BaseURL() itself or a
-// gateway whose only provider is upstream.
-func runSuite(t *testing.T, baseURL, apiKey string, upstream *fakeupstream.Server) {
+// gateway whose only provider is upstream. wire is the upstream's protocol;
+// with wireAnthropic, baseURL must be a gateway.
+//
+// Against Anthropic, the cases run unchanged except where the protocol
+// makes the OpenAI expectation impossible; each such case says why:
+// n > 1 is answered by the gateway (no Anthropic deployment has n), an
+// upstream 400's code and param have no Anthropic counterpart, the
+// upstream body is a translation (so it is not compared byte for byte),
+// and unknown request and response fields cannot cross the translation.
+func runSuite(t *testing.T, baseURL, apiKey string, upstream upstreamFake, wire string) {
 	transport := &http.Transport{MaxIdleConnsPerHost: 4}
 	t.Cleanup(transport.CloseIdleConnections)
 	s := &suite{
-		baseURL:  baseURL,
-		apiKey:   apiKey,
-		upstream: upstream,
-		gateway:  strings.TrimSuffix(baseURL, "/") != upstream.BaseURL(),
-		http:     &http.Client{Transport: transport},
+		baseURL:   baseURL,
+		apiKey:    apiKey,
+		upstream:  upstream,
+		anthropic: wire == wireAnthropic,
+		gateway:   strings.TrimSuffix(baseURL, "/") != upstream.BaseURL(),
+		http:      &http.Client{Transport: transport},
+	}
+	if s.anthropic && !s.gateway {
+		t.Fatal("the Anthropic upstream can only be reached through the gateway")
 	}
 	t.Run("plain chat", s.testPlainChat)
 	t.Run("streaming is incremental", s.testStreamingIncremental)
@@ -326,8 +359,9 @@ func (s *suite) checkSuccess(t *testing.T, r result, stream bool, want []answer)
 		if !strings.HasPrefix(h.Get("Content-Type"), "application/json") {
 			t.Errorf("Content-Type %q, want application/json", h.Get("Content-Type"))
 		}
-		// Golden: the body is the upstream's, byte for byte.
-		if !bytes.Equal(r.ex.respBody, up.ResponseBody) {
+		// Golden: the body is the upstream's, byte for byte. A translated
+		// Anthropic answer is covered by the adapter's golden tests.
+		if !s.anthropic && !bytes.Equal(r.ex.respBody, up.ResponseBody) {
 			t.Errorf("response body differs from the upstream's:\n got %s\nwant %s", r.ex.respBody, up.ResponseBody)
 		}
 	}
@@ -364,6 +398,10 @@ func (s *suite) checkSuccess(t *testing.T, r result, stream bool, want []answer)
 // provider key, never the client's.
 func (s *suite) checkForwarded(t *testing.T, ex *exchange, up fakeupstream.Request, stream bool) {
 	t.Helper()
+	if s.anthropic {
+		s.checkTranslated(t, up, stream)
+		return
+	}
 	if got := up.Header.Get("Authorization"); got != "Bearer "+providerKey {
 		t.Errorf("upstream Authorization %q, want the provider key", redactAuth(got))
 	}
@@ -418,6 +456,38 @@ func (s *suite) checkForwarded(t *testing.T, ex *exchange, up fakeupstream.Reque
 		if k != "include_usage" && !jsonEqual(t, v, gotOpts[k]) {
 			t.Errorf("upstream stream_options.%s = %s, want %s", k, gotOpts[k], v)
 		}
+	}
+}
+
+// checkTranslated checks what reached an Anthropic upstream: the provider
+// key in X-Api-Key, never an Authorization header or the client's key, and
+// a Messages request for the upstream model. The translation itself is
+// covered by the adapter's golden tests.
+func (s *suite) checkTranslated(t *testing.T, up fakeupstream.Request, stream bool) {
+	t.Helper()
+	if got := up.Header.Get("X-Api-Key"); got != providerKey {
+		t.Errorf("upstream X-Api-Key %q, want the provider key", redactAuth(got))
+	}
+	if got := up.Header.Get("Authorization"); got != "" {
+		t.Errorf("upstream Authorization %q, want none", redactAuth(got))
+	}
+	for name, values := range up.Header {
+		for _, v := range values {
+			if strings.Contains(v, s.apiKey) {
+				t.Errorf("upstream header %s carries the client's key", name)
+			}
+		}
+	}
+	got := decodeObject(t, up.Body)
+	var model string
+	if err := json.Unmarshal(got["model"], &model); err != nil || model != upstreamModel {
+		t.Errorf("upstream model %s, want %q", got["model"], upstreamModel)
+	}
+	if _, ok := got["messages"]; !ok {
+		t.Errorf("upstream body has no messages: %s", up.Body)
+	}
+	if gotStream := string(got["stream"]) == "true"; gotStream != stream {
+		t.Errorf("upstream stream %s, want %v", got["stream"], stream)
 	}
 }
 
@@ -604,6 +674,15 @@ func (s *suite) testN(t *testing.T) {
 		p := params()
 		p.N = openai.Int(3)
 		r := s.call(t, p, stream)
+		if s.anthropic {
+			// The Messages API has no n: the only deployment lacks the
+			// capability, so the gateway answers without the upstream.
+			s.checkError(t, r, apiErr{status: 400, typ: "invalid_request_error", code: "no_eligible_model", upstreamNotCalled: true})
+			if !strings.Contains(describe(r.err), "lacks capability n") {
+				t.Errorf("error %v does not name the missing capability", describe(r.err))
+			}
+			return
+		}
 		s.checkSuccess(t, r, stream, []answer{
 			{Content: fakeupstream.ChoiceText(0), Finish: "stop"},
 			{Content: fakeupstream.ChoiceText(1), Finish: "stop"},
@@ -687,11 +766,16 @@ func (s *suite) testErrors(t *testing.T) {
 		edit     func(*openai.ChatCompletionNewParams)
 		direct   *apiErr // nil: not run directly
 		gateway  *apiErr // nil: same as direct
+		// anthropic, when set, replaces gateway for an Anthropic upstream.
+		anthropic *apiErr
 	}{
 		{
 			name:     "400 from the upstream",
 			behavior: ptr(fakeupstream.APIError(400, "invalid_request_error", "invalid_value", "temperature", "Invalid 'temperature': decimal above maximum value.")),
 			direct:   &apiErr{status: 400, typ: "invalid_request_error", code: "invalid_value", param: "temperature", message: "Invalid 'temperature': decimal above maximum value."},
+			// An Anthropic error has a type and a message, but no code or
+			// param to carry over.
+			anthropic: &apiErr{status: 400, typ: "invalid_request_error", message: "Invalid 'temperature': decimal above maximum value."},
 		},
 		{
 			name:    "400 missing messages",
@@ -760,6 +844,9 @@ func (s *suite) testErrors(t *testing.T) {
 			want := tc.direct
 			if s.gateway && tc.gateway != nil {
 				want = tc.gateway
+			}
+			if s.anthropic && tc.anthropic != nil {
+				want = tc.anthropic
 			}
 			if want == nil {
 				t.Skip("gateway-only case")
@@ -853,7 +940,14 @@ func (s *suite) checkError(t *testing.T, r result, want apiErr) {
 // SDK sees the chunks sent so far, then an error.
 func (s *suite) testMidStreamError(t *testing.T) {
 	s.reset(t)
-	s.upstream.Script(fakeupstream.Behavior{Fault: fakeupstream.FaultDrop, FaultAfterChunks: 3})
+	// Against Anthropic the fault counts Messages API events, which are
+	// not one to one with chunks: message_start, content_block_start, a
+	// ping and two text deltas give three chunks.
+	after := 3
+	if s.anthropic {
+		after = 5
+	}
+	s.upstream.Script(fakeupstream.Behavior{Fault: fakeupstream.FaultDrop, FaultAfterChunks: after})
 	r := s.call(t, params(), true)
 	if r.err == nil {
 		t.Fatalf("stream ended cleanly after %d chunks, want an error", r.chunks)
@@ -881,6 +975,9 @@ func (s *suite) testMidStreamError(t *testing.T) {
 }
 
 func (s *suite) testUnknownFields(t *testing.T) {
+	if s.anthropic {
+		t.Skip("OpenAI-only: unknown request fields cannot reach an Anthropic upstream; the adapter translates only the fields it maps")
+	}
 	// A big integer and an exponent survive only lossless forwarding.
 	const extension = `{"nested":{"big":12345678901234567890,"tiny":1.0e-7,"list":[1,"two",null,true,{}]},"text":"caf\u00e9 <&>"}`
 	streamModes(t, func(t *testing.T, stream bool) {
@@ -904,6 +1001,9 @@ func (s *suite) testUnknownFields(t *testing.T) {
 // byte (checkSuccess compares it with what the upstream sent), and every
 // stream chunk keeps them too.
 func (s *suite) testUnknownResponseFields(t *testing.T) {
+	if s.anthropic {
+		t.Skip("OpenAI-only: the adapter builds chat.completion objects from the Message, so unknown upstream fields are not passed through")
+	}
 	extra := map[string]json.RawMessage{
 		// A big integer and an exponent survive only lossless forwarding.
 		"x_upstream_extension": json.RawMessage(`{"big":12345678901234567890,"tiny":1.0e-7,"list":[1,"two",null,true,{}],"text":"caf\u00e9 <&>"}`),

@@ -4,5 +4,7 @@ models:
     deployments:
       - provider: gpu-cluster
         upstream_model: meta-llama/Llama-3.3-70B-Instruct
+        pricing: { input: 0.10, output: 0.10 }
       - provider: together
         upstream_model: meta-llama/Llama-3.3-70B-Instruct-Turbo
+        pricing: { input: "0.88", output: "0.88" }

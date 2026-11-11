@@ -21,7 +21,7 @@ type includeMatch struct {
 }
 
 // includeFiles resolves the include patterns in inc, parses each matched file
-// and appends its providers and models to the root mapping.
+// and appends its providers, models and aliases to the root mapping.
 func (st *loadState) includeFiles(root, inc *yaml.Node) {
 	if inc.Kind != yaml.SequenceNode {
 		return // the decoder reports the type error
@@ -92,7 +92,7 @@ func (st *loadState) includeFile(root *yaml.Node, m includeMatch) {
 		return
 	}
 	if doc.Kind != yaml.MappingNode {
-		st.addProblem(SeverityError, doc, "", "an included file must be a mapping of providers and models, got "+kindName(doc))
+		st.addProblem(SeverityError, doc, "", "an included file must be a mapping of providers, models and aliases, got "+kindName(doc))
 		return
 	}
 	seen := make(map[string]bool)
@@ -123,6 +123,19 @@ func (st *loadState) includeFile(root *yaml.Node, m includeMatch) {
 			if dst := rootSequence(root, k.Value); dst != nil {
 				dst.Content = append(dst.Content, v.Content...)
 			}
+		case "aliases":
+			v = resolveAlias(v)
+			if v.Kind == yaml.ScalarNode && v.ShortTag() == nullTag {
+				continue
+			}
+			if v.Kind != yaml.MappingNode {
+				st.addProblem(SeverityError, v, k.Value, "expected a mapping, got "+kindName(v))
+				continue
+			}
+			// The decoder reports a name defined twice, in any files.
+			if dst := rootMapping(root, k.Value); dst != nil {
+				dst.Content = append(dst.Content, v.Content...)
+			}
 		default:
 			// A key that looks like a credential is not echoed.
 			shown := shownKey(k.Value)
@@ -131,7 +144,7 @@ func (st *loadState) includeFile(root *yaml.Node, m includeMatch) {
 				what = strconv.Quote(shown)
 			}
 			st.addProblem(SeverityError, k, shown, fmt.Sprintf(
-				"%s is not allowed in included file %s; only version, providers and models are", what, m.file))
+				"%s is not allowed in included file %s; only version, providers, models and aliases are", what, m.file))
 		}
 	}
 }
@@ -152,6 +165,27 @@ func rootSequence(root *yaml.Node, key string) *yaml.Node {
 		return v
 	case v.Kind == yaml.ScalarNode && v.ShortTag() == nullTag:
 		v.Kind, v.Tag, v.Value = yaml.SequenceNode, "!!seq", ""
+		return v
+	}
+	return nil
+}
+
+// rootMapping returns the root mapping's mapping for key, creating it if
+// the key is absent or null. It returns nil if the key holds something else,
+// which the decoder reports as a type error.
+func rootMapping(root *yaml.Node, key string) *yaml.Node {
+	v := mappingValue(root, key)
+	if v == nil {
+		v = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, v)
+		return v
+	}
+	v = resolveAlias(v)
+	switch {
+	case v.Kind == yaml.MappingNode:
+		return v
+	case v.Kind == yaml.ScalarNode && v.ShortTag() == nullTag:
+		v.Kind, v.Tag, v.Value = yaml.MappingNode, "!!map", ""
 		return v
 	}
 	return nil

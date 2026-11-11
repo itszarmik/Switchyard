@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 )
 
 // Request fields the gateway reads or edits.
@@ -33,6 +34,10 @@ const (
 	fieldTemperature         = "temperature"
 	fieldMaxTokens           = "max_tokens"
 	fieldMaxCompletionTokens = "max_completion_tokens"
+	fieldTopP                = "top_p"
+	fieldFrequencyPenalty    = "frequency_penalty"
+	fieldPresencePenalty     = "presence_penalty"
+	fieldParallelToolCalls   = "parallel_tool_calls"
 )
 
 // Error codes of RequestError, following OpenAI's validation errors.
@@ -110,35 +115,15 @@ type ResponseFormat struct {
 func DecodeChatRequest(data []byte) (*ChatRequest, error) {
 	obj, err := parseObject(data)
 	if err != nil {
-		msg := "We could not parse the JSON body of your request. The API expects a JSON object in the request body."
-		if errors.Is(err, errNotObject) {
-			msg = "The request body must be a JSON object."
-		}
-		return nil, &RequestError{Code: CodeInvalidJSON, Message: msg}
+		return nil, invalidBody(err)
 	}
-	r := &ChatRequest{obj: obj}
+	model, rerr := decodeModel(obj)
+	if rerr != nil {
+		return nil, rerr
+	}
+	r := &ChatRequest{obj: obj, model: model}
 
-	raw, ok := obj.get(fieldModel)
-	if !ok || isNull(raw) {
-		return nil, missing(fieldModel)
-	}
-	if err := json.Unmarshal(raw, &r.model); err != nil {
-		return nil, invalidType(fieldModel, "a string", raw)
-	}
-	if r.model == "" {
-		return nil, missing(fieldModel)
-	}
-	if len(r.model) > MaxModelLength {
-		// The message gives the length, never the value.
-		return nil, &RequestError{
-			Param: fieldModel,
-			Code:  CodeInvalidValue,
-			Message: fmt.Sprintf("Invalid 'model': string too long. Expected a string with maximum length %d bytes, but got a string with length %d instead.",
-				MaxModelLength, len(r.model)),
-		}
-	}
-
-	raw, ok = obj.get(fieldMessages)
+	raw, ok := obj.get(fieldMessages)
 	if !ok || isNull(raw) {
 		return nil, missing(fieldMessages)
 	}
@@ -166,6 +151,41 @@ func DecodeChatRequest(data []byte) (*ChatRequest, error) {
 	return r, nil
 }
 
+// invalidBody is the error for a body that is not one JSON object.
+func invalidBody(err error) *RequestError {
+	msg := "We could not parse the JSON body of your request. The API expects a JSON object in the request body."
+	if errors.Is(err, errNotObject) {
+		msg = "The request body must be a JSON object."
+	}
+	return &RequestError{Code: CodeInvalidJSON, Message: msg}
+}
+
+// decodeModel reads and validates the model field: a non-empty string of
+// at most MaxModelLength bytes.
+func decodeModel(obj *object) (string, *RequestError) {
+	raw, ok := obj.get(fieldModel)
+	if !ok || isNull(raw) {
+		return "", missing(fieldModel)
+	}
+	var model string
+	if err := json.Unmarshal(raw, &model); err != nil {
+		return "", invalidType(fieldModel, "a string", raw)
+	}
+	if model == "" {
+		return "", missing(fieldModel)
+	}
+	if len(model) > MaxModelLength {
+		// The message gives the length, never the value.
+		return "", &RequestError{
+			Param: fieldModel,
+			Code:  CodeInvalidValue,
+			Message: fmt.Sprintf("Invalid 'model': string too long. Expected a string with maximum length %d bytes, but got a string with length %d instead.",
+				MaxModelLength, len(model)),
+		}
+	}
+	return model, nil
+}
+
 func missing(param string) *RequestError {
 	return &RequestError{
 		Param:   param,
@@ -186,15 +206,12 @@ func invalidType(param, want string, got json.RawMessage) *RequestError {
 // message that is not an object, or whose role is not a string, gets an
 // empty role; the upstream rejects such messages itself.
 func decodeMessage(raw json.RawMessage) Message {
-	var m struct {
-		Role    json.RawMessage `json:"role"`
-		Content json.RawMessage `json:"content"`
-	}
-	if err := json.Unmarshal(raw, &m); err != nil {
+	m, ok := members(raw)
+	if !ok {
 		return Message{}
 	}
-	role, _ := decodeField[string](m.Role, m.Role != nil)
-	return Message{Role: role, Content: m.Content}
+	role, _ := member[string](m, "role")
+	return Message{Role: role, Content: m["content"]}
 }
 
 // Model returns the requested model, as the client sent it.
@@ -206,8 +223,23 @@ func (r *ChatRequest) Stream() bool { return r.stream }
 // StreamOptions returns the decoded stream_options, and false if the field
 // is absent, null or not an object of the expected shape.
 func (r *ChatRequest) StreamOptions() (StreamOptions, bool) {
-	raw, ok := r.obj.get(fieldStreamOptions)
-	return decodeField[StreamOptions](raw, ok)
+	return decodeStreamOptions(r.obj.get(fieldStreamOptions))
+}
+
+// decodeStreamOptions decodes a present stream_options value, matching
+// member names exactly. It reports false if the value is absent, null, not
+// an object, or has an include_usage that is neither a boolean nor null.
+func decodeStreamOptions(raw json.RawMessage, present bool) (StreamOptions, bool) {
+	m, ok := members(raw)
+	if !present || !ok {
+		return StreamOptions{}, false
+	}
+	v, ok := m["include_usage"]
+	if !ok || isNull(v) {
+		return StreamOptions{}, true
+	}
+	inc, ok := decodeField[bool](v, true)
+	return StreamOptions{IncludeUsage: inc}, ok
 }
 
 // IncludeUsage reports whether the client itself set
@@ -219,9 +251,12 @@ func (r *ChatRequest) IncludeUsage() bool {
 
 // N returns the number of choices requested, and false if n is absent,
 // null or not an integer.
-func (r *ChatRequest) N() (int, bool) {
-	raw, ok := r.obj.get(fieldN)
-	f, ok := decodeField[float64](raw, ok)
+func (r *ChatRequest) N() (int, bool) { return intField(r.obj, fieldN) }
+
+// intField returns an integer field that fits an int32, and false if it is
+// absent, null or not an integer.
+func intField(o *object, name string) (int, bool) {
+	f, ok := decodeField[float64](o.get(name))
 	if !ok || f != math.Trunc(f) || f < math.MinInt32 || f > math.MaxInt32 {
 		return 0, false
 	}
@@ -248,9 +283,19 @@ func (r *ChatRequest) ToolChoice() json.RawMessage {
 
 // ResponseFormat returns the decoded response_format, and false if it is
 // absent, null or not an object of the expected shape.
+// Member names are matched exactly.
 func (r *ChatRequest) ResponseFormat() (ResponseFormat, bool) {
 	raw, ok := r.obj.get(fieldResponseFormat)
-	return decodeField[ResponseFormat](raw, ok)
+	m, isObj := members(raw)
+	if !ok || !isObj {
+		return ResponseFormat{}, false
+	}
+	t, ok := m["type"]
+	if !ok || isNull(t) {
+		return ResponseFormat{}, true
+	}
+	typ, ok := decodeField[string](t, true)
+	return ResponseFormat{Type: typ}, ok
 }
 
 // Logprobs reports whether logprobs is true.
@@ -297,9 +342,23 @@ func (r *ChatRequest) Field(name string) (json.RawMessage, bool) {
 // stream_options.include_usage is set to true. Other stream_options members
 // are kept; a stream_options value that is not an object is replaced.
 func (r *ChatRequest) Encode(upstreamModel string) []byte {
-	o := r.obj.clone()
+	return r.EncodeFor(upstreamModel, true)
+}
+
+// EncodeFor is Encode, with injectUsage deciding whether a streamed
+// request gets stream_options.include_usage. Without it, stream_options is
+// forwarded exactly as the client sent it (or not at all), for upstreams
+// that reject the option.
+func (r *ChatRequest) EncodeFor(upstreamModel string, injectUsage bool) []byte {
+	return encodeRequest(r.obj, upstreamModel, r.stream && injectUsage)
+}
+
+// encodeRequest returns o with model replaced and, when injectUsage is set,
+// stream_options.include_usage set to true.
+func encodeRequest(obj *object, upstreamModel string, injectUsage bool) []byte {
+	o := obj.clone()
 	o.set(fieldModel, encodeString(upstreamModel))
-	if r.stream {
+	if injectUsage {
 		opts := &object{vals: map[string]json.RawMessage{}}
 		if raw, ok := o.get(fieldStreamOptions); ok {
 			if parsed, err := parseObject(raw); err == nil {
@@ -310,4 +369,41 @@ func (r *ChatRequest) Encode(upstreamModel string) []byte {
 		o.set(fieldStreamOptions, opts.encode())
 	}
 	return o.encode()
+}
+
+// Without returns a copy of r with the named top-level fields removed, and
+// the names of those that were present, in the order given. It never
+// removes model, messages or stream. r itself is unchanged.
+func (r *ChatRequest) Without(fields ...string) (*ChatRequest, []string) {
+	o, removed := without(r.obj, fields, fieldModel, fieldMessages, fieldStream)
+	if len(removed) == 0 {
+		return r, nil
+	}
+	c := *r
+	c.obj = o
+	return &c, removed
+}
+
+// without returns a copy of obj without fields, except those in keep, and
+// the fields that were present. When none was, it returns obj itself.
+func without(obj *object, fields []string, keep ...string) (*object, []string) {
+	var removed []string
+	var o *object
+	for _, f := range fields {
+		if slices.Contains(keep, f) || slices.Contains(removed, f) {
+			continue
+		}
+		if _, ok := obj.get(f); !ok {
+			continue
+		}
+		if o == nil {
+			o = obj.clone()
+		}
+		o.delete(f)
+		removed = append(removed, f)
+	}
+	if o == nil {
+		return obj, nil
+	}
+	return o, removed
 }

@@ -21,9 +21,33 @@ import (
 	"switchyard/internal/apierror"
 	"switchyard/internal/config"
 	"switchyard/internal/providers"
+	"switchyard/internal/providers/anthropic"
+	"switchyard/internal/providers/openai"
 	"switchyard/internal/reqctx"
 	"switchyard/internal/schema"
 )
+
+// allCapabilities is every capability in the vocabulary.
+var allCapabilities = func() []string {
+	var out []string
+	for _, c := range schema.Vocabulary() {
+		out = append(out, string(c))
+	}
+	return out
+}()
+
+// price returns a deployment price; it panics on a bad literal.
+func price(in, out string) config.Pricing {
+	p := config.Pricing{}
+	var err error
+	if p.Input, err = config.ParsePrice(in); err != nil {
+		panic(err)
+	}
+	if p.Output, err = config.ParsePrice(out); err != nil {
+		panic(err)
+	}
+	return p
+}
 
 func testConfig() *config.Config {
 	return &config.Config{
@@ -32,11 +56,13 @@ func testConfig() *config.Config {
 			{ID: "anth", Type: "anthropic", BaseURL: "https://api.anthropic.test"},
 		},
 		Models: []config.Model{
-			{ID: "gpt-test", Deployments: []config.Deployment{
-				{Provider: "fake", UpstreamModel: "upstream-gpt"},
-				{Provider: "anth", UpstreamModel: "ignored-second"},
+			{ID: "gpt-test", Capabilities: allCapabilities, Deployments: []config.Deployment{
+				{Provider: "fake", UpstreamModel: "upstream-gpt", Pricing: price("1", "2")},
+				{Provider: "anth", UpstreamModel: "pricier-second", Pricing: price("3", "4")},
 			}},
-			{ID: "claude-test", Deployments: []config.Deployment{{Provider: "anth", UpstreamModel: "claude"}}},
+			{ID: "claude-test", Capabilities: []string{"streaming", "tools"}, Deployments: []config.Deployment{
+				{Provider: "anth", UpstreamModel: "claude", Pricing: price("1", "2")},
+			}},
 		},
 	}
 }
@@ -116,17 +142,13 @@ func TestNew(t *testing.T) {
 		}
 	})
 
-	t.Run("first deployment wins and unsupported types are kept", func(t *testing.T) {
-		g, logs, _ := newTestGateway(t)
-		tg := g.targets["gpt-test"]
-		if tg.provider != "fake" || tg.upstreamModel != "upstream-gpt" || tg.adapter == nil {
-			t.Errorf("gpt-test target = %+v", tg)
+	t.Run("one adapter per provider, of its type", func(t *testing.T) {
+		g, _, _ := newTestGateway(t)
+		if _, ok := g.adapters["fake"].(*openai.Adapter); !ok {
+			t.Errorf("fake adapter = %T", g.adapters["fake"])
 		}
-		if tg := g.targets["claude-test"]; tg.adapter != nil || tg.providerType != "anthropic" {
-			t.Errorf("claude-test target = %+v", tg)
-		}
-		if len(logs.find(t, "provider type not supported yet; its models will return errors")) != 1 {
-			t.Error("unsupported provider type not logged")
+		if _, ok := g.adapters["anth"].(*anthropic.Adapter); !ok {
+			t.Errorf("anth adapter = %T", g.adapters["anth"])
 		}
 	})
 }
@@ -423,10 +445,16 @@ func TestChatCompletionsPipeline(t *testing.T) {
 			wantCode: "model_not_found",
 		},
 		{
-			name:     "unsupported provider type",
-			body:     `{"model":"claude-test","messages":[{}]}`,
-			want:     []string{"error 502 upstream_error"},
-			wantCode: "upstream_error",
+			name:     "virtual model",
+			body:     `{"model":"auto","messages":[{}]}`,
+			want:     []string{"error 400 model_not_supported"},
+			wantCode: "model_not_supported",
+		},
+		{
+			name:     "no eligible deployment",
+			body:     `{"model":"claude-test","messages":[{}],"n":2}`,
+			want:     []string{"error 400 no_eligible_model"},
+			wantCode: "no_eligible_model",
 		},
 		{
 			name:    "stream commits after the first upstream event and strips usage",
@@ -500,7 +528,7 @@ func TestChatCompletionsPipeline(t *testing.T) {
 			var log []string
 			ad := tt.adapter
 			ad.log = &log
-			g.targets["gpt-test"].adapter = &ad
+			g.adapters["fake"] = &ad
 			ex := &fakeExchange{body: []byte(tt.body), bodyErr: tt.bodyErr, header: http.Header{}, log: &log, failAt: tt.failAt}
 			ctx, ann := annotated(logs)
 
@@ -539,7 +567,7 @@ func annotations(a *reqctx.Annotations) map[string]any {
 func TestCompletionAnnotations(t *testing.T) {
 	g, logs, reg := newTestGateway(t)
 	var log []string
-	g.targets["gpt-test"].adapter = &fakeAdapter{
+	g.adapters["fake"] = &fakeAdapter{
 		log: &log, chunks: []string{`{"choices":[{"index":0}]}`},
 		usage: &schema.Usage{PromptTokens: 11, CompletionTokens: 22},
 	}
@@ -674,7 +702,7 @@ func TestOverheadExcludesClientWrites(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g, logs, _ := newTestGateway(t)
 			var log []string
-			g.targets["gpt-test"].adapter = &fakeAdapter{log: &log, chunks: tt.chunks}
+			g.adapters["fake"] = &fakeAdapter{log: &log, chunks: tt.chunks}
 			ctx, ann := annotated(logs)
 			g.ChatCompletions(ctx, &fakeExchange{body: []byte(tt.body), log: &log, header: http.Header{}, slow: slow})
 

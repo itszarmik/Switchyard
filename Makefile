@@ -62,6 +62,10 @@ bench-overhead: ## Measure the gateway's added latency (pass flags with BENCH_FL
 smoke: ## Run the live smoke test against a real provider (needs OPENAI_API_KEY; SMOKE_MODEL optional).
 	$(GO) test -tags smoke -count=1 -v ./test/smoke/...
 
+.PHONY: record-fixtures
+record-fixtures: ## Record Anthropic API fixtures (needs ANTHROPIC_API_KEY; skips without it).
+	$(GO) test -tags record -count=1 -v -run TestRecordFixtures ./test/fakeanthropic/...
+
 fmt: ## Format the code (gofmt, goimports).
 	$(GOLANGCI_LINT) fmt
 

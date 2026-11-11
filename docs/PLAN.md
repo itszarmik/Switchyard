@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0 and P1 complete locally** (2026-11-09). CI and the P1 live smoke test have not run yet. Next: P2. |
+| Status | Design approved. **P0–P2 complete** and committed on `main`. Next: P3. CI and the live smoke tests have not run yet. |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -141,13 +141,30 @@ The access log and completion log are now one line per request (DESIGN §15.1). 
 
 **Acceptance**
 
-- [ ] The P1 conformance suite passes unchanged against the Anthropic adapter, using a fake Anthropic upstream that replays fixtures, streaming tool calls included.
-- [ ] Golden tests cover every row of the Anthropic mapping table: requests, responses, stream events, errors and usage.
-- [ ] A request that needs a capability a deployment lacks is never sent there. Examples: `n = 2` on Anthropic, images on a text-only model, temperature 1.5 on a model limited to 1.0. It goes to a capable deployment instead, or fails with a 400 that names the reason.
-- [ ] A model offered by two providers is served by the cheaper one, and `model@provider` pins the other.
-- [ ] `/v1/completions` works against a chat-only deployment through the shim, marked by `X-Switchyard-Shim: chat`. Legacy parameters the shim can't honor (`echo`, `suffix`, `logprobs`) return 400.
-- [ ] `/v1/embeddings` never switches to a different model.
-- [ ] `catalog lint` flags missing prices, quality values outside [0, 1], unknown providers and duplicate IDs.
+- [x] The P1 conformance suite passes unchanged against the Anthropic adapter, using a fake Anthropic upstream that replays fixtures, streaming tool calls included.
+- [x] Golden tests cover every row of the Anthropic mapping table: requests, responses, stream events, errors and usage.
+- [x] A request that needs a capability a deployment lacks is never sent there. Examples: `n = 2` on Anthropic, images on a text-only model, temperature 1.5 on a model limited to 1.0. It goes to a capable deployment instead, or fails with a 400 that names the reason.
+- [x] A model offered by two providers is served by the cheaper one, and `model@provider` pins the other.
+- [x] `/v1/completions` works against a chat-only deployment through the shim, marked by `X-Switchyard-Shim: chat`. Legacy parameters the shim can't honor (`echo`, `suffix`, `logprobs`) return 400.
+- [x] `/v1/embeddings` never switches to a different model.
+- [x] `catalog lint` flags missing prices, quality values outside [0, 1], unknown providers and duplicate IDs.
+
+**P2 outcome.**
+
+- **Conformance through Anthropic:** the P1 conformance suite runs through the binary against a fake Anthropic upstream. Two skips are named and inherently OpenAI-only (unknown request fields and unknown response fields), and n > 1 is asserted as `no_eligible_model`.
+- **Catalog:** 11 models across OpenAI, Anthropic, Gemini (compat endpoint) and Together. Prices were verified on 2026-11-11 against the providers' official pricing pages. The self-hosted entry is commented out until the operator supplies an amortized price.
+- **New capabilities:** research found `sampling` and `forced_tools`.
+  - Several current models reject temperature/top_p or a forced tool_choice.
+  - Missing `sampling` always drops temperature and top_p.
+- **Capability definition:** `json_schema` means native structured output.
+- **Reviews:** independent security and correctness reviews found 11 issues. All are fixed with regression tests. The main ones:
+  - a JSON-escaped provider key slipping past the echo guard (high);
+  - base64 images counted as text tokens (high);
+  - case-folded JSON keys hiding an image from the vision filter.
+- **Overhead regression check:** borderline on this machine. The c100 run measured 4.8–5.3 ms p99 added at load averages of 6–21, and A/B runs against the P1 binary under the same load measured the same. Re-check on a quiet machine.
+- **Follow-ups:**
+  - strict tool `input_schema` is not transformed for Anthropic yet;
+  - long-context price tiers and cache-write token accounting are Phase 4.
 
 ## P3: Reliability (retries, fallback, circuit breakers)
 

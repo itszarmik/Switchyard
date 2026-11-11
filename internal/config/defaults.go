@@ -23,6 +23,8 @@ const (
 	defaultFirstTokenTimeout = 30 * time.Second
 	defaultIdleChunkTimeout  = 60 * time.Second
 	defaultTotalTimeout      = 10 * time.Minute
+	defaultModelType         = ModelTypeChat
+	defaultTokenRatio        = 1.0
 )
 
 // applyDefaults fills zero-valued fields with their documented defaults.
@@ -46,6 +48,11 @@ func applyDefaults(c *Config) {
 		setDefault(&t.FirstToken, Duration(defaultFirstTokenTimeout))
 		setDefault(&t.Idle, Duration(defaultIdleChunkTimeout))
 		setDefault(&t.Total, Duration(defaultTotalTimeout))
+	}
+	for i := range c.Models {
+		m := &c.Models[i]
+		setDefault(&m.Type, defaultModelType)
+		setDefault(&m.TokenRatio, defaultTokenRatio)
 	}
 }
 

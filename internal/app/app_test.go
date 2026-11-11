@@ -68,6 +68,7 @@ models:
     deployments:
       - provider: openai
         upstream_model: gpt-5-mini
+        pricing: {input: "0.25", output: "2.00"}
 tenants:
   - id: test
     keys:

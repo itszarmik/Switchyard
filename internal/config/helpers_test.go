@@ -131,14 +131,25 @@ func isNoTenantsWarning(p Problem) bool {
 	return p.Severity == SeverityWarning && p.Path == "tenants" && p.Message == msgNoTenants
 }
 
+// isPricingWarning reports whether p is the warning every deployment without
+// prices gets.
+func isPricingWarning(p Problem) bool {
+	return p.Severity == SeverityWarning && p.Message == MsgPricingUnknown
+}
+
 // checkProblems asserts that problems contains exactly the wanted ones, in
 // any order. The no-tenants warning comes with every config that defines no
-// tenants, and most tests are about something else, so it is ignored unless
-// one of wants names the tenants path.
+// tenants, and the pricing warning with every deployment that has no prices.
+// Most tests are about something else, so the no-tenants warning is ignored
+// unless one of wants names the tenants path, and pricing warnings unless
+// one of wants is a pricing warning.
 func checkProblems(t *testing.T, got []Problem, wants ...want) {
 	t.Helper()
 	if !slices.ContainsFunc(wants, func(w want) bool { return w.path == "tenants" }) {
 		got = slices.DeleteFunc(slices.Clone(got), isNoTenantsWarning)
+	}
+	if !slices.ContainsFunc(wants, func(w want) bool { return w.msg == MsgPricingUnknown }) {
+		got = slices.DeleteFunc(slices.Clone(got), isPricingWarning)
 	}
 	used := make([]bool, len(got))
 	for _, w := range wants {
@@ -169,4 +180,14 @@ func formatProblems(ps []Problem) string {
 		b.WriteString("  " + p.String() + "\n")
 	}
 	return b.String()
+}
+
+// mustPrice parses a Price or fails the test.
+func mustPrice(t *testing.T, s string) Price {
+	t.Helper()
+	p, err := ParsePrice(s)
+	if err != nil {
+		t.Fatalf("ParsePrice(%q): %v", s, err)
+	}
+	return p
 }

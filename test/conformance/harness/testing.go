@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -29,6 +30,19 @@ type RunOptions struct {
 // failed, logs the gateway's output.
 func Run(t testing.TB, cfg Config, opts RunOptions) *Gateway {
 	t.Helper()
+	b, err := cfg.YAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return RunYAML(t, b, opts)
+}
+
+// RunYAML is Run with a config file written by the caller, for gateways
+// that Config cannot describe (several providers, aliases, prices,
+// routing settings). The file should bind both listeners to 127.0.0.1:0
+// and log JSON, as Config.YAML does.
+func RunYAML(t testing.TB, config []byte, opts RunOptions) *Gateway {
+	t.Helper()
 	dir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
 	defer cancel()
@@ -37,7 +51,7 @@ func Run(t testing.TB, cfg Config, opts RunOptions) *Gateway {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(dir, "switchyard.yaml")
-	if err := WriteConfig(cfgPath, cfg); err != nil {
+	if err := os.WriteFile(cfgPath, config, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	g, err := Start(ctx, bin, cfgPath, StartOptions{Env: opts.Env})

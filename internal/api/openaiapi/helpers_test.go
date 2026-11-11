@@ -21,6 +21,7 @@ import (
 	"switchyard/internal/api/openaiapi"
 	"switchyard/internal/config"
 	"switchyard/internal/gateway"
+	"switchyard/internal/schema"
 	"switchyard/internal/server"
 )
 
@@ -183,9 +184,11 @@ func newEnvWith(t *testing.T, h func(u *upstream, w http.ResponseWriter, r *http
 			{ID: "anth", Type: "anthropic", BaseURL: "https://api.anthropic.test"},
 		},
 		Models: []config.Model{
-			{ID: "gpt-test", Deployments: []config.Deployment{{Provider: "fake", UpstreamModel: "upstream-gpt"}}},
-			{ID: "claude-test", Deployments: []config.Deployment{{Provider: "anth", UpstreamModel: "claude"}}},
+			{ID: "gpt-test", Capabilities: allCapabilities(), Deployments: []config.Deployment{{Provider: "fake", UpstreamModel: "upstream-gpt"}}},
+			{ID: "claude-test", Capabilities: []string{"streaming"}, Deployments: []config.Deployment{{Provider: "anth", UpstreamModel: "claude"}}},
+			{ID: "embed-test", Type: config.ModelTypeEmbedding, Deployments: []config.Deployment{{Provider: "fake", UpstreamModel: "upstream-embed"}}},
 		},
+		Aliases: map[string]string{"gpt-alias": "gpt-test@fake"},
 	}
 	for _, m := range mutate {
 		m(cfg)
@@ -223,11 +226,26 @@ func newEnvWith(t *testing.T, h func(u *upstream, w http.ResponseWriter, r *http
 	return &env{url: "http://" + srv.PublicAddr(), addr: srv.PublicAddr(), logs: logs, reg: reg, up: up}
 }
 
+// allCapabilities is every capability in the vocabulary.
+func allCapabilities() []string {
+	var out []string
+	for _, c := range schema.Vocabulary() {
+		out = append(out, string(c))
+	}
+	return out
+}
+
 // post sends a chat completion request with the client key. The caller
 // closes the response body.
 func (e *env) post(ctx context.Context, t *testing.T, body string, header http.Header) *http.Response {
 	t.Helper()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.url+"/v1/chat/completions", strings.NewReader(body))
+	return e.postTo(ctx, t, "/v1/chat/completions", body, header)
+}
+
+// postTo is post to another path.
+func (e *env) postTo(ctx context.Context, t *testing.T, path, body string, header http.Header) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.url+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,9 +270,15 @@ type result struct {
 // call sends body and returns the response and its whole body.
 func (e *env) call(t *testing.T, body string) (result, string) {
 	t.Helper()
+	return e.callPath(t, "/v1/chat/completions", body)
+}
+
+// callPath is call on another path.
+func (e *env) callPath(t *testing.T, path, body string) (result, string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	resp := e.post(ctx, t, body, nil)
+	resp := e.postTo(ctx, t, path, body, nil)
 	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {

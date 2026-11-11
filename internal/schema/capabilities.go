@@ -3,6 +3,7 @@ package schema
 import (
 	"encoding/json"
 	"slices"
+	"strings"
 )
 
 // Capability is a feature a deployment must support to serve a request.
@@ -16,7 +17,8 @@ const (
 	CapVision Capability = "vision"
 	// CapJSONMode: response_format is json_object.
 	CapJSONMode Capability = "json_mode"
-	// CapJSONSchema: response_format is json_schema.
+	// CapJSONSchema: response_format is json_schema. A deployment with it
+	// supports native structured output; it is never emulated.
 	CapJSONSchema Capability = "json_schema"
 	// CapN: more than one choice is requested.
 	CapN Capability = "n"
@@ -49,6 +51,14 @@ func (s CapabilitySet) Sorted() []Capability {
 
 // RequiredCapabilities returns the capabilities a deployment needs to serve
 // r. Values of the wrong type are ignored, since the upstream rejects them.
+//
+// Besides the features a request uses (tools, images, response formats,
+// n > 1, logprobs, seed, streaming), it reports: sampling when temperature
+// or top_p is set; temperature_2 when temperature is above 1; penalties
+// for a non-zero frequency_penalty or presence_penalty; parallel_tools when
+// parallel_tool_calls is explicitly true; and forced_tools when tool_choice
+// is "required" or an object naming a function. stream_usage is never
+// required: it only decides whether the gateway asks for usage.
 func (r *ChatRequest) RequiredCapabilities() CapabilitySet {
 	s := CapabilitySet{}
 	add := func(c Capability, cond bool) {
@@ -62,13 +72,47 @@ func (r *ChatRequest) RequiredCapabilities() CapabilitySet {
 		add(CapJSONMode, rf.Type == "json_object")
 		add(CapJSONSchema, rf.Type == "json_schema")
 	}
-	n, ok := r.N()
-	add(CapN, ok && n > 1)
 	add(CapLogprobs, r.Logprobs())
-	_, ok = r.Seed()
-	add(CapSeed, ok)
+	add(CapParallelTools, isTrue(r.obj, fieldParallelToolCalls))
+	add(CapForcedTools, forcesTool(r.ToolChoice()))
 	add(CapStreaming, r.Stream())
+	addCommon(r.obj, add)
 	return s
+}
+
+// addCommon reports the capabilities that chat and legacy completion
+// requests share: n > 1, seed, sampling, temperature_2 and penalties.
+func addCommon(o *object, add func(Capability, bool)) {
+	n, ok := intField(o, fieldN)
+	add(CapN, ok && n > 1)
+	_, ok = decodeField[int64](o.get(fieldSeed))
+	add(CapSeed, ok)
+	temp, hasTemp := decodeField[float64](o.get(fieldTemperature))
+	_, hasTopP := decodeField[float64](o.get(fieldTopP))
+	add(CapSampling, hasTemp || hasTopP)
+	add(CapTemperature2, hasTemp && temp > 1)
+	fp, _ := decodeField[float64](o.get(fieldFrequencyPenalty))
+	pp, _ := decodeField[float64](o.get(fieldPresencePenalty))
+	add(CapPenalties, fp != 0 || pp != 0)
+}
+
+// isTrue reports whether field is the JSON literal true.
+func isTrue(o *object, field string) bool {
+	v, _ := decodeField[bool](o.get(field))
+	return v
+}
+
+// forcesTool reports whether a tool_choice value forces a tool call:
+// "required", or an object such as {"type":"function","function":{…}}.
+func forcesTool(raw json.RawMessage) bool {
+	if raw == nil || isNull(raw) {
+		return false
+	}
+	var str string
+	if json.Unmarshal(raw, &str) == nil {
+		return str == "required"
+	}
+	return jsonKind(raw) == "an object"
 }
 
 // hasFunctions reports whether the deprecated functions array is non-empty.
@@ -81,18 +125,37 @@ func (r *ChatRequest) hasFunctions() bool {
 // hasImage reports whether any message has a content part of type
 // image_url.
 func (r *ChatRequest) hasImage() bool {
+	n, _ := r.ImageParts()
+	return n > 0
+}
+
+// ImageParts returns the number of content parts of type image_url across
+// the messages, and the total length in bytes of their data: URLs, the
+// inline image data that is part of the body. The type member is matched
+// exactly (see members).
+func (r *ChatRequest) ImageParts() (count, inlineBytes int) {
 	for _, m := range r.messages {
-		parts, ok := decodeField[[]struct {
-			Type string `json:"type"`
-		}](m.Content, m.Content != nil)
+		if jsonKind(m.Content) != "an array" {
+			continue // a string or null: no parts, and no decoding error to build
+		}
+		parts, ok := decodeField[[]json.RawMessage](m.Content, m.Content != nil)
 		if !ok {
 			continue
 		}
-		for _, p := range parts {
-			if p.Type == "image_url" {
-				return true
+		for _, raw := range parts {
+			p, ok := members(raw)
+			if !ok {
+				continue
+			}
+			if typ, _ := member[string](p, "type"); typ != "image_url" {
+				continue
+			}
+			count++
+			img, _ := members(p["image_url"])
+			if url, _ := member[string](img, "url"); strings.HasPrefix(url, "data:") {
+				inlineBytes += len(url)
 			}
 		}
 	}
-	return false
+	return count, inlineBytes
 }

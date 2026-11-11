@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"switchyard/internal/apierror"
+	"switchyard/internal/catalog"
 	"switchyard/internal/providers"
 	"switchyard/internal/schema"
 )
@@ -14,6 +16,8 @@ import (
 // Error codes the gateway itself sets.
 const (
 	codeModelNotFound   = "model_not_found"
+	codeModelNotSupport = "model_not_supported"
+	codeNoEligible      = "no_eligible_model"
 	codeUpstreamError   = "upstream_error"
 	codeTimeout         = "timeout"
 	codeRateLimited     = "rate_limit_exceeded"
@@ -45,10 +49,42 @@ func modelNotFound(model string) *Error {
 	}
 }
 
-func unsupportedProvider(model string) *Error {
+// virtualModel is the answer for a virtual model name ("auto…").
+func virtualModel(model string) *Error {
+	return &Error{
+		Status: http.StatusBadRequest, Type: apierror.TypeInvalidRequest, Code: codeModelNotSupport, Param: "model",
+		Message: fmt.Sprintf("The model `%s` is a virtual model: virtual models arrive in a later phase.", model),
+	}
+}
+
+// wrongModelType is the answer for a model whose type the endpoint does
+// not serve, such as an embedding model sent to chat completions.
+func wrongModelType(model, typ, endpoint string) *Error {
+	return &Error{
+		Status: http.StatusBadRequest, Type: apierror.TypeInvalidRequest, Code: codeModelNotSupport, Param: "model",
+		Message: fmt.Sprintf("The model `%s` is a %s model and cannot be used with %s.", model, typ, endpoint),
+	}
+}
+
+// noEligibleModel is the answer when every deployment of model was
+// excluded. The message names each one and why.
+func noEligibleModel(model string, exclusions []catalog.Exclusion) *Error {
+	parts := make([]string, len(exclusions))
+	for i, x := range exclusions {
+		parts[i] = x.Deployment + " (" + x.Reason + ")"
+	}
+	return &Error{
+		Status: http.StatusBadRequest, Type: apierror.TypeInvalidRequest, Code: codeNoEligible,
+		Message: fmt.Sprintf("No deployment of the model `%s` can serve this request: %s.", model, strings.Join(parts, "; ")),
+	}
+}
+
+// badUpstreamResponse is the answer when a successful upstream response
+// cannot be translated for the client.
+func badUpstreamResponse() *Error {
 	return &Error{
 		Status: http.StatusBadGateway, Type: apierror.TypeServer, Code: codeUpstreamError,
-		Message: fmt.Sprintf("The model `%s` cannot be served yet: its provider type is not supported by this version.", model),
+		Message: "The upstream provider returned a response the gateway could not translate.",
 	}
 }
 

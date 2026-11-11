@@ -4,6 +4,7 @@
 //
 //	switchyard serve [-c FILE] [--log-level LEVEL]
 //	switchyard config validate [-c FILE] [--log-level LEVEL]
+//	switchyard catalog lint [-c FILE]
 //	switchyard keys generate [--tenant ID] [--key-id ID]
 //	switchyard version
 //	switchyard help
@@ -23,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"switchyard/internal/app"
 	"switchyard/internal/config"
@@ -44,6 +46,7 @@ const usage = `Switchyard is a cost-aware, OpenAI-compatible LLM gateway.
 Usage:
   switchyard serve [flags]             run the gateway
   switchyard config validate [flags]   check a config file and exit
+  switchyard catalog lint [-c FILE]    check catalog prices and sources; exit 1 on warnings
   switchyard keys generate [flags]     create a gateway API key
   switchyard version                   print the build metadata
   switchyard help                      print this help
@@ -87,6 +90,8 @@ func run(args []string, stdout, stderr io.Writer, lookupEnv func(string) (string
 			return exitUsage
 		}
 		return runValidate(rest[1:], stdout, stderr, lookupEnv)
+	case "catalog":
+		return runCatalog(rest, stdout, stderr, lookupEnv, time.Now)
 	case "keys":
 		return runKeys(rest, stdout, stderr)
 	case "version", "--version":

@@ -314,3 +314,56 @@ func TestDecodeChatRequestModelAtLimit(t *testing.T) {
 		t.Errorf("model = %q", r.Model())
 	}
 }
+
+// TestAccessorsMatchKeysExactly checks that the accessors read nested
+// members by their exact name, as an upstream does: encoding/json would
+// match "TYPE" or "Content" to a struct field case-insensitively.
+func TestAccessorsMatchKeysExactly(t *testing.T) {
+	tests := []struct {
+		name, body  string
+		role        string
+		content     string
+		format      string
+		formatOK    bool
+		includeUsed bool
+	}{
+		{
+			name: "exact names",
+			body: `{"model":"m","stream":true,"stream_options":{"include_usage":true},"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hi"}]}`,
+			role: "user", content: `"hi"`, format: "json_object", formatOK: true, includeUsed: true,
+		},
+		{
+			name: "case-folded duplicates are other members",
+			body: `{"model":"m","stream":true,"stream_options":{"include_usage":true,"INCLUDE_USAGE":false},"response_format":{"type":"json_object","Type":"text"},"messages":[{"role":"user","ROLE":"system","content":"hi","Content":"x"}]}`,
+			role: "user", content: `"hi"`, format: "json_object", formatOK: true, includeUsed: true,
+		},
+		{
+			name: "case-folded names only",
+			body: `{"model":"m","stream":true,"stream_options":{"Include_Usage":true},"response_format":{"TYPE":"json_object"},"messages":[{"Role":"user","CONTENT":"hi"}]}`,
+			role: "", content: "", format: "", formatOK: true, includeUsed: false,
+		},
+		{
+			name: "wrong member types",
+			body: `{"model":"m","stream":true,"stream_options":{"include_usage":"yes"},"response_format":{"type":1},"messages":[{"role":2,"content":"hi"}]}`,
+			role: "", content: `"hi"`, formatOK: false, includeUsed: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := DecodeChatRequest([]byte(tt.body))
+			if err != nil {
+				t.Fatalf("DecodeChatRequest: %v", err)
+			}
+			m := r.Messages()[0]
+			if m.Role != tt.role || string(m.Content) != tt.content {
+				t.Errorf("message = %q %s, want %q %s", m.Role, m.Content, tt.role, tt.content)
+			}
+			if rf, ok := r.ResponseFormat(); ok != tt.formatOK || rf.Type != tt.format {
+				t.Errorf("response_format = %+v %v, want %q %v", rf, ok, tt.format, tt.formatOK)
+			}
+			if got := r.IncludeUsage(); got != tt.includeUsed {
+				t.Errorf("IncludeUsage = %v, want %v", got, tt.includeUsed)
+			}
+		})
+	}
+}

@@ -39,6 +39,62 @@ type Request struct {
 	// Header holds the client's request headers. Adapters copy only those
 	// the provider's forward_headers allow, and never Authorization.
 	Header http.Header
+	// MaxOutputTokens is the catalog model's output limit, or 0 if unknown.
+	// Adapters whose API requires max_tokens use it as the default.
+	MaxOutputTokens int64
+	// Capabilities is what the chosen deployment supports, as declared in
+	// the catalog. Adapters check it before using a feature (for example
+	// native structured output) and reject a request that needs one the
+	// deployment lacks.
+	Capabilities schema.CapabilitySet
+	// NoStreamUsage is set when the deployment lacks capability
+	// stream_usage. An OpenAI-wire adapter then forwards stream_options as
+	// the client sent it instead of setting include_usage, so the stream
+	// may carry no usage.
+	NoStreamUsage bool
+}
+
+// Completer is implemented by adapters that can serve the legacy
+// /v1/completions endpoint natively. Deployments of other adapters are
+// served through the gateway's chat shim.
+type Completer interface {
+	// Completion sends a non-streaming legacy completion, with the same
+	// contract as Adapter.Chat.
+	Completion(ctx context.Context, req *CompletionRequest) (*Response, error)
+	// CompletionStream sends a streaming legacy completion, with the same
+	// contract as Adapter.ChatStream. Its chunks are text_completion
+	// objects.
+	CompletionStream(ctx context.Context, req *CompletionRequest) (Stream, error)
+}
+
+// CompletionRequest is one native legacy completion call.
+type CompletionRequest struct {
+	// Completion is the client's request.
+	Completion *schema.CompletionRequest
+	// UpstreamModel replaces the request's model field.
+	UpstreamModel string
+	// Header holds the client's request headers, as in Request.
+	Header http.Header
+	// NoStreamUsage is as in Request.
+	NoStreamUsage bool
+}
+
+// Embedder is implemented by adapters whose provider serves /v1/embeddings.
+// A deployment whose adapter is not an Embedder cannot serve embeddings.
+type Embedder interface {
+	// Embed sends an embeddings request, with the same contract as
+	// Adapter.Chat. Response.Usage carries the prompt tokens.
+	Embed(ctx context.Context, req *EmbedRequest) (*Response, error)
+}
+
+// EmbedRequest is one embeddings call.
+type EmbedRequest struct {
+	// Embedding is the client's request.
+	Embedding *schema.EmbeddingRequest
+	// UpstreamModel replaces the request's model field.
+	UpstreamModel string
+	// Header holds the client's request headers, as in Request.
+	Header http.Header
 }
 
 // Response is a successful non-streaming upstream answer.

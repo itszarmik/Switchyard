@@ -13,6 +13,7 @@ import (
 	"github.com/openai/openai-go/v3/option"
 
 	"switchyard/test/conformance/harness"
+	"switchyard/test/fakeanthropic"
 	"switchyard/test/fakeupstream"
 )
 
@@ -41,22 +42,50 @@ func newUpstream(t *testing.T) *fakeupstream.Server {
 	return u
 }
 
-// startGateway builds and starts the gateway in front of upstream and
-// returns it with a client key it accepts.
-func startGateway(t *testing.T, upstream *fakeupstream.Server) (*harness.Gateway, string) {
+// Capabilities of the conformance model on each wire. The OpenAI-wire
+// deployment can do everything the suite asks for; the Anthropic one has
+// what the Messages API supports, as the curated catalog declares for
+// Claude models.
+var (
+	openAICapabilities = []string{
+		"streaming", "stream_usage", "tools", "parallel_tools", "forced_tools", "vision", "json_mode",
+		"json_schema", "n", "logprobs", "seed", "sampling", "temperature_2", "penalties", "prompt_caching",
+	}
+	anthropicCapabilities = []string{
+		"streaming", "stream_usage", "tools", "parallel_tools", "vision", "json_mode", "json_schema", "prompt_caching",
+	}
+)
+
+// newAnthropicUpstream starts a fake Messages API that knows the upstream
+// model and requires the provider key, in its conformance view.
+func newAnthropicUpstream(t *testing.T) *fakeanthropic.OpenAIUpstream {
+	t.Helper()
+	u := fakeanthropic.New(fakeanthropic.Options{Models: []string{upstreamModel}, APIKey: providerKey}).OpenAI()
+	t.Cleanup(u.Close)
+	return u
+}
+
+// startGateway builds and starts the gateway in front of upstream, whose
+// protocol is wire, and returns it with a client key it accepts.
+func startGateway(t *testing.T, baseURL, wire string) (*harness.Gateway, string) {
 	t.Helper()
 	key, hash, err := harness.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
+	caps := openAICapabilities
+	if wire == wireAnthropic {
+		caps = anthropicCapabilities
+	}
 	g := harness.Run(t, harness.Config{
-		ProviderBaseURL: upstream.BaseURL(),
+		ProviderBaseURL: baseURL,
 		ProviderAPIKey:  providerKey,
+		ProviderType:    wire,
 		ForwardHeaders:  []string{forwardedHeader},
 		Timeouts: harness.Timeouts{
 			Connect: connectTimeout, FirstToken: firstTokenTimeout, Idle: idleTimeout, Total: totalTimeout,
 		},
-		Models:  []harness.Model{{ID: catalogModel, UpstreamModel: upstreamModel}},
+		Models:  []harness.Model{{ID: catalogModel, UpstreamModel: upstreamModel, Capabilities: caps}},
 		KeyHash: hash,
 	}, harness.RunOptions{Race: raceEnabled})
 	return g, key
@@ -64,7 +93,7 @@ func startGateway(t *testing.T, upstream *fakeupstream.Server) (*harness.Gateway
 
 func TestConformanceDirect(t *testing.T) {
 	upstream := newUpstream(t)
-	runSuite(t, upstream.BaseURL(), providerKey, upstream)
+	runSuite(t, upstream.BaseURL(), providerKey, upstream, wireOpenAI)
 }
 
 // TestConformanceThroughGateway runs the suite through the gateway binary,
@@ -74,8 +103,24 @@ func TestConformanceThroughGateway(t *testing.T) {
 		t.Skip("builds and runs the gateway; skipped with -short")
 	}
 	upstream := newUpstream(t)
-	g, key := startGateway(t, upstream)
-	runSuite(t, g.PublicURL+"/v1", key, upstream)
+	g, key := startGateway(t, upstream.BaseURL(), wireOpenAI)
+	runSuite(t, g.PublicURL+"/v1", key, upstream, wireOpenAI)
+
+	t.Run("logs", func(t *testing.T) { checkLogs(t, g, key) })
+	t.Run("metrics", func(t *testing.T) { checkMetrics(t, g) })
+}
+
+// TestConformanceThroughGatewayAnthropic runs the suite through the gateway
+// binary against an Anthropic-backed deployment: gateway, anthropic
+// adapter, then the fake Messages API. The same SDK calls must give the
+// same answers, streaming tool calls included.
+func TestConformanceThroughGatewayAnthropic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs the gateway; skipped with -short")
+	}
+	upstream := newAnthropicUpstream(t)
+	g, key := startGateway(t, upstream.BaseURL(), wireAnthropic)
+	runSuite(t, g.PublicURL+"/v1", key, upstream, wireAnthropic)
 
 	t.Run("logs", func(t *testing.T) { checkLogs(t, g, key) })
 	t.Run("metrics", func(t *testing.T) { checkMetrics(t, g) })
@@ -97,8 +142,8 @@ func checkLogs(t *testing.T, g *harness.Gateway, clientKey string) {
 		}
 	}
 
-	fields := []string{"requested_model", "deployment", "stream", "status", "ttft_ms", "latency_ms",
-		"overhead_ms", "prompt_tokens", "completion_tokens", "upstream_request_id", "error_code",
+	fields := []string{"requested_model", "deployment", "excluded", "stream", "status",
+		"ttft_ms", "latency_ms", "overhead_ms", "upstream_request_id", "error_code",
 		"request_id", "tenant", "key_id"}
 	completions, rejected, streamsWithUsage := 0, 0, 0
 	for _, line := range lines {
@@ -126,10 +171,19 @@ func checkLogs(t *testing.T, g *harness.Gateway, clientKey string) {
 				t.Errorf("request line has no %s: %s", f, line)
 			}
 		}
+		// The token counts are omitted only when they are unknown: the
+		// upstream started a stream that failed before reporting usage.
+		midStream := m["stream"] == true && m["status"] == float64(http.StatusOK) && m["error_code"] != ""
+		for _, f := range []string{"prompt_tokens", "completion_tokens"} {
+			if _, ok := m[f]; !ok && !midStream {
+				t.Errorf("request line has no %s: %s", f, line)
+			}
+		}
 		if m["level"] != "INFO" || m["tenant"] != harness.TenantID || m["key_id"] != harness.KeyID {
 			t.Errorf("request line level %v, tenant %v, key_id %v: %s", m["level"], m["tenant"], m["key_id"], line)
 		}
-		if rm := m["requested_model"]; rm == catalogModel && m["deployment"] != catalogModel+"@"+harness.ProviderID {
+		if rm := m["requested_model"]; rm == catalogModel && m["error_code"] != "no_eligible_model" &&
+			m["deployment"] != catalogModel+"@"+harness.ProviderID {
 			t.Errorf("request line deployment %v, want %s@%s", m["deployment"], catalogModel, harness.ProviderID)
 		}
 		// The gateway always asks the upstream for usage, so every stream
@@ -198,7 +252,7 @@ func checkMetrics(t *testing.T, g *harness.Gateway) {
 
 func TestStreamDisconnectDirect(t *testing.T) {
 	upstream := newUpstream(t)
-	checkDisconnect(t, upstream.BaseURL(), providerKey, upstream)
+	checkDisconnect(t, upstream.BaseURL(), providerKey, upstream, 3)
 }
 
 func TestStreamDisconnectThroughGateway(t *testing.T) {
@@ -206,17 +260,27 @@ func TestStreamDisconnectThroughGateway(t *testing.T) {
 		t.Skip("builds and runs the gateway; skipped with -short")
 	}
 	upstream := newUpstream(t)
-	g, key := startGateway(t, upstream)
-	checkDisconnect(t, g.PublicURL+"/v1", key, upstream)
+	g, key := startGateway(t, upstream.BaseURL(), wireOpenAI)
+	checkDisconnect(t, g.PublicURL+"/v1", key, upstream, 3)
+}
+
+func TestStreamDisconnectThroughGatewayAnthropic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs the gateway; skipped with -short")
+	}
+	upstream := newAnthropicUpstream(t)
+	g, key := startGateway(t, upstream.BaseURL(), wireAnthropic)
+	// Five Messages API events make three chunks (see testMidStreamError).
+	checkDisconnect(t, g.PublicURL+"/v1", key, upstream, 5)
 }
 
 // checkDisconnect streams from baseURL, cancels after two chunks, and checks
 // that the upstream request was canceled within maxCancelLatency.
-func checkDisconnect(t *testing.T, baseURL, apiKey string, upstream *fakeupstream.Server) {
+func checkDisconnect(t *testing.T, baseURL, apiKey string, upstream upstreamFake, events int) {
 	upstream.Reset()
-	// The upstream is still generating: it sends three chunks, then nothing
-	// until its client goes away.
-	upstream.Script(fakeupstream.Behavior{Fault: fakeupstream.FaultHang, FaultAfterChunks: 3})
+	// The upstream is still generating: it sends a few events (three
+	// chunks), then nothing until its client goes away.
+	upstream.Script(fakeupstream.Behavior{Fault: fakeupstream.FaultHang, FaultAfterChunks: events})
 
 	transport := &http.Transport{}
 	defer transport.CloseIdleConnections()

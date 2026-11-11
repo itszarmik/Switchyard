@@ -141,7 +141,7 @@ func bench(ctx context.Context, o options, stdout, stderr io.Writer) error {
 	if err := harness.WriteConfig(cfgPath, harness.Config{
 		ProviderBaseURL: upstream.BaseURL(),
 		ProviderAPIKey:  "sk-load-test",
-		Models:          []harness.Model{{ID: model, UpstreamModel: model}},
+		Models:          []harness.Model{{ID: model, UpstreamModel: model, Capabilities: []string{"streaming", "stream_usage"}}},
 		KeyHash:         hash,
 		LogLevel:        o.logLevel,
 	}); err != nil {

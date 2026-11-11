@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 )
 
 // object is a JSON object that keeps every member's raw bytes and the order
@@ -71,6 +72,15 @@ func (o *object) set(key string, v json.RawMessage) {
 		o.keys = append(o.keys, key)
 	}
 	o.vals[key] = v
+}
+
+// delete removes key, if present.
+func (o *object) delete(key string) {
+	if _, ok := o.vals[key]; !ok {
+		return
+	}
+	delete(o.vals, key)
+	o.keys = slices.DeleteFunc(o.keys, func(k string) bool { return k == key })
 }
 
 // clone returns a copy that can be modified without affecting o. The raw
@@ -143,13 +153,41 @@ func isNull(raw json.RawMessage) bool {
 	return string(bytes.TrimSpace(raw)) == "null"
 }
 
+// members decodes a JSON object into its members, matching keys exactly;
+// a key that appears more than once keeps its last value, as in
+// parseObject. It reports false if raw is not an object.
+//
+// Nested objects that routing reads (message content, content part types,
+// response_format, stream_options) are decoded with members, never into a
+// struct: encoding/json matches struct fields case-insensitively, so
+// {"type":"image_url","TYPE":"text"} would read as text while the upstream,
+// matching exactly, sees an image.
+func members(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return nil, false
+	}
+	return m, true
+}
+
+// member decodes the member key of the object m into a T, as decodeField
+// does.
+func member[T any](m map[string]json.RawMessage, key string) (T, bool) {
+	raw, ok := m[key]
+	return decodeField[T](raw, ok)
+}
+
 // decodeField decodes a present, non-null raw value into a T. It reports
 // false when the value is absent, null or of another type.
 func decodeField[T any](raw json.RawMessage, present bool) (T, bool) {
-	var v T
 	if !present || isNull(raw) {
-		return v, false
+		// v is declared below: its address escapes into json.Unmarshal,
+		// so declaring it first would heap-allocate it on every call,
+		// including for the absent fields the hot path checks.
+		var zero T
+		return zero, false
 	}
+	var v T
 	if err := json.Unmarshal(raw, &v); err != nil {
 		var zero T
 		return zero, false

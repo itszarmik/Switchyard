@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -643,15 +644,94 @@ func TestModelNotFound(t *testing.T) {
 	}
 }
 
-func TestUnsupportedProviderType(t *testing.T) {
-	e := newEnv(t, func(*upstream, http.ResponseWriter, *http.Request) {})
-	resp, body := e.call(t, `{"model":"claude-test","messages":[{}]}`)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d", resp.StatusCode)
+// TestRoutingHeadersAndErrors checks the catalog routing over HTTP: the
+// X-Switchyard-* headers and the routing errors.
+func TestRoutingHeadersAndErrors(t *testing.T) {
+	e := newEnv(t, func(_ *upstream, w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
+	}, func(c *config.Config) { c.Routing.DropUnsupportedParams = true })
+
+	resp, body := e.call(t, `{"model":"gpt-alias","messages":[{"role":"user","content":"x"}]}`)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Switchyard-Alias") != "gpt-alias" ||
+		resp.Header.Get("X-Switchyard-Model") != "gpt-test" || resp.Header.Get("X-Switchyard-Provider") != "fake" ||
+		resp.Header.Get("X-Switchyard-Dropped-Params") != "" {
+		t.Errorf("alias: status %d, headers %v, body %s", resp.StatusCode, resp.Header, body)
 	}
-	if env := decodeError(t, body); deref(env.Error.Code) != "upstream_error" {
-		t.Errorf("error = %+v", env.Error)
+
+	// claude-test only streams; with dropping on, n and seed are removed
+	// before the (unreachable) upstream is called, and the header says so.
+	resp, _ = e.call(t, `{"model":"claude-test","n":2,"seed":1,"messages":[{"role":"user","content":"x"}]}`)
+	if got := resp.Header.Get("X-Switchyard-Dropped-Params"); got != "n, seed" {
+		t.Errorf("X-Switchyard-Dropped-Params = %q (status %d)", got, resp.StatusCode)
 	}
+
+	for _, tc := range []struct{ path, body, code string }{
+		{"/v1/chat/completions", `{"model":"auto","messages":[{"role":"user","content":"x"}]}`, "model_not_supported"},
+		{"/v1/chat/completions", `{"model":"embed-test","messages":[{"role":"user","content":"x"}]}`, "model_not_supported"},
+		{"/v1/chat/completions", `{"model":"claude-test","messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"f"}}]}`, "no_eligible_model"},
+		{"/v1/embeddings", `{"model":"gpt-test","input":"x"}`, "model_not_supported"},
+		{"/v1/completions", `{"model":"claude-test","prompt":"x","echo":true}`, "unsupported_parameter"},
+	} {
+		resp, body := e.callPath(t, tc.path, tc.body)
+		env := decodeError(t, body)
+		if resp.StatusCode != http.StatusBadRequest || deref(env.Error.Code) != tc.code || env.Error.Type != "invalid_request_error" {
+			t.Errorf("%s %s: status %d, error %+v", tc.path, tc.body, resp.StatusCode, env.Error)
+		}
+	}
+	if v := e.metricValue(t, "switchyard_requests_total", "/v1/completions", "4xx"); v != 1 {
+		t.Errorf("requests_total{/v1/completions,4xx} = %v, want 1", v)
+	}
+	if v := e.metricValue(t, "switchyard_requests_total", "/v1/embeddings", "4xx"); v != 1 {
+		t.Errorf("requests_total{/v1/embeddings,4xx} = %v, want 1", v)
+	}
+}
+
+// TestCompletionsAndEmbeddings checks the two new endpoints end to end
+// against an OpenAI-wire upstream.
+func TestCompletionsAndEmbeddings(t *testing.T) {
+	e := newEnv(t, func(_ *upstream, w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/embeddings":
+			_, _ = io.WriteString(w, `{"object":"list","data":[],"model":"upstream-embed","usage":{"prompt_tokens":2,"total_tokens":2}}`)
+		case "/v1/chat/completions":
+			sseHeaders(w)
+			sse(w, `data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}`+"\n\n",
+				`data: {"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n",
+				"data: [DONE]\n\n")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}, func(c *config.Config) {
+		c.Models[0].Capabilities = slices.DeleteFunc(slices.Clone(c.Models[0].Capabilities), func(s string) bool { return s == "completions" })
+	})
+	resp, body := e.callPath(t, "/v1/embeddings", `{"model":"embed-test","input":["a","b"]}`)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Switchyard-Model") != "embed-test" ||
+		body != `{"object":"list","data":[],"model":"upstream-embed","usage":{"prompt_tokens":2,"total_tokens":2}}` {
+		t.Errorf("embeddings: status %d, headers %v, body %s", resp.StatusCode, resp.Header, body)
+	}
+	if got := e.up.got(); len(got) != 1 || got[0].body != `{"model":"upstream-embed","input":["a","b"]}` {
+		t.Errorf("embeddings upstream %+v", got)
+	}
+
+	// gpt-test lacks the completions capability here, so the shim serves
+	// it.
+	resp, body = e.callPath(t, "/v1/completions", `{"model":"gpt-test","prompt":"p","stream":true}`)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Switchyard-Shim") != "chat" ||
+		!strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		t.Errorf("completions: status %d, headers %v", resp.StatusCode, resp.Header)
+	}
+	want := `data: {"id":"cmpl-9","object":"text_completion","created":1,"model":"m","choices":[{"text":"ok","index":0,"logprobs":null,"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
+	if body != want {
+		t.Errorf("completions stream\n got %q\nwant %q", body, want)
+	}
+	waitFor(t, "the completions request line", func() bool {
+		for _, l := range e.logs.find(t, "request") {
+			if l["path"] == "/v1/completions" {
+				return l["deployment"] == "gpt-test@fake" && l["requested_model"] == "gpt-test"
+			}
+		}
+		return false
+	})
 }
 
 func TestModels(t *testing.T) {
@@ -681,10 +761,10 @@ func TestModels(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		t.Fatal(err)
 	}
-	if list.Object != "list" || len(list.Data) != 2 {
+	if list.Object != "list" || len(list.Data) != 4 {
 		t.Fatalf("list = %+v", list)
 	}
-	for i, id := range []string{"gpt-test", "claude-test"} {
+	for i, id := range []string{"gpt-test", "claude-test", "embed-test", "gpt-alias"} {
 		m := list.Data[i]
 		if m.ID != id || m.Object != "model" || m.OwnedBy != "switchyard" || m.Created < before || m.Created > after {
 			t.Errorf("data[%d] = %+v", i, m)

@@ -38,6 +38,35 @@ type Snapshot struct {
 	version  string
 	sources  []string
 	warnings []Problem
+	root     string
+	// lines maps each config path decoded from a file to its location.
+	lines map[string]fileLine
+	// overridden records the config paths set by LoadOptions.Overrides.
+	overridden map[string]bool
+}
+
+// fileLine is where a config path was written.
+type fileLine struct {
+	file string
+	line int
+}
+
+// Locate returns the file and line a config path was written at, such as
+// "models[0].deployments[1].pricing", in the form Problem uses. A path that
+// is not in any file, such as a field left at its default, is located at its
+// nearest ancestor that is, or else at the root file with line 0. A value
+// set by an override has no file. Tools that report problems about a loaded
+// configuration, such as `switchyard catalog lint`, use it.
+func (s *Snapshot) Locate(path string) (file string, line int) {
+	if s.overridden[path] {
+		return "", 0
+	}
+	for p := path; p != ""; p = parentPath(p) {
+		if fl, ok := s.lines[p]; ok {
+			return fl.file, fl.line
+		}
+	}
+	return s.root, 0
 }
 
 // Config returns the effective configuration. Callers must not mutate it.
@@ -74,11 +103,18 @@ func Load(path string, opts LoadOptions) (*Snapshot, error) {
 
 	sortProblems(st.problems)
 	if !st.hasErrors() {
+		lines := make(map[string]fileLine, len(st.pos))
+		for p, pos := range st.pos {
+			lines[p] = fileLine{file: pos.file, line: pos.line}
+		}
 		return &Snapshot{
-			cfg:      cfg,
-			version:  fingerprint(cfg),
-			sources:  st.sources,
-			warnings: st.problems,
+			cfg:        cfg,
+			version:    fingerprint(cfg),
+			sources:    st.sources,
+			warnings:   st.problems,
+			root:       st.root,
+			lines:      lines,
+			overridden: st.overridden,
 		}, nil
 	}
 	return nil, &ValidationError{Problems: st.problems}

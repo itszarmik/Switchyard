@@ -15,8 +15,9 @@ type Config struct {
 	// Version is the schema version. Only 1 is defined, and it is required.
 	Version int `yaml:"version"`
 	// Include lists glob patterns of additional files, resolved relative to the
-	// directory of the root file. Included files may only define list sections
-	// (providers, models); their entries are appended in sorted file-name order.
+	// directory of the root file. Included files may only define providers,
+	// models and aliases; list entries are appended in sorted file-name order,
+	// and an alias defined twice, in any files, is an error.
 	Include []string `yaml:"include"`
 
 	Server    Server     `yaml:"server"`
@@ -27,6 +28,12 @@ type Config struct {
 	// Tenants own the API keys that clients use to call the gateway. With no
 	// tenants configured, every /v1 request is rejected with 401.
 	Tenants []Tenant `yaml:"tenants"`
+	// Aliases maps virtual model names to a catalog model ID or a pinned
+	// deployment (model@provider). Alias names follow Model.ID rules and
+	// must not collide with a model ID. Values starting with "auto" are
+	// reserved for Phase 5.
+	Aliases map[string]string `yaml:"aliases"`
+	Routing Routing           `yaml:"routing"`
 }
 
 // Server configures the public and admin HTTP listeners.
@@ -129,13 +136,41 @@ type ProviderTimeouts struct {
 	Total Duration `yaml:"total"`
 }
 
-// Model is a logical model in the catalog. This is the Phase 0 skeleton;
-// Phase 2 adds capabilities, context windows, pricing and quality priors.
+// Model is a logical model in the catalog (DESIGN §16.4).
 type Model struct {
 	// ID is the name clients send in the model field. It must not contain "@"
 	// and must not be "auto" or start with "auto:", which are reserved for
 	// virtual models.
 	ID string `yaml:"id"`
+	// Type is chat (default) or embedding. Chat models serve
+	// /v1/chat/completions and /v1/completions; embedding models serve
+	// /v1/embeddings.
+	Type string `yaml:"type"`
+	// ContextWindow is the maximum number of input plus output tokens.
+	// 0 means unknown, which disables the context-size filter for this model.
+	ContextWindow int64 `yaml:"context_window"`
+	// MaxOutputTokens is the most the model can generate in one response.
+	// Adapters that require max_tokens (Anthropic) use it as the default.
+	// 0 means unknown.
+	MaxOutputTokens int64 `yaml:"max_output_tokens"`
+	// Capabilities lists what the model supports, from a fixed vocabulary:
+	// streaming, stream_usage, tools, parallel_tools, forced_tools, vision,
+	// json_mode, json_schema, n, logprobs, seed, sampling, temperature_2,
+	// penalties, completions, prompt_caching. json_schema means native
+	// structured-output support: no deployment emulates it. A request
+	// needing a capability that a deployment lacks is never sent to it
+	// (DESIGN §6.2, §9.2), unless the parameters that need it are dropped
+	// (Routing).
+	Capabilities []string `yaml:"capabilities"`
+	// Quality holds quality priors in [0, 1] per category: general, coding,
+	// reasoning, extraction, creative, tool_use (DESIGN §10.2). Used from
+	// Phase 5; validated now.
+	Quality map[string]float64 `yaml:"quality"`
+	// TokenRatio scales the bytes/4 token estimate for this model's
+	// tokenizer. 0 means 1.
+	TokenRatio float64 `yaml:"token_ratio"`
+	// Dimensions is the vector size of an embedding model.
+	Dimensions int `yaml:"dimensions"`
 	// Deployments lists the providers that serve this model. At least one is
 	// required, and each provider may appear at most once per model.
 	Deployments []Deployment `yaml:"deployments"`
@@ -147,6 +182,60 @@ type Deployment struct {
 	Provider string `yaml:"provider"`
 	// UpstreamModel is the model name sent to the provider.
 	UpstreamModel string `yaml:"upstream_model"`
+	// Pricing is what this deployment costs.
+	Pricing Pricing `yaml:"pricing"`
+	// Capabilities, when set, replaces the model's list for this deployment
+	// (for example a host that lacks parallel tool calls).
+	Capabilities []string `yaml:"capabilities"`
+	// Tags are added to the provider's tags for this deployment.
+	Tags []string `yaml:"tags"`
+	// QualityOffset adjusts the model's quality priors for this deployment,
+	// e.g. -0.02 for a quantized variant. Must be in [-1, 1].
+	QualityOffset float64 `yaml:"quality_offset"`
+	// LatencyHint seeds latency estimates until there are measurements.
+	LatencyHint LatencyHint `yaml:"latency_hint"`
+}
+
+// Pricing is in USD per million tokens. A price that is not set is unknown;
+// routing ranks deployments with unknown prices last, and `switchyard
+// catalog lint` reports them.
+type Pricing struct {
+	Input       Price `yaml:"input"`
+	Output      Price `yaml:"output"`
+	CachedInput Price `yaml:"cached_input"`
+	CacheWrite  Price `yaml:"cache_write"`
+	// Source is the URL the prices were checked against.
+	Source string `yaml:"source"`
+	// Checked is the date the prices were last checked, as YYYY-MM-DD.
+	Checked string `yaml:"checked"`
+}
+
+// Price is a non-negative decimal amount of USD per million tokens, written
+// as a YAML number or string, for example 0.15 or "0.0375". It keeps the
+// exact decimal text so that cost accounting (Phase 4) can avoid float
+// rounding. The zero value means "not set".
+type Price struct {
+	text string
+}
+
+// LatencyHint is an operator's estimate of a deployment's latency.
+type LatencyHint struct {
+	// TTFTMs is the typical time to first token, in milliseconds.
+	TTFTMs int `yaml:"ttft_ms"`
+	// TokensPerSec is the typical output speed.
+	TokensPerSec float64 `yaml:"tokens_per_sec"`
+}
+
+// Routing holds gateway-wide routing settings. Phase 5 adds profiles and
+// per-policy overrides.
+type Routing struct {
+	// DropUnsupportedParams lets a request reach a deployment that cannot
+	// honor some optional parameters (n, logprobs, seed, penalties,
+	// temperature above 1, parallel tool calls) by removing them, instead
+	// of excluding the deployment. Default false. temperature and top_p are
+	// removed for a deployment without capability sampling whatever this
+	// says.
+	DropUnsupportedParams bool `yaml:"drop_unsupported_params"`
 }
 
 // Secret holds a sensitive value such as an API key, a DSN or a URL that may

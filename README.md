@@ -7,7 +7,7 @@ Switchyard is a cost-aware, OpenAI-compatible LLM inference gateway written in G
 
 ## Status
 
-**Phase 1: transparent OpenAI-compatible proxy.** Switchyard serves `POST /v1/chat/completions` (JSON and streaming) and `GET /v1/models` behind gateway API keys, and forwards each request losslessly to the first deployment of the requested model on an OpenAI-wire provider. Routing, fallback, caching, budgets and the other provider types come in later phases ([docs/PLAN.md](docs/PLAN.md)).
+**Phase 2: catalog and multi-provider adapters.** Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment of the requested model that has every capability the request needs, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Fallback, budgets, cost-aware model choice and caching come in later phases ([docs/PLAN.md](docs/PLAN.md)).
 
 ## Quickstart
 
@@ -59,7 +59,7 @@ GEMINI_API_KEY=placeholder TOGETHER_API_KEY=placeholder \
 | `${VAR:-default}` | `VAR`, or `default` when it is unset. `${VAR:-}` means empty when unset. |
 | `${file:/run/secrets/name}` | The contents of a file, for Docker and Kubernetes secrets. |
 
-**Includes.** `include:` lists glob patterns, relative to the root file's directory. Included files may only define list sections (`providers`, `models`); their entries are appended in sorted file-name order, and a duplicate ID is an error. The example config includes the model catalog from [configs/catalog/](configs/catalog/).
+**Includes.** `include:` lists glob patterns, relative to the root file's directory. Included files may only define `providers`, `models` and `aliases`; list entries are appended in sorted file-name order, and a duplicate ID or alias name, in any files, is an error. The example config includes the model catalog from [configs/catalog/](configs/catalog/).
 
 **Limits.** `server.max_header_bytes` (default 64 KiB) caps request headers; net/http allows up to 4 KiB beyond it before it answers 431. A `${file:…}` reference reads only a regular file of at most 64 KiB.
 
@@ -68,6 +68,84 @@ GEMINI_API_KEY=placeholder TOGETHER_API_KEY=placeholder \
 **Strict validation.** Unknown keys are rejected. Validation does not stop at the first problem: it reports every error at once, each with its file, line and config path, such as `providers[2].base_url`. Secret values never appear in errors, logs or CLI output: messages name a referenced value by its reference (`the value of ${VAR}`), and describe a literal value or key that looks like a credential only as `a string value` or `<hidden key>`. A credential written literally, including as the default of `${VAR:-default}`, gets a warning.
 
 Every supported key is documented, with its default, in [configs/switchyard.example.yaml](configs/switchyard.example.yaml).
+
+## Model catalog
+
+The catalog says which models exist, which providers serve them, what each deployment can do and what it costs. It is ordinary config, usually kept in its own files under `include:` (see [configs/catalog/](configs/catalog/)), and follows DESIGN §16.4.
+
+```yaml
+models:
+  - id: llama-3.3-70b                  # the name clients send
+    type: chat                         # chat (default) or embedding
+    context_window: 131072             # input + output tokens; 0 = unknown, no context filter
+    max_output_tokens: 8192            # also the default max_tokens for Anthropic
+    capabilities: [streaming, tools, json_mode, sampling]
+    quality: { general: 0.70, coding: 0.62 }   # priors in [0, 1], used from Phase 5
+    token_ratio: 1.05                  # scales the bytes/4 token estimate; default 1
+    deployments:                       # each is model@provider
+      - provider: together
+        upstream_model: meta-llama/Llama-3.3-70B-Instruct-Turbo
+        pricing: { input: 0.88, output: 0.88, source: "https://…", checked: 2026-11-11 }
+      - provider: gpu-cluster
+        upstream_model: meta-llama/Llama-3.3-70B-Instruct
+        capabilities: [streaming, tools, json_mode]   # replaces the model's list here
+        tags: [quantized]                             # added to the provider's tags
+        pricing: { input: 0.10, output: 0.10 }        # amortized
+
+  - id: text-embedding-3-small
+    type: embedding
+    dimensions: 1536                   # required for embedding models
+    deployments:
+      - { provider: openai, upstream_model: text-embedding-3-small, pricing: { input: 0.02 } }
+
+aliases:                               # operator-defined names
+  code-model: llama-3.3-70b            # a model id…
+  cheap-llama: llama-3.3-70b@gpu-cluster   # …or a pinned model@provider
+
+routing:
+  drop_unsupported_params: false
+```
+
+**Prices** are USD per million tokens (`input`, `output`, `cached_input`, `cache_write`), written as a number or a decimal string such as `"0.0375"`. Negative values, exponents and more than 9 decimal places are rejected, and the exact text is kept for cost accounting. A chat deployment without both `input` and `output`, or an embedding deployment without `input`, gets the warning "pricing unknown; this deployment is ranked last".
+
+**Capabilities** come from a fixed vocabulary: `streaming`, `stream_usage`, `tools`, `parallel_tools`, `forced_tools`, `vision`, `json_mode`, `json_schema`, `n`, `logprobs`, `seed`, `sampling`, `temperature_2`, `penalties`, `completions` and `prompt_caching`. A request is only sent to a deployment that has every capability it needs. With `routing.drop_unsupported_params: true`, the parameters behind `n`, `logprobs`, `seed`, `penalties`, `temperature_2` and `parallel_tools` are removed instead, and the response lists them in `X-Switchyard-Dropped-Params`. `sampling` (the deployment accepts `temperature` and `top_p`) is always dropped for a deployment without it, because such models document fixed sampling. Every other capability is a hard requirement. Embedding models can't have chat capabilities such as `tools`.
+
+**The `model` field** resolves as follows. A catalog id uses that model's cheapest eligible deployment, and `model@provider` pins one deployment. An alias stands for either; aliases don't chain. A name that starts with `auto` is reserved for virtual models (Phase 5), and anything else is unknown.
+
+**Choosing a deployment.** The candidates that pass the hard filters (capabilities, and context window ≥ estimated input + output tokens) are ranked by estimated cost. Unknown prices rank last, and ties keep config order. If nothing is eligible, the error names every deployment and why it was excluded.
+
+**Stream usage.** For a streamed request to a deployment with `stream_usage`, the gateway sets `stream_options.include_usage` so it can log the usage. A deployment without it gets the client's `stream_options` unchanged (or none), because some hosts reject the option; usage may then be missing, and the request line omits `prompt_tokens` and `completion_tokens` instead of logging 0. They are logged as 0 only when no tokens were spent: the request was rejected before or by the provider. When a provider repeats usage on several chunks (Gemini's endpoint may), the last one is kept.
+
+**The curated catalog.** [configs/catalog/models.yaml](configs/catalog/models.yaml) lists current OpenAI, Anthropic, Gemini, Together and self-hosted models with prices checked on 2026-11-11, each with its source. [configs/catalog/README.md](configs/catalog/README.md) explains every price and capability decision. The self-hosted vLLM deployment is commented out until you set its amortized price.
+
+**`switchyard catalog lint [-c FILE]`** loads the config the same way `config validate` does. It then reports catalog findings, one per line in the same format as config problems, followed by a summary. It warns about:
+- missing prices;
+- a missing `pricing.source` or `pricing.checked`;
+- a `pricing.checked` date more than 90 days old.
+
+It prints notices, which don't fail it, for an output price below the input price and for a chat model without `streaming`. It exits 0 when there are no warnings, 1 on warnings or an invalid config, and 2 on usage errors. Errors that `config validate` reports, such as a quality prior outside [0, 1], an unknown provider or a duplicate model id, fail it too.
+
+```sh
+$ bin/switchyard catalog lint -c configs/switchyard.example.yaml   # with the provider keys set
+configs/switchyard.example.yaml: catalog lint OK (11 models, 3 aliases; 0 warnings, 0 notices)
+```
+
+## Providers
+
+Each provider has a `type`, its wire protocol.
+
+- **`openai`**: OpenAI and every OpenAI-compatible host (Together, Fireworks, Groq, vLLM, Ollama and others). Requests are forwarded losslessly: the body reaches the provider unchanged except for `model` and the parameters the gateway removes (see [Model catalog](#model-catalog)). `base_url` is the API root that ends in `/v1`. Declare each host's capabilities per deployment; a host that accepts fewer parameters than the model's list says gets a deployment-level `capabilities` list.
+- **`anthropic`**: the Messages API at `{base_url}/v1/messages`, with `base_url: https://api.anthropic.com`. The adapter translates the OpenAI request into a Messages request and the answer (or every stream event) back into `chat.completion` objects, following DESIGN §6.2: system and developer messages become the system prompt, tools and tool results map one to one, images must be data URLs, `max_tokens` defaults to the model's `max_output_tokens`, `stop` becomes `stop_sequences`, and `user` becomes `metadata.user_id`. `response_format: json_schema` uses native structured outputs, so only a deployment with `json_schema` gets it; the schema is reduced to the subset Anthropic supports, as Anthropic's SDKs do (unsupported keywords such as `minimum` or `maxLength` move into the field's description, and every object gets `additionalProperties: false`), whether or not the client set `strict`. `json_object` is a system-prompt instruction. Tool-call ids that don't match Anthropic's pattern are mapped to valid ones. Usage is normalized (cache reads into `prompt_tokens_details.cached_tokens`), and errors map to OpenAI envelopes, with 529 `overloaded_error` as a 502. Fields without a Messages API equivalent are never forwarded, so the catalog must not declare `n`, `logprobs`, `seed`, `penalties` or `temperature_2` for Anthropic deployments. Client headers such as `anthropic-beta` pass only when listed in `forward_headers`.
+- **Gemini** uses Google's OpenAI-compatible endpoint with `type: openai`:
+
+  ```yaml
+  - id: google
+    type: openai
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key: ${GEMINI_API_KEY}
+  ```
+
+  Google calls this endpoint beta. The curated catalog declares only what Google's compatibility page documents (see [configs/catalog/README.md](configs/catalog/README.md)).
 
 ## API keys
 
@@ -109,7 +187,7 @@ export SWITCHYARD_API_KEY=sy_…   # the key printed by keys generate
 curl localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $SWITCHYARD_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"gpt-6-luna","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 With an OpenAI SDK, use the key as the API key and point the base URL at `http://localhost:8080/v1`.
@@ -135,7 +213,7 @@ Switchyard speaks the OpenAI Chat Completions API, so an OpenAI SDK only needs a
 
 **1. Generate a key.** Run `bin/switchyard keys generate` (optionally with `--tenant ID --key-id ID`). It prints the key once and the `tenants` entry that holds its hash; see [API keys](#api-keys) for details.
 
-**2. Add the tenant and a model.** Paste the printed entry into your config next to a provider and a model. In Phase 1 the request's `model` is looked up by catalog `id`, and the model's first deployment serves it, with `model` rewritten to `upstream_model`:
+**2. Add the tenant and a model.** Paste the printed entry into your config next to a provider and a model. The request's `model` is resolved through the catalog (a model id, an alias or `model@provider`; see [Model catalog](#model-catalog)), and the chosen deployment gets the request with `model` rewritten to its `upstream_model`. A model needs a `capabilities` list: a request that needs a capability the model lacks, `streaming` included, is never sent to it.
 
 ```yaml
 providers:
@@ -144,10 +222,12 @@ providers:
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY}
 models:
-  - id: gpt-5-mini
+  - id: gpt-6-luna
+    capabilities: [streaming, stream_usage, vision, json_mode, json_schema, prompt_caching]
     deployments:
       - provider: openai
-        upstream_model: gpt-5-mini
+        upstream_model: gpt-6-luna
+        pricing: { input: "0.10", output: "0.50", source: "https://developers.openai.com/api/docs/pricing", checked: "2026-11-11" }
 tenants:
   - id: default
     keys:
@@ -164,7 +244,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8080/v1", api_key="sy_...")
 resp = client.chat.completions.create(
-    model="gpt-5-mini",
+    model="gpt-6-luna",
     messages=[{"role": "user", "content": "Hello"}],
 )
 print(resp.choices[0].message.content)
@@ -178,10 +258,10 @@ curl localhost:8080/v1/models -H "Authorization: Bearer $SWITCHYARD_API_KEY"
 curl -N localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $SWITCHYARD_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5-mini","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"gpt-6-luna","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-**What is forwarded.** The request body reaches the provider unchanged, unknown fields included, except that `model` becomes the deployment's `upstream_model` and streams always ask for `stream_options.include_usage`, so usage is logged for every stream. The usage-only final chunk is passed on only to clients that set `include_usage` themselves. Non-streaming responses are returned byte for byte. The client's `Authorization` header is never forwarded; the provider's `api_key` is sent instead, along with only the client headers listed in the provider's `forward_headers`. When the client disconnects, the upstream request is canceled.
+**What is forwarded.** On an OpenAI-wire provider the request body reaches the provider unchanged, unknown fields included, except that `model` becomes the deployment's `upstream_model`, parameters the deployment cannot honor are removed (listed in `X-Switchyard-Dropped-Params`), and streams to a deployment with `stream_usage` ask for `stream_options.include_usage`, so usage is logged. An Anthropic deployment gets a translation instead (see [Providers](#providers)). The usage-only final chunk is passed on only to clients that set `include_usage` themselves. Non-streaming responses are returned byte for byte. The client's `Authorization` header is never forwarded; the provider's `api_key` is sent instead, along with only the client headers listed in the provider's `forward_headers`. When the client disconnects, the upstream request is canceled.
 
 **Response headers.**
 
@@ -189,7 +269,10 @@ curl -N localhost:8080/v1/chat/completions \
 |---|---|
 | `X-Request-Id` | The gateway's request ID, also in every log line for the request. |
 | `X-Switchyard-Model` | The catalog model that served the request. |
-| `X-Switchyard-Provider` | The provider id. |
+| `X-Switchyard-Provider` | The provider id of the chosen deployment. |
+| `X-Switchyard-Alias` | The alias the client sent, when it sent one. |
+| `X-Switchyard-Dropped-Params` | The request parameters removed because the deployment cannot honor them, such as `n, temperature`. |
+| `X-Switchyard-Shim` | `chat` when a legacy completion was served through Chat Completions. |
 | `X-Switchyard-Upstream-Request-Id` | The provider's own `x-request-id`, for support tickets. Omitted unless it is at most 128 bytes of printable ASCII. |
 | `Retry-After` | On 429, copied from the provider. |
 
@@ -203,14 +286,28 @@ Streams carry `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `
 | Invalid JSON, missing `model` or `messages`, `model` over 256 bytes, non-boolean `stream` | 400 | `invalid_json`, `missing_required_parameter`, `invalid_value`, `invalid_type` or `empty_array`; `param` names the field |
 | Body larger than `server.max_request_bytes` | 413 | `request_too_large` |
 | Body not received within `server.body_read_timeout` (default 60s) | 408 | `request_timeout` |
-| Unknown model | 404 | `model_not_found` |
+| Unknown model or `model@provider` | 404 | `model_not_found` |
+| Virtual model (`auto…`), or a model of the wrong type (an embedding model on chat, a chat model on embeddings) | 400 | `model_not_supported` |
+| No deployment has every capability the request needs, or fits the context window | 400 | `no_eligible_model`; the message names each deployment and why it was excluded |
+| A legacy completion parameter the chat shim cannot honor | 400 | `unsupported_parameter`; `param` names it |
 | Provider 4xx (other than 401/403), including 429 | the provider's status | the provider's body |
 | Provider 401/403: the gateway's credential is wrong | 502 | `upstream_error` (the body is never echoed) |
 | Provider 5xx, connection failure | 502 | `upstream_error` |
 | First-token or total timeout | 504 | `timeout` |
 | Provider failure after the stream started | an SSE `data: {"error":…}` event, then the stream closes without `[DONE]` | `upstream_error` |
 
-Each request is logged at INFO as one `request` access-log line. For a chat completion it also carries the tenant, key id, model, deployment, latency, TTFT, gateway overhead and token counts, never the prompt or the response. Metrics (`switchyard_requests_total`, which also counts requests rejected for a bad key, `switchyard_upstream_requests_total`, `switchyard_overhead_duration_seconds` and others) are on the admin listener's `/metrics`.
+Each request is logged at INFO as one `request` access-log line. For the chat, completions and embeddings endpoints it also carries the tenant, key id, requested model, chosen `deployment`, the number of `excluded` deployments, latency, TTFT, gateway overhead and token counts, plus the `alias` and the `dropped_params` (comma-separated) when there are any, never the prompt or the response.
+
+**Legacy completions.** `POST /v1/completions` takes the legacy OpenAI shape (`prompt` a string or an array of strings; token arrays get 400). A deployment with the `completions` capability on an OpenAI-wire provider gets the request natively and losslessly. Any other deployment is served through the chat shim, marked `X-Switchyard-Shim: chat`: the prompt becomes one user message; `max_tokens`, `temperature`, `top_p`, `stop`, `n`, `stream`, `stream_options`, `user`, `seed` and the penalties carry over (other legacy fields, such as `logit_bias`, are not sent); and the answer, streamed or not, comes back as `text_completion` objects with `choices[].text`. The shim cannot honor `echo`, `suffix`, `logprobs`, `best_of` above 1 or more than one prompt: such a request goes to a native deployment if the model has one, and otherwise gets 400 `unsupported_parameter`. Capability filtering and dropping work as for chat. The legacy default of 16 `max_tokens` is not applied by the shim.
+
+```sh
+curl localhost:8080/v1/completions -H "Authorization: Bearer $SWITCHYARD_API_KEY" \
+  -H "Content-Type: application/json" -d '{"model":"gpt-6-luna","prompt":"Say hello","max_tokens":20}'
+```
+
+**Embeddings.** `POST /v1/embeddings` takes `model`, `input` (a string, an array of strings, or token arrays, which are passed through), `encoding_format` (`float` or `base64`), `dimensions` and `user`, and is forwarded losslessly. The model must be an embedding model. Among its deployments, the one with the lowest input price serves it, so the provider may change but the model never does. Only OpenAI-wire providers serve embeddings; an Anthropic deployment is excluded with "provider does not serve embeddings".
+
+**Models.** `GET /v1/models` lists every catalog model, chat and embedding, then every alias, all with `owned_by: "switchyard"`. Metrics (`switchyard_requests_total`, which also counts requests rejected for a bad key, `switchyard_upstream_requests_total`, `switchyard_overhead_duration_seconds` and others) are on the admin listener's `/metrics`.
 
 ## Docker
 
@@ -280,6 +377,7 @@ Run `make` or `make help` to list them.
 | `cover` | Writes `coverage.out` and prints a per-function coverage summary. |
 | `bench-overhead` | Measures the latency the gateway adds against a zero-latency fake upstream; results in [test/load/RESULTS.md](test/load/RESULTS.md). Pass flags with `BENCH_FLAGS="-mode stream -concurrency 200"`; the default is the P1 acceptance run (non-stream, concurrency 100). |
 | `smoke` | Live smoke test against OpenAI with the SDK. Opt-in: it skips unless `OPENAI_API_KEY` is set; `SMOKE_MODEL` defaults to `gpt-5-mini`. |
+| `record-fixtures` | Records live Anthropic API responses into `test/fixtures/anthropic/recorded/`, for comparison with the handcrafted fixtures. Opt-in and billed: it skips unless `ANTHROPIC_API_KEY` is set. Until it has been run, the fixtures are handcrafted from Anthropic's documentation. |
 | `fmt` | Formats the code with `golangci-lint fmt` (gofmt, goimports). |
 | `fmt-check` | Fails if formatting would change anything. |
 | `vet` | `go vet ./...` |
@@ -300,16 +398,17 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same checks o
 ## Project layout
 
 ```
-cmd/switchyard/     CLI: serve, config validate, keys generate, version
+cmd/switchyard/     CLI: serve, config validate, catalog lint, keys generate, version
 internal/
-  api/openaiapi/    HTTP handlers for /v1/chat/completions and /v1/models
+  api/openaiapi/    HTTP handlers for /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
   apierror/         errors in the OpenAI-compatible JSON envelope
   app/              composition root: config snapshot to running service
   auth/             gateway API keys: hashing, store, middleware
+  catalog/          models, deployments, prices; resolution, selection, lint
   config/           schema, loading, ${…} expansion, includes, validation, snapshot
-  gateway/          request pipeline, metrics, completion log fields
-  providers/        adapter interface; openai/ is the OpenAI-wire adapter
-  schema/           lossless Chat Completions request and response types
+  gateway/          request pipeline, routing, completions shim, metrics, log fields
+  providers/        adapter interfaces; openai/ (OpenAI wire) and anthropic/ (Messages API)
+  schema/           lossless chat, legacy completion and embedding requests; capabilities
   server/           listeners, middleware, health checks, graceful shutdown
   sse/              server-sent events reader and writer
   telemetry/        slog with secret redaction, Prometheus registry
@@ -317,7 +416,10 @@ internal/
   version/          build metadata
 test/
   fakeupstream/     scriptable fake OpenAI-wire server
-  conformance/      OpenAI SDK conformance suite, direct and through the gateway
+  fakeanthropic/    scriptable fake Messages API (make record-fixtures records real ones)
+  fixtures/         Anthropic fixtures, handcrafted from the docs until recorded
+  conformance/      OpenAI SDK conformance suite, direct and through the gateway (OpenAI and
+                    Anthropic upstreams), plus the P2 acceptance cases
   load/             overhead benchmark (make bench-overhead)
   smoke/            opt-in live smoke test (make smoke)
 configs/            quickstart.yaml, switchyard.example.yaml, catalog/

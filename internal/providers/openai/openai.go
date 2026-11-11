@@ -32,8 +32,13 @@ import (
 
 // Limits on what the adapter reads from an upstream.
 const (
-	// maxResponseBytes caps a non-streaming response body.
+	// maxResponseBytes caps a non-streaming chat or completions response
+	// body.
 	maxResponseBytes = 64 << 20
+	// maxEmbeddingResponseBytes caps an embeddings response body. It is
+	// larger because embeddings are big: 2,048 inputs at 3,072 dimensions
+	// in float format are about 88 MB.
+	maxEmbeddingResponseBytes = 256 << 20
 	// maxErrorBodyBytes caps an error response body.
 	maxErrorBodyBytes = 1 << 20
 )
@@ -86,17 +91,23 @@ type timeouts struct {
 
 // Adapter calls one OpenAI-wire provider. It is safe for concurrent use.
 type Adapter struct {
-	id        string
-	endpoint  string
-	apiKey    string
-	forward   []string
-	timeouts  timeouts
-	client    *http.Client
-	dialer    *net.Dialer // bounds connection setup by the connect timeout
-	userAgent string
+	id          string
+	endpoint    string // chat/completions
+	completions string // completions
+	embeddings  string // embeddings
+	apiKey      string
+	forward     []string
+	timeouts    timeouts
+	client      *http.Client
+	dialer      *net.Dialer // bounds connection setup by the connect timeout
+	userAgent   string
 }
 
-var _ providers.Adapter = (*Adapter)(nil)
+var (
+	_ providers.Adapter   = (*Adapter)(nil)
+	_ providers.Completer = (*Adapter)(nil)
+	_ providers.Embedder  = (*Adapter)(nil)
+)
 
 // New returns the adapter for provider p, which must be validated config
 // with type openai. It builds the provider's own HTTP client and transport:
@@ -104,7 +115,9 @@ var _ providers.Adapter = (*Adapter)(nil)
 // and kept alive, and redirects are not followed.
 func New(p config.Provider) (*Adapter, error) {
 	endpoint, err := url.JoinPath(p.BaseURL, "chat/completions")
-	if err != nil {
+	completions, err2 := url.JoinPath(p.BaseURL, "completions")
+	embeddings, err3 := url.JoinPath(p.BaseURL, "embeddings")
+	if err = errors.Join(err, err2, err3); err != nil {
 		// The URL is not echoed: config validation guarantees it has no
 		// credentials, but it is still the operator's to print.
 		return nil, fmt.Errorf("openai: provider %s: invalid base_url", p.ID)
@@ -130,10 +143,12 @@ func New(p config.Provider) (*Adapter, error) {
 	}
 
 	return &Adapter{
-		id:       p.ID,
-		endpoint: endpoint,
-		apiKey:   p.APIKey.Value(),
-		forward:  forward,
+		id:          p.ID,
+		endpoint:    endpoint,
+		completions: completions,
+		embeddings:  embeddings,
+		apiKey:      p.APIKey.Value(),
+		forward:     forward,
 		timeouts: timeouts{
 			firstToken: p.Timeouts.FirstToken.Std(),
 			idle:       p.Timeouts.Idle.Std(),
@@ -156,10 +171,40 @@ func (a *Adapter) CloseIdleConnections() { a.client.CloseIdleConnections() }
 // Chat implements providers.Adapter. first_token bounds the wait for the
 // response headers, and total bounds the whole call including the body.
 func (a *Adapter) Chat(ctx context.Context, req *providers.Request) (*providers.Response, error) {
+	return a.post(ctx, a.endpoint, req.Chat.EncodeFor(req.UpstreamModel, !req.NoStreamUsage), req.Header, maxResponseBytes)
+}
+
+// ChatStream implements providers.Adapter. first_token bounds the wait for
+// the first event, idle each gap between events, and total the whole call.
+func (a *Adapter) ChatStream(ctx context.Context, req *providers.Request) (providers.Stream, error) {
+	return a.stream(ctx, a.endpoint, req.Chat.EncodeFor(req.UpstreamModel, !req.NoStreamUsage), req.Header)
+}
+
+// Completion implements providers.Completer: POST {base_url}/completions,
+// forwarded losslessly as Chat is.
+func (a *Adapter) Completion(ctx context.Context, req *providers.CompletionRequest) (*providers.Response, error) {
+	return a.post(ctx, a.completions, req.Completion.Encode(req.UpstreamModel, !req.NoStreamUsage), req.Header, maxResponseBytes)
+}
+
+// CompletionStream implements providers.Completer.
+func (a *Adapter) CompletionStream(ctx context.Context, req *providers.CompletionRequest) (providers.Stream, error) {
+	return a.stream(ctx, a.completions, req.Completion.Encode(req.UpstreamModel, !req.NoStreamUsage), req.Header)
+}
+
+// Embed implements providers.Embedder: POST {base_url}/embeddings,
+// forwarded losslessly with the model replaced.
+func (a *Adapter) Embed(ctx context.Context, req *providers.EmbedRequest) (*providers.Response, error) {
+	return a.post(ctx, a.embeddings, req.Embedding.Encode(req.UpstreamModel), req.Header, maxEmbeddingResponseBytes)
+}
+
+// post sends a non-streaming request to endpoint and reads a response body
+// of at most limit bytes. first_token bounds the wait for the response
+// headers, and total bounds the whole call including the body.
+func (a *Adapter) post(ctx context.Context, endpoint string, body []byte, header http.Header, limit int) (*providers.Response, error) {
 	c := a.newCall(ctx)
 	defer c.stop()
 
-	resp, err := a.do(c, req, false)
+	resp, err := a.do(c, endpoint, body, header, false)
 	if err != nil {
 		return nil, err
 	}
@@ -171,28 +216,32 @@ func (a *Adapter) Chat(ctx context.Context, req *providers.Request) (*providers.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, a.statusError(resp, rid)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
 		return nil, c.classify(err, rid)
 	}
-	if len(body) > maxResponseBytes {
+	if len(data) > limit {
 		return nil, &providers.Error{
 			Kind: providers.KindServerError, Status: resp.StatusCode, Provider: a.id, UpstreamRequestID: rid,
-			Message: fmt.Sprintf("upstream response exceeds %d bytes", maxResponseBytes),
+			Message: fmt.Sprintf("upstream response exceeds %d bytes", limit),
 		}
 	}
-	out := &providers.Response{Status: resp.StatusCode, Body: body, UpstreamRequestID: rid, TTFT: ttft}
-	if parsed, err := schema.ParseChatResponse(body); err == nil {
+	out := &providers.Response{Status: resp.StatusCode, Body: data, UpstreamRequestID: rid, TTFT: ttft}
+	var parsed struct {
+		Usage *schema.Usage `json:"usage"`
+	}
+	if json.Unmarshal(data, &parsed) == nil {
 		out.Usage = parsed.Usage
 	}
 	return out, nil
 }
 
-// ChatStream implements providers.Adapter. first_token bounds the wait for
-// the first event, idle each gap between events, and total the whole call.
-func (a *Adapter) ChatStream(ctx context.Context, req *providers.Request) (providers.Stream, error) {
+// stream sends a streaming request to endpoint and returns once the first
+// event has arrived. first_token bounds the wait for the first event, idle
+// each gap between events, and total the whole call.
+func (a *Adapter) stream(ctx context.Context, endpoint string, body []byte, header http.Header) (providers.Stream, error) {
 	c := a.newCall(ctx)
-	resp, err := a.do(c, req, true)
+	resp, err := a.do(c, endpoint, body, header, true)
 	if err != nil {
 		c.stop()
 		return nil, err
@@ -220,16 +269,16 @@ func (a *Adapter) ChatStream(ctx context.Context, req *providers.Request) (provi
 	return s, nil
 }
 
-// do sends the request and returns the response once its headers arrive.
-func (a *Adapter) do(c *call, req *providers.Request, stream bool) (*http.Response, error) {
-	httpReq, err := http.NewRequestWithContext(c.ctx, http.MethodPost, a.endpoint,
-		bytes.NewReader(req.Chat.Encode(req.UpstreamModel)))
+// do sends body to endpoint and returns the response once its headers
+// arrive.
+func (a *Adapter) do(c *call, endpoint string, body []byte, header http.Header, stream bool) (*http.Response, error) {
+	httpReq, err := http.NewRequestWithContext(c.ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, &providers.Error{Kind: providers.KindTransport, Provider: a.id, Message: "could not build the upstream request", Err: err}
 	}
 	h := httpReq.Header
 	for _, name := range a.forward {
-		for _, v := range req.Header.Values(name) {
+		for _, v := range header.Values(name) {
 			h.Add(name, v)
 		}
 	}
@@ -253,8 +302,9 @@ func (a *Adapter) do(c *call, req *providers.Request, stream bool) (*http.Respon
 
 // statusError turns a non-2xx response into an error. Only client errors
 // keep the upstream body, and only when it is an OpenAI error envelope
-// without the provider key: a 401 or 403 body may echo parts of our
-// credential, and 5xx bodies are the upstream's internals.
+// without the provider key (see clientErrorBody): a 401 or 403 body may
+// echo parts of our credential, and 5xx bodies are the upstream's
+// internals.
 func (a *Adapter) statusError(resp *http.Response, rid string) *providers.Error {
 	e := &providers.Error{Status: resp.StatusCode, Provider: a.id, UpstreamRequestID: rid}
 	code := resp.StatusCode
@@ -280,10 +330,87 @@ func (a *Adapter) statusError(resp *http.Response, rid string) *providers.Error 
 		return e
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
-	if err == nil && len(body) <= maxErrorBodyBytes && isErrorEnvelope(body) && !a.containsKey(body) {
-		e.Body = body
+	if err == nil && len(body) <= maxErrorBodyBytes {
+		e.Body = a.clientErrorBody(body)
 	}
 	return e
+}
+
+// clientErrorBody returns the client-error body to forward, or nil when
+// the gateway should send its generic envelope instead. The body must be a
+// JSON object whose error member is an object, as in
+// {"error":{"message":…}}, and no string in it, object keys included, may
+// contain the provider key once decoded: a JSON escape such as \u002d
+// hides the key from the raw bytes, but the client decodes it. What is
+// forwarded is a canonical re-encoding, token by token in the upstream's
+// order: strings are re-escaped (without escaping <, > and &) and numbers
+// keep their literal text, so no escape the check did not see can reach
+// the client.
+func (a *Adapter) clientErrorBody(body []byte) []byte {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil {
+		return nil
+	}
+	if e := bytes.TrimSpace(top["error"]); len(e) == 0 || e[0] != '{' {
+		return nil
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	// Each open object or array counts the tokens written into it: in an
+	// object, keys are the even ones and values the odd ones.
+	var open []struct {
+		object bool
+		n      int
+	}
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return buf.Bytes()
+		}
+		if err != nil {
+			return nil
+		}
+		if d, ok := tok.(json.Delim); ok && (d == '}' || d == ']') {
+			buf.WriteRune(rune(d))
+			open = open[:len(open)-1]
+			continue
+		}
+		if n := len(open); n > 0 {
+			f := &open[n-1]
+			switch {
+			case f.object && f.n%2 == 1:
+				buf.WriteByte(':')
+			case f.n > 0:
+				buf.WriteByte(',')
+			}
+			f.n++
+		} else if buf.Len() > 0 {
+			return nil // a second top-level value
+		}
+		switch v := tok.(type) {
+		case json.Delim:
+			buf.WriteRune(rune(v))
+			open = append(open, struct {
+				object bool
+				n      int
+			}{object: v == '{'})
+		case string:
+			if a.containsKey([]byte(v)) || enc.Encode(v) != nil {
+				return nil
+			}
+			buf.Truncate(buf.Len() - 1) // Encode's newline
+		case json.Number:
+			buf.WriteString(v.String())
+		case bool:
+			buf.WriteString(strconv.FormatBool(v))
+		case nil:
+			buf.WriteString("null")
+		}
+	}
 }
 
 // requestID returns the upstream's x-request-id, or "" unless it is 1–128
@@ -305,19 +432,6 @@ func (a *Adapter) requestID(h http.Header) string {
 // containsKey reports whether b contains the provider's API key.
 func (a *Adapter) containsKey(b []byte) bool {
 	return a.apiKey != "" && bytes.Contains(b, []byte(a.apiKey))
-}
-
-// isErrorEnvelope reports whether body is a JSON object whose error member
-// is an object, as in {"error":{"message":…}}.
-func isErrorEnvelope(body []byte) bool {
-	var env struct {
-		Error json.RawMessage `json:"error"`
-	}
-	if err := json.Unmarshal(body, &env); err != nil {
-		return false
-	}
-	b := bytes.TrimSpace(env.Error)
-	return len(b) > 0 && b[0] == '{'
 }
 
 // retryAfter parses Retry-After (delay seconds or an HTTP date), falling

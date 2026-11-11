@@ -317,7 +317,7 @@ func TestShippedConfigs(t *testing.T) {
 				"GEMINI_API_KEY":    "dummy-gemini",
 				"TOGETHER_API_KEY":  "dummy-together",
 			},
-			wantProvs: 5, wantModels: 5, wantSources: 2,
+			wantProvs: 5, wantModels: 11, wantSources: 2,
 		},
 	}
 	for _, tt := range tests {

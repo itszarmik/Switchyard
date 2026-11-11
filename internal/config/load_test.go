@@ -72,11 +72,13 @@ func TestLoadHappyPath(t *testing.T) {
 			},
 		},
 		Models: []Model{
-			{ID: "llama-3.3-70b", Deployments: []Deployment{
-				{Provider: "gpu-cluster", UpstreamModel: "meta-llama/Llama-3.3-70B-Instruct"},
-				{Provider: "together", UpstreamModel: "meta-llama/Llama-3.3-70B-Instruct-Turbo"},
+			{ID: "llama-3.3-70b", Type: "chat", TokenRatio: 1, Deployments: []Deployment{
+				{Provider: "gpu-cluster", UpstreamModel: "meta-llama/Llama-3.3-70B-Instruct", Pricing: Pricing{Input: mustPrice(t, "0.10"), Output: mustPrice(t, "0.10")}},
+				{Provider: "together", UpstreamModel: "meta-llama/Llama-3.3-70B-Instruct-Turbo", Pricing: Pricing{Input: mustPrice(t, "0.88"), Output: mustPrice(t, "0.88")}},
 			}},
-			{ID: "gpt-5", Deployments: []Deployment{{Provider: "openai", UpstreamModel: "gpt-5"}}},
+			{ID: "gpt-5", Type: "chat", TokenRatio: 1, Deployments: []Deployment{
+				{Provider: "openai", UpstreamModel: "gpt-5", Pricing: Pricing{Input: mustPrice(t, "1.25"), Output: mustPrice(t, "10")}},
+			}},
 		},
 		Tenants: []Tenant{
 			{ID: "acme", Keys: []APIKey{
@@ -273,7 +275,7 @@ func TestIncludes(t *testing.T) {
 			name:  "included file is not a mapping",
 			root:  "version: 1\ninclude: [a.yaml]\n",
 			files: fakeFS{"a.yaml": "- a\n"},
-			wants: []want{{sev: SeverityError, file: "a.yaml", line: 1, msg: "must be a mapping of providers and models, got a sequence"}},
+			wants: []want{{sev: SeverityError, file: "a.yaml", line: 1, msg: "must be a mapping of providers, models and aliases, got a sequence"}},
 		},
 		{
 			name:  "empty included file is fine",

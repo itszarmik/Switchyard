@@ -52,7 +52,7 @@ func TestSmoke(t *testing.T) {
 	g := harness.Run(t, harness.Config{
 		ProviderBaseURL: baseURL,
 		ProviderAPIKey:  "${OPENAI_API_KEY}",
-		Models:          []harness.Model{{ID: model, UpstreamModel: model}},
+		Models:          []harness.Model{{ID: model, UpstreamModel: model, Capabilities: []string{"streaming", "stream_usage"}}},
 		KeyHash:         hash,
 		Timeouts:        harness.Timeouts{FirstToken: 90 * time.Second, Total: callTimeout},
 	}, harness.RunOptions{Env: env})

@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -129,10 +130,43 @@ func wantKind(t *testing.T, err error, kind providers.Kind) *providers.Error {
 	if pe.Provider != "fake" {
 		t.Errorf("provider = %q, want fake", pe.Provider)
 	}
-	if strings.Contains(pe.Error(), providerKey) || strings.Contains(string(pe.Body), providerKey) {
+	if strings.Contains(pe.Error(), providerKey) || leaksKey(pe.Body) {
 		t.Errorf("error leaks the provider key: %v", pe)
 	}
 	return pe
+}
+
+// leaksKey reports whether body holds the provider key, as raw bytes or in
+// any string a client decodes from it as JSON.
+func leaksKey(body []byte) bool {
+	if strings.Contains(string(body), providerKey) {
+		return true
+	}
+	var v any
+	if json.Unmarshal(body, &v) != nil {
+		return false
+	}
+	var walk func(v any) bool
+	walk = func(v any) bool {
+		switch v := v.(type) {
+		case string:
+			return strings.Contains(v, providerKey)
+		case []any:
+			for _, e := range v {
+				if walk(e) {
+					return true
+				}
+			}
+		case map[string]any:
+			for k, e := range v {
+				if strings.Contains(k, providerKey) || walk(e) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(v)
 }
 
 func TestNewTransport(t *testing.T) {
@@ -483,5 +517,119 @@ func TestUpstreamRequestID(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestKeyNeverEchoed checks that a client-error body echoing the provider
+// key is never forwarded, however the key is spelled inside the JSON, on
+// every endpoint: the client decodes - to "-", so an escaped key is
+// as much a leak as a clear one. A body without the key is forwarded as a
+// canonical re-encoding, so no escape survives into it.
+func TestKeyNeverEchoed(t *testing.T) {
+	escaped := map[string]string{
+		"clear":            providerKey,
+		"one escaped dash": strings.Replace(providerKey, "-", `-`, 1),
+		"every byte escaped": func() string {
+			var b strings.Builder
+			for _, r := range providerKey {
+				fmt.Fprintf(&b, `\u%04X`, r)
+			}
+			return b.String()
+		}(),
+	}
+	bodies := map[string]func(key string) string{
+		"message": func(k string) string {
+			return `{"error":{"message":"bad key ` + k + `","type":"invalid_request_error"}}`
+		},
+		"param":      func(k string) string { return `{"error":{"message":"bad","param":"` + k + `"}}` },
+		"object key": func(k string) string { return `{"error":{"message":"bad","details":{"` + k + `":1}}}` },
+		"array":      func(k string) string { return `{"error":{"message":"bad","hints":["x",["` + k + `"]]}}` },
+		"sibling":    func(k string) string { return `{"error":{"message":"bad"},"key":"` + k + `"}` },
+	}
+	calls := map[string]func(t *testing.T, a *Adapter) error{
+		"chat": func(t *testing.T, a *Adapter) error {
+			_, err := a.Chat(ctxWithTimeout(t), chatRequest(t, `{"model":"m","messages":[{}]}`, nil))
+			return err
+		},
+		"chat stream": func(t *testing.T, a *Adapter) error {
+			s, err := a.ChatStream(ctxWithTimeout(t), chatRequest(t, `{"model":"m","messages":[{}],"stream":true}`, nil))
+			if s != nil {
+				_ = s.Close()
+			}
+			return err
+		},
+		"completion": func(t *testing.T, a *Adapter) error {
+			cr, _ := schema.DecodeCompletionRequest([]byte(`{"model":"m","prompt":"a"}`))
+			_, err := a.Completion(ctxWithTimeout(t), &providers.CompletionRequest{Completion: cr, UpstreamModel: "up", Header: http.Header{}})
+			return err
+		},
+		"completion stream": func(t *testing.T, a *Adapter) error {
+			cr, _ := schema.DecodeCompletionRequest([]byte(`{"model":"m","prompt":"a","stream":true}`))
+			s, err := a.CompletionStream(ctxWithTimeout(t), &providers.CompletionRequest{Completion: cr, UpstreamModel: "up", Header: http.Header{}})
+			if s != nil {
+				_ = s.Close()
+			}
+			return err
+		},
+		"embed": func(t *testing.T, a *Adapter) error {
+			er, _ := schema.DecodeEmbeddingRequest([]byte(`{"model":"m","input":"x"}`))
+			_, err := a.Embed(ctxWithTimeout(t), &providers.EmbedRequest{Embedding: er, UpstreamModel: "up", Header: http.Header{}})
+			return err
+		},
+	}
+	for spelling, key := range escaped {
+		for where, body := range bodies {
+			for _, status := range []int{400, 404, 429} {
+				for name, call := range calls {
+					t.Run(fmt.Sprintf("%s/%s/%d/%s", spelling, where, status, name), func(t *testing.T) {
+						u := newUpstream(t, func(_ *upstream, w http.ResponseWriter, _ *http.Request) {
+							w.WriteHeader(status)
+							_, _ = io.WriteString(w, body(key))
+						})
+						a := newAdapter(t, testProvider(u.URL+"/v1"))
+						kind := providers.KindClientError
+						if status == http.StatusTooManyRequests {
+							kind = providers.KindRateLimited
+						}
+						pe := wantKind(t, call(t, a), kind)
+						if pe.Body != nil {
+							t.Errorf("error kept the echoing body: %s", pe.Body)
+						}
+					})
+				}
+			}
+		}
+	}
+	reencoded := []struct{ name, body, want string }{
+		{"escapes", `{"error":{"message":"a \u003c b \u0026 c\/d \u00e9","type":"invalid_request_error","n":1.50}}`,
+			`{"error":{"message":"a < b & c/d é","type":"invalid_request_error","n":1.50}}`},
+		{"whitespace and nesting", "{ \"error\" : {\"message\":\"m\", \"a\":[1, [true,false], {\"b\":null}, []], \"o\":{}} ,\"x\":-2e3 }\n",
+			`{"error":{"message":"m","a":[1,[true,false],{"b":null},[]],"o":{}},"x":-2e3}`},
+		{"duplicate members are kept", `{"error":{"message":"a","message":"b"}}`, `{"error":{"message":"a","message":"b"}}`},
+	}
+	for _, tt := range reencoded {
+		t.Run("re-encoded/"+tt.name, func(t *testing.T) {
+			u := newUpstream(t, func(_ *upstream, w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, tt.body)
+			})
+			a := newAdapter(t, testProvider(u.URL+"/v1"))
+			pe := wantKind(t, calls["chat"](t, a), providers.KindClientError)
+			if string(pe.Body) != tt.want {
+				t.Errorf("body = %s, want %s", pe.Body, tt.want)
+			}
+		})
+	}
+	for _, body := range []string{`{"error":{"message":"m"}} {}`, `{"ERROR":{"message":"m"}}`, `{"error":"m"}`, `[{"error":{}}]`} {
+		t.Run("not an envelope/"+body, func(t *testing.T) {
+			u := newUpstream(t, func(_ *upstream, w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, body)
+			})
+			a := newAdapter(t, testProvider(u.URL+"/v1"))
+			if pe := wantKind(t, calls["chat"](t, a), providers.KindClientError); pe.Body != nil {
+				t.Errorf("body = %s, want none", pe.Body)
+			}
+		})
 	}
 }

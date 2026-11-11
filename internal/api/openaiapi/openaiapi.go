@@ -1,5 +1,6 @@
 // Package openaiapi serves the OpenAI-compatible /v1 endpoints over HTTP:
-// POST /v1/chat/completions (JSON and SSE) and GET /v1/models.
+// POST /v1/chat/completions and POST /v1/completions (JSON and SSE),
+// POST /v1/embeddings and GET /v1/models.
 //
 // The handlers own the HTTP details (reading the body, the response and
 // X-Switchyard-* headers, the OpenAI error envelope, SSE framing and
@@ -9,6 +10,7 @@
 package openaiapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"switchyard/internal/apierror"
@@ -31,6 +34,9 @@ const (
 	headerModel             = "X-Switchyard-Model"
 	headerProvider          = "X-Switchyard-Provider"
 	headerUpstreamRequestID = "X-Switchyard-Upstream-Request-Id"
+	headerAlias             = "X-Switchyard-Alias"
+	headerDroppedParams     = "X-Switchyard-Dropped-Params"
+	headerShim              = "X-Switchyard-Shim"
 )
 
 // Defaults for the zero values of Options.
@@ -71,25 +77,28 @@ type Route struct {
 // Routes returns the /v1 routes served by gw.
 func Routes(gw *gateway.Gateway, opts Options) []Route {
 	opts = opts.withDefaults()
+	post := func(endpoint string, serve func(context.Context, gateway.Exchange)) Route {
+		return Route{Pattern: "POST " + endpoint, Endpoint: endpoint, Handler: pipelineHandler{serve: serve, opts: opts}}
+	}
 	return []Route{
-		{
-			Pattern: "POST " + gateway.EndpointChatCompletions, Endpoint: gateway.EndpointChatCompletions,
-			Handler: chatHandler{gw: gw, opts: opts},
-		},
+		post(gateway.EndpointChatCompletions, gw.ChatCompletions),
+		post(gateway.EndpointCompletions, gw.Completions),
+		post(gateway.EndpointEmbeddings, gw.Embeddings),
 		{Pattern: "GET " + gateway.EndpointModels, Endpoint: gateway.EndpointModels, Handler: modelsHandler{gw: gw}},
 	}
 }
 
-type chatHandler struct {
-	gw   *gateway.Gateway
-	opts Options
+// pipelineHandler serves one POST endpoint through a gateway pipeline.
+type pipelineHandler struct {
+	serve func(context.Context, gateway.Exchange)
+	opts  Options
 }
 
-// ServeHTTP serves POST /v1/chat/completions.
-func (h chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP serves the endpoint.
+func (h pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ex := &exchange{w: w, r: r, rc: http.NewResponseController(w), opts: h.opts}
 	defer ex.finish()
-	h.gw.ChatCompletions(r.Context(), ex)
+	h.serve(r.Context(), ex)
 }
 
 type modelsHandler struct{ gw *gateway.Gateway }
@@ -250,6 +259,15 @@ func setInfo(h http.Header, info gateway.Info) {
 	}
 	if info.Provider != "" {
 		h.Set(headerProvider, info.Provider)
+	}
+	if info.Alias != "" {
+		h.Set(headerAlias, info.Alias)
+	}
+	if len(info.DroppedParams) > 0 {
+		h.Set(headerDroppedParams, strings.Join(info.DroppedParams, ", "))
+	}
+	if info.Shim != "" {
+		h.Set(headerShim, info.Shim)
 	}
 	if info.UpstreamRequestID != "" {
 		h.Set(headerUpstreamRequestID, info.UpstreamRequestID)

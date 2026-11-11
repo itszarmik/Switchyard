@@ -61,6 +61,10 @@ func HashKey(key string) string {
 type Model struct {
 	ID            string
 	UpstreamModel string
+	// Capabilities is the model's capability list. A request that needs a
+	// capability the model lacks is never sent upstream, so a model that
+	// must stream needs at least "streaming". Nil writes no list.
+	Capabilities []string
 }
 
 // Timeouts are the provider timeouts. Zero fields keep the defaults.
@@ -77,6 +81,9 @@ type Config struct {
 	// ProviderAPIKey is written to the config as is, so it may be a ${VAR}
 	// reference that the gateway expands from its environment.
 	ProviderAPIKey string
+	// ProviderType is the provider's wire protocol, openai (the default)
+	// or anthropic.
+	ProviderType string
 	// ForwardHeaders lists the client headers the provider may receive.
 	ForwardHeaders []string
 	Timeouts       Timeouts
@@ -111,8 +118,9 @@ func (c Config) YAML() ([]byte, error) {
 			UpstreamModel string `yaml:"upstream_model"`
 		}
 		model struct {
-			ID          string       `yaml:"id"`
-			Deployments []deployment `yaml:"deployments"`
+			ID           string       `yaml:"id"`
+			Capabilities []string     `yaml:"capabilities,omitempty"`
+			Deployments  []deployment `yaml:"deployments"`
 		}
 		key struct {
 			ID   string `yaml:"id"`
@@ -141,8 +149,12 @@ func (c Config) YAML() ([]byte, error) {
 	if level == "" {
 		level = "info"
 	}
+	typ := c.ProviderType
+	if typ == "" {
+		typ = "openai"
+	}
 	p := provider{
-		ID: ProviderID, Type: "openai", BaseURL: c.ProviderBaseURL, APIKey: c.ProviderAPIKey,
+		ID: ProviderID, Type: typ, BaseURL: c.ProviderBaseURL, APIKey: c.ProviderAPIKey,
 		ForwardHeaders: c.ForwardHeaders,
 	}
 	if c.Timeouts != (Timeouts{}) {
@@ -161,7 +173,8 @@ func (c Config) YAML() ([]byte, error) {
 		Provs:   []provider{p},
 	}
 	for _, m := range c.Models {
-		f.Models = append(f.Models, model{ID: m.ID, Deployments: []deployment{{Provider: ProviderID, UpstreamModel: m.UpstreamModel}}})
+		f.Models = append(f.Models, model{ID: m.ID, Capabilities: m.Capabilities,
+			Deployments: []deployment{{Provider: ProviderID, UpstreamModel: m.UpstreamModel}}})
 	}
 	if c.KeyHash != "" {
 		f.Tenants = []tenant{{ID: TenantID, Keys: []key{{ID: KeyID, Hash: c.KeyHash}}}}

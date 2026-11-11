@@ -1,8 +1,9 @@
 // Package gateway runs the request pipeline for each endpoint. It is the
 // only package that knows the order of the steps: decode and validate the
-// request, resolve the model, call the provider adapter, respond, then
-// record metrics and annotate the request's access-log line with the
-// completion fields.
+// request, resolve the model through the catalog and choose the cheapest
+// deployment that can honor the request, remove the parameters it may
+// drop, call the provider adapter, respond, then record metrics and
+// annotate the request's access-log line with the completion fields.
 //
 // The pipeline is transport-neutral: it talks to the HTTP layer
 // (api/openaiapi) through the Exchange interface, which reads the request
@@ -20,14 +21,18 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"switchyard/internal/catalog"
 	"switchyard/internal/config"
 	"switchyard/internal/providers"
+	"switchyard/internal/providers/anthropic"
 	"switchyard/internal/providers/openai"
 )
 
 // Endpoint labels, used in metrics and logs.
 const (
 	EndpointChatCompletions = "/v1/chat/completions"
+	EndpointCompletions     = "/v1/completions"
+	EndpointEmbeddings      = "/v1/embeddings"
 	EndpointModels          = "/v1/models"
 )
 
@@ -45,37 +50,25 @@ type Options struct {
 // Gateway serves the OpenAI-compatible endpoints. It is safe for concurrent
 // use.
 type Gateway struct {
-	targets map[string]*target
-	models  []Model
+	catalog *catalog.Catalog
+	// adapters holds one adapter per provider, by provider id.
+	adapters map[string]providers.Adapter
+	// drop is routing.drop_unsupported_params.
+	drop    bool
+	created int64
 	metrics *metrics
 }
 
-// target is where a catalog model is served: in Phase 1, its first
-// deployment.
-type target struct {
-	model         string // catalog id
-	provider      string
-	providerType  string
-	upstreamModel string
-	// adapter is nil when the provider's type has no adapter yet.
-	adapter providers.Adapter
-}
-
-// deployment is the target's id, model@provider.
-func (t *target) deployment() string { return t.model + "@" + t.provider }
-
 // Model is one entry of the model list.
 type Model struct {
-	// ID is the catalog id clients send in the model field.
+	// ID is the catalog id or alias clients send in the model field.
 	ID string
 	// Created is the Unix time the configuration was loaded.
 	Created int64
 }
 
-// New builds the gateway: one adapter, with its own HTTP client, per
-// provider, and the model lookup table. Providers of a type without an
-// adapter yet (anthropic, until Phase 2) are logged and their models answer
-// with an error. It registers the metrics on opts.Registry.
+// New builds the gateway: the catalog, and one adapter, with its own HTTP
+// client, per provider. It registers the metrics on opts.Registry.
 func New(opts Options) (*Gateway, error) {
 	switch {
 	case opts.Config == nil:
@@ -87,48 +80,37 @@ func New(opts Options) (*Gateway, error) {
 	}
 	cfg := opts.Config
 
-	type built struct {
-		typ     string
-		adapter providers.Adapter
+	cat, err := catalog.New(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: %w", err)
 	}
-	adapters := make(map[string]built, len(cfg.Providers))
+	g := &Gateway{
+		catalog:  cat,
+		adapters: make(map[string]providers.Adapter, len(cfg.Providers)),
+		drop:     cfg.Routing.DropUnsupportedParams,
+		created:  time.Now().Unix(),
+	}
 	for _, p := range cfg.Providers {
+		var (
+			a   providers.Adapter
+			err error
+		)
 		switch p.Type {
 		case "openai":
-			a, err := openai.New(p)
-			if err != nil {
-				return nil, fmt.Errorf("gateway: %w", err)
-			}
-			adapters[p.ID] = built{typ: p.Type, adapter: a}
+			a, err = openai.New(p)
+		case "anthropic":
+			a, err = anthropic.New(p)
 		default:
-			adapters[p.ID] = built{typ: p.Type}
-			opts.Logger.Warn("provider type not supported yet; its models will return errors",
+			// Validation rejects other types; their deployments are
+			// excluded from every request.
+			opts.Logger.Warn("provider type not supported; its deployments are never chosen",
 				"provider", p.ID, "type", p.Type)
+			continue
 		}
-	}
-
-	created := time.Now().Unix()
-	g := &Gateway{
-		targets: make(map[string]*target, len(cfg.Models)),
-		models:  make([]Model, 0, len(cfg.Models)),
-	}
-	for _, m := range cfg.Models {
-		if len(m.Deployments) == 0 {
-			return nil, fmt.Errorf("gateway: model %s has no deployments", m.ID)
+		if err != nil {
+			return nil, fmt.Errorf("gateway: %w", err)
 		}
-		d := m.Deployments[0]
-		b, ok := adapters[d.Provider]
-		if !ok {
-			return nil, fmt.Errorf("gateway: model %s: unknown provider %s", m.ID, d.Provider)
-		}
-		g.targets[m.ID] = &target{
-			model:         m.ID,
-			provider:      d.Provider,
-			providerType:  b.typ,
-			upstreamModel: d.UpstreamModel,
-			adapter:       b.adapter,
-		}
-		g.models = append(g.models, Model{ID: m.ID, Created: created})
+		g.adapters[p.ID] = a
 	}
 
 	met, err := newMetrics(opts.Registry)
@@ -146,6 +128,14 @@ type Info struct {
 	Model string
 	// Provider is the provider id.
 	Provider string
+	// Alias is the alias the client named, or "".
+	Alias string
+	// DroppedParams lists the request parameters removed because the
+	// chosen deployment cannot honor them.
+	DroppedParams []string
+	// Shim names the translation that served the request, such as "chat"
+	// for a legacy completion served through Chat Completions, or "".
+	Shim string
 	// UpstreamRequestID is the upstream's x-request-id.
 	UpstreamRequestID string
 }

@@ -37,12 +37,26 @@ providers:
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY:-}
 
-# Models clients can request, and the provider that serves each one.
+# Models clients can request, and the provider that serves each one. The
+# entry is copied from the curated catalog (configs/catalog/models.yaml),
+# which records why each capability is listed. A request is only sent to a
+# deployment that has every capability it needs.
 models:
-  - id: gpt-5-mini
+  - id: gpt-6-luna
+    context_window: 1050000
+    max_output_tokens: 128000
+    capabilities: [streaming, stream_usage, vision, json_mode, json_schema, prompt_caching]
     deployments:
       - provider: openai
-        upstream_model: gpt-5-mini
+        upstream_model: gpt-6-luna
+        # USD per 1M tokens, standard tier, prompts up to 272K tokens.
+        pricing:
+          input: "0.10"
+          output: "0.50"
+          cached_input: "0.01"
+          cache_write: "0.125"
+          source: https://developers.openai.com/api/docs/pricing
+          checked: "2026-11-11"
 
 # Gateway API keys. There are none yet, so every /v1 request gets 401 and
 # validation warns about it. Create a key and paste the printed entry here:

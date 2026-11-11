@@ -113,7 +113,8 @@ func (st *loadState) validate(c *Config) {
 	st.validateLogging(&c.Logging)
 	st.validateStorage(&c.Storage)
 	providers := st.validateProviders(c.Providers)
-	st.validateModels(c.Models, providers)
+	models, modelPaths := st.validateModels(c.Models, providers)
+	st.validateAliases(c.Aliases, models, modelPaths)
 	st.validateTenants(c.Tenants)
 	st.checkLiteralSecrets(c)
 }
@@ -352,8 +353,10 @@ func validHeaderName(s string) bool {
 }
 
 // validateModels checks every model against the defined providers, given
-// as id -> path of the provider's id.
-func (st *loadState) validateModels(ms []Model, providers map[string]string) {
+// as id -> path of the provider's id. It returns the first definition of
+// each model id, and the path of that id.
+func (st *loadState) validateModels(ms []Model, providers map[string]string) (models map[string]*Model, paths map[string]string) {
+	models = make(map[string]*Model)
 	known := make([]string, 0, len(providers))
 	for id := range providers {
 		known = append(known, id)
@@ -365,23 +368,19 @@ func (st *loadState) validateModels(ms []Model, providers map[string]string) {
 		m := &ms[i]
 		base := indexPath("models", i)
 		idPath := base + ".id"
-		switch {
-		case m.ID == "":
+		if m.ID == "" {
 			st.errorAt(idPath, msgRequired)
-		case strings.Contains(m.ID, "@"):
-			st.errorAt(idPath, `must not contain "@", which separates model and provider in deployment ids`)
-		case m.ID == "auto" || strings.HasPrefix(m.ID, "auto:"):
-			st.errorAt(idPath, `"auto" and the "auto:" prefix are reserved for virtual models`)
-		case !modelIDRE.MatchString(m.ID):
-			st.errorAt(idPath, fmt.Sprintf("must match %s, got %s", modelIDRE, st.describe(idPath, m.ID)))
 		}
+		st.checkModelID(idPath, m.ID)
 		if m.ID != "" {
 			if prev, dup := first[m.ID]; dup {
 				st.errorAt(idPath, fmt.Sprintf("duplicate model id %s; first defined at %s", st.describe(idPath, m.ID), st.where(prev)))
 			} else {
 				first[m.ID] = idPath
+				models[m.ID] = m
 			}
 		}
+		st.validateModelCatalog(m, base)
 
 		if len(m.Deployments) == 0 {
 			st.errorAt(base+".deployments", "at least one deployment is required")
@@ -403,8 +402,10 @@ func (st *loadState) validateModels(ms []Model, providers map[string]string) {
 			if d.UpstreamModel == "" {
 				st.errorAt(dp+".upstream_model", msgRequired)
 			}
+			st.validateDeploymentCatalog(m, &m.Deployments[j], dp)
 		}
 	}
+	return models, first
 }
 
 // validateTenants checks the tenants and their API keys. Key ids and key

@@ -8,3 +8,4 @@ models:
     deployments:
       - provider: openai
         upstream_model: gpt-5
+        pricing: { input: 1.25, output: 10 }
