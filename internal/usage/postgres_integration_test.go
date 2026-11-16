@@ -345,6 +345,7 @@ func TestPostgresMatchesMemoryLedger(t *testing.T) {
 	t.Parallel()
 	db := newTestDB(t)
 	events := randomEvents(t, 11, 3000)
+	shadows, feedback := addQualityRows(events, 11)
 	// Text Postgres cannot store must not poison a batch; it is stored
 	// cleaned.
 	odd := &Event{
@@ -372,8 +373,32 @@ func TestPostgresMatchesMemoryLedger(t *testing.T) {
 	mem := newMemoryWith(all)
 	pg := openLedger(t, db.dsn, PostgresOptions{})
 	defer closeLedger(t, pg)
+	ctx := context.Background()
+	for _, s := range shadows {
+		for _, l := range []ShadowStore{mem, pg} {
+			if err := l.RecordShadowEval(ctx, s); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, f := range feedback {
+		for _, l := range []FeedbackStore{mem, pg} {
+			if err := l.RecordFeedback(ctx, f); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Feedback on another tenant's request: the memory ledger refuses it,
+	// Postgres stores it, and neither report joins it.
+	cross := &Feedback{RequestID: events[0].ID, Tenant: "nobody", Score: 1}
+	if err := mem.RecordFeedback(ctx, cross); !errors.Is(err, ErrUnknownRequest) {
+		t.Errorf("memory: cross-tenant feedback = %v, want ErrUnknownRequest", err)
+	}
+	if err := pg.RecordFeedback(ctx, cross); err != nil {
+		t.Fatal(err)
+	}
 
-	for _, q := range reportQueries() {
+	for _, q := range append(reportQueries(), qualityQueries()...) {
 		want, err := mem.Report(context.Background(), q)
 		if err != nil {
 			t.Fatal(err)
@@ -385,7 +410,8 @@ func TestPostgresMatchesMemoryLedger(t *testing.T) {
 		if diff := cmp.Diff(want, got); diff != "" {
 			t.Errorf("Report(tenant %q, group by %v) differs from the memory ledger (-memory +postgres):\n%s", q.Tenant, q.GroupBy, diff)
 		}
-		checkTotalsAgainstEvents(t, q, got, all)
+		checkTotalsAgainstEvents(t, q, got, all, shadows...)
+		checkQualityAgainstRows(t, q, got, all, shadows, feedback)
 	}
 
 	t.Run("tenant isolation in SQL", func(t *testing.T) {
@@ -405,10 +431,15 @@ func TestPostgresMatchesMemoryLedger(t *testing.T) {
 			if r.Totals.Requests != want || inGroups != want {
 				t.Errorf("tenant %s: report counts %d requests (%d in groups), the table has %d", tenant, r.Totals.Requests, inGroups, want)
 			}
-			// The cost total equals a SQL sum restricted to the tenant.
+			// The cost total equals a SQL sum restricted to the tenant: the
+			// known cost and the overhead, which includes the cost of the
+			// shadow evaluations that join to the tenant's events.
 			var sqlSum string
 			if err := db.admin.QueryRow(context.Background(),
-				"SELECT (COALESCE(sum(cost_usd) FILTER (WHERE cost_known), 0) + COALESCE(sum(overhead_cost_usd), 0))::text FROM usage_events WHERE tenant = $1",
+				`SELECT (COALESCE(sum(cost_usd) FILTER (WHERE cost_known), 0) + COALESCE(sum(overhead_cost_usd), 0) +
+	COALESCE((SELECT sum(s.shadow_cost_usd) FROM shadow_evals s JOIN usage_events e ON e.tenant = s.tenant AND e.id = s.request_id
+		WHERE s.tenant = $1), 0))::text
+FROM usage_events WHERE tenant = $1`,
 				tenant).Scan(&sqlSum); err != nil {
 				t.Fatal(err)
 			}
@@ -619,7 +650,7 @@ func TestPostgresReportsDoNotStarveWriter(t *testing.T) {
 		SELECT 'seed-'||g, $1::timestamptz + (g % 86400) * interval '1 second', 'attacker', 'k', 'chat', 'm'||(g % 1000), '', 'd', 'p',
 		false, 200, 1, '', '', 'miss', 10, 0, 0, 10, true, false, 0.000001, true, '{}', 'm', 0.000001, 0, 1, 1,
 		jsonb_build_object('a', (g % 50000)::text, 'b', (g % 7)::text), 'v',
-		'balanced', 'observe', 'm@p', 0.0000005, true
+		'balanced', 'observe', 'm@p', 0.0000005, true, 'coding'
 		FROM generate_series(1, 300000) g`, month); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -681,5 +712,104 @@ func TestPostgresReportsDoNotStarveWriter(t *testing.T) {
 	t.Logf("report outcomes: %v", outcomes)
 	if outcomes["error"] > 0 {
 		t.Errorf("%d reports failed", outcomes["error"])
+	}
+}
+
+// TestPostgresQuality: the hand-computed shadow and feedback reports of the
+// memory ledger hold in Postgres, the stores keep the first evaluation and
+// the latest feedback, and rows hold no content beyond the comment.
+func TestPostgresQuality(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	f := newQualityFixture(t)
+	l := openLedger(t, db.dsn, PostgresOptions{FlushInterval: 10 * time.Millisecond})
+	f.load(t, l)
+	ctx := context.Background()
+	// A second evaluation is ignored and later feedback replaces earlier.
+	if err := l.RecordShadowEval(ctx, &ShadowEval{RequestID: "e3", Tenant: "acme", Acceptable: true, Cost: mustMoney(t, "9")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RecordFeedback(ctx, &Feedback{RequestID: "e3", Tenant: "acme", KeyID: "k2", Time: qualityDay, Score: 0, Comment: "x\x00y"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RecordFeedback(ctx, &Feedback{RequestID: "e3", Tenant: "acme", Score: 5}); err == nil {
+		t.Error("a score of 5 was stored")
+	}
+	closeLedger(t, l)
+
+	pg := openLedger(t, db.dsn, PostgresOptions{})
+	defer closeLedger(t, pg)
+	checkQualityFixture(t, pg)
+
+	if n := db.count(t, "SELECT count(*) FROM shadow_evals"); n != int64(len(f.shadows)) {
+		t.Errorf("shadow_evals has %d rows, want %d", n, len(f.shadows))
+	}
+	var keyID, comment string
+	if err := db.admin.QueryRow(ctx, "SELECT key_id, comment FROM feedback WHERE tenant = 'acme' AND request_id = 'e3'").Scan(&keyID, &comment); err != nil {
+		t.Fatal(err)
+	}
+	if keyID != "k2" || comment != "xy" {
+		t.Errorf("feedback e3 = key %q comment %q, want the latest, cleaned", keyID, comment)
+	}
+	var cost string
+	if err := db.admin.QueryRow(ctx, "SELECT shadow_cost_usd::text FROM shadow_evals WHERE request_id = 'e3'").Scan(&cost); err != nil {
+		t.Fatal(err)
+	}
+	if cost != "0.100000000000000" {
+		t.Errorf("shadow_evals e3 cost = %s, want the first evaluation's", cost)
+	}
+	var category string
+	if err := db.admin.QueryRow(ctx, "SELECT category FROM usage_events WHERE id = 'e1'").Scan(&category); err != nil {
+		t.Fatal(err)
+	}
+	if category != "coding" {
+		t.Errorf("usage_events.category = %q, want coding", category)
+	}
+}
+
+// TestPostgresMigration0003KeepsOldRows: events written before migration
+// 0003 read as uncategorized, and the migration is safe to run again.
+func TestPostgresMigration0003KeepsOldRows(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	ctx := context.Background()
+	ms, err := loadMigrations(migrationFiles, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) < 3 || ms[2].version != 3 {
+		t.Fatalf("migrations = %v, want 0001 to 0003", ms)
+	}
+	if _, err := migrate(ctx, db.admin, ms[:2]); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		"CREATE TABLE usage_events_p202611 PARTITION OF usage_events FOR VALUES FROM ('2026-11-01T00:00:00Z') TO ('2026-12-01T00:00:00Z')",
+		`INSERT INTO usage_events (id, ts, tenant, key_id, endpoint, requested_model, alias, deployment, provider, stream, status,
+			attempts, fallback_reason, route_reason, cache_status, input_tokens, cached_input_tokens, cache_write_tokens,
+			output_tokens, usage_known, usage_estimated, cost_usd, cost_known, pricing, baseline_model, baseline_cost_usd,
+			overhead_cost_usd, latency_ms, ttft_ms, tags, config_version)
+		VALUES ('old', '2026-11-05T12:00:00Z', 'acme', 'k1', '/v1/chat/completions', 'gpt', '', 'gpt@openai', 'openai', false, 200,
+			1, '', 'cheapest_eligible', 'miss', 10, 0, 0, 5, true, false, 0.25, true, '{}', 'gpt', 0.5, 0, 1, 1, '{}', 'v1')`,
+	} {
+		if _, err := db.admin.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := migrate(ctx, db.admin, ms); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.admin.Exec(ctx, ms[2].sql); err != nil {
+		t.Errorf("re-running 0003: %v", err)
+	}
+	l := openLedger(t, db.dsn, PostgresOptions{})
+	defer closeLedger(t, l)
+	ts := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	r, err := l.Report(ctx, Query{Tenant: "acme", From: ts.Add(-time.Hour), To: ts.Add(time.Hour), GroupBy: []string{GroupByCategory}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Totals.Requests != 1 || r.Totals.Quality != nil || len(r.Groups) != 1 || r.Groups[0].Key[GroupByCategory] != "" {
+		t.Errorf("report of the old row = %+v", r)
 	}
 }

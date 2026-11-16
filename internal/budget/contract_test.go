@@ -10,8 +10,10 @@ import (
 	"time"
 )
 
-// noon is a fixed time in the middle of a UTC day and month.
-var noon = time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+// noon is a fixed time in the middle of a UTC day and month. It is a century
+// ahead so the Redis keys' EXPIREAT deadlines, computed from it, never fall
+// into the real past (real Redis and miniredis expire them by wall clock).
+var noon = time.Date(2126, 11, 11, 12, 0, 0, 0, time.UTC)
 
 // scope returns a tenant scope named after tenant and window.
 func scope(tenant, window string, limit int64, block bool) Scope {
@@ -72,8 +74,8 @@ func names(scopes []Scope) []string {
 // which returns a fresh, empty store for each subtest.
 func testContract(t *testing.T, newStore func(t *testing.T) Store) {
 	ctx := context.Background()
-	nextDay := time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC)
-	nextMonth := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	nextDay := time.Date(2126, 11, 12, 0, 0, 0, 0, time.UTC)
+	nextMonth := time.Date(2126, 12, 1, 0, 0, 0, 0, time.UTC)
 
 	t.Run("admit and settle", func(t *testing.T) {
 		st := newStore(t)
@@ -212,7 +214,7 @@ func testContract(t *testing.T, newStore func(t *testing.T) Store) {
 	t.Run("delta charges the admission's windows", func(t *testing.T) {
 		st := newStore(t)
 		s := scope("acme", WindowDay, 1000, true)
-		late := time.Date(2026, 11, 11, 23, 59, 59, 0, time.UTC)
+		late := time.Date(2126, 11, 11, 23, 59, 59, 0, time.UTC)
 		a := mustAdmit(t, st, []Scope{s}, 100, late)
 		if err := st.Delta(ctx, &a, 50, nextDay); err != nil {
 			t.Fatalf("Delta: %v", err)
@@ -237,21 +239,21 @@ func testContract(t *testing.T, newStore func(t *testing.T) Store) {
 			sameWindowTime time.Time
 		}{
 			{"day", WindowDay,
-				time.Date(2026, 11, 11, 23, 59, 59, 999_999_999, time.UTC), nextDay,
-				nextDay, time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)},
+				time.Date(2126, 11, 11, 23, 59, 59, 999_999_999, time.UTC), nextDay,
+				nextDay, time.Date(2126, 11, 11, 0, 0, 0, 0, time.UTC)},
 			{"month", WindowMonth,
-				time.Date(2026, 11, 30, 23, 59, 59, 0, time.UTC), nextMonth,
-				nextMonth, time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)},
+				time.Date(2126, 11, 30, 23, 59, 59, 0, time.UTC), nextMonth,
+				nextMonth, time.Date(2126, 11, 1, 0, 0, 0, 0, time.UTC)},
 			{"year", WindowMonth,
-				time.Date(2026, 12, 31, 23, 0, 0, 0, time.UTC), time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-				time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)},
+				time.Date(2126, 12, 31, 23, 0, 0, 0, time.UTC), time.Date(2127, 1, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2127, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2126, 12, 1, 0, 0, 0, 0, time.UTC)},
 			{"leap day", WindowDay,
-				time.Date(2028, 2, 29, 10, 0, 0, 0, time.UTC), time.Date(2028, 3, 1, 0, 0, 0, 0, time.UTC),
-				time.Date(2028, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)},
+				time.Date(2128, 2, 29, 10, 0, 0, 0, time.UTC), time.Date(2128, 3, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2128, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2128, 2, 29, 0, 0, 0, 0, time.UTC)},
 			{"non-UTC clock", WindowDay,
-				// 2026-11-12 01:00 at UTC+5 is 2026-11-11 20:00 UTC.
-				time.Date(2026, 11, 12, 1, 0, 0, 0, time.FixedZone("UTC+5", 5*3600)), nextDay,
-				nextDay, time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)},
+				// 2126-11-12 01:00 at UTC+5 is 2126-11-11 20:00 UTC.
+				time.Date(2126, 11, 12, 1, 0, 0, 0, time.FixedZone("UTC+5", 5*3600)), nextDay,
+				nextDay, time.Date(2126, 11, 11, 0, 0, 0, 0, time.UTC)},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -515,15 +517,15 @@ func TestMemoryStoreSweepsExpiredWindows(t *testing.T) {
 	s := scope("acme", WindowDay, 1000, true)
 	mustAdmit(t, st, []Scope{s}, 10, noon)
 	// Two days after the window ends the counter is still kept.
-	mustAdmit(t, st, []Scope{s}, 10, time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC))
+	mustAdmit(t, st, []Scope{s}, 10, time.Date(2126, 11, 14, 0, 0, 0, 0, time.UTC))
 	if n := len(st.counters); n != 2 {
 		t.Fatalf("%d counters, want 2", n)
 	}
-	mustAdmit(t, st, []Scope{s}, 10, time.Date(2026, 11, 14, 1, 0, 1, 0, time.UTC))
+	mustAdmit(t, st, []Scope{s}, 10, time.Date(2126, 11, 14, 1, 0, 1, 0, time.UTC))
 	if n := len(st.counters); n != 1 {
 		t.Fatalf("%d counters after the sweep, want 1", n)
 	}
-	if _, ok := st.counters[counterKey{s.Name, time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)}]; ok {
-		t.Error("the counter of 2026-11-11 was not swept")
+	if _, ok := st.counters[counterKey{s.Name, time.Date(2126, 11, 11, 0, 0, 0, 0, time.UTC)}]; ok {
+		t.Error("the counter of 2126-11-11 was not swept")
 	}
 }

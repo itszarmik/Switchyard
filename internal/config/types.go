@@ -37,6 +37,11 @@ type Config struct {
 	Budgets Budgets           `yaml:"budgets"`
 	// Policies are referenced by tenants and keys (DESIGN §13).
 	Policies []Policy `yaml:"policies"`
+	// QualityOverrides replace catalog quality priors with measured values,
+	// usually written by `switchyard eval fit` into an included file.
+	QualityOverrides []QualityOverride `yaml:"quality_overrides"`
+	// Evaluation configures the judge and shadow sampling (Phase 8).
+	Evaluation Evaluation `yaml:"evaluation"`
 }
 
 // Server configures the public and admin HTTP listeners.
@@ -474,6 +479,19 @@ type Policy struct {
 	// Rules are evaluated in order; the first whose match holds applies its
 	// set.
 	Rules []Rule `yaml:"rules"`
+	// Shadow configures shadow sampling for this policy's traffic (Phase 8).
+	// It is off unless SampleRate > 0.
+	Shadow ShadowPolicy `yaml:"shadow"`
+}
+
+// ShadowPolicy opts a policy's traffic into shadow sampling: a fraction of
+// routed requests is also answered by the comparison model and judged, so
+// quality can be measured on real traffic (DESIGN §10.7). Shadow calls send
+// request content to the comparison and judge deployments, which must pass
+// this policy's allow, deny and require_tags rules.
+type ShadowPolicy struct {
+	// SampleRate is the fraction of eligible requests sampled, in [0, 1].
+	SampleRate float64 `yaml:"sample_rate"`
 }
 
 // Substitution configures cross-model substitution for concrete model names.
@@ -535,4 +553,56 @@ type PolicyOverride struct {
 	RoutingMode          string       `yaml:"routing_mode"`
 	MaxCostPerRequestUSD Price        `yaml:"max_cost_per_request_usd"`
 	OnUnmet              string       `yaml:"on_unmet"`
+}
+
+// QualityOverride is a measured quality prior for one model and category.
+type QualityOverride struct {
+	// Model is a catalog model ID.
+	Model string `yaml:"model"`
+	// Category is a quality category (general, coding, reasoning,
+	// extraction, creative, tool_use).
+	Category string `yaml:"category"`
+	// Value replaces the catalog prior, in [0, 1].
+	Value float64 `yaml:"value"`
+	// CILow and CIHigh bound Value's confidence interval, in [0, 1].
+	CILow  float64 `yaml:"ci_low"`
+	CIHigh float64 `yaml:"ci_high"`
+	// Samples is the number of judged comparisons behind Value.
+	Samples int `yaml:"samples"`
+	// Evaluated is the date of the evaluation, as YYYY-MM-DD.
+	Evaluated string `yaml:"evaluated"`
+	// Source describes the evaluation, e.g. the prompt set and judge model.
+	Source string `yaml:"source"`
+}
+
+// Evaluation configures the LLM judge and shadow sampling.
+type Evaluation struct {
+	// Judge is the deployment that compares answers.
+	Judge JudgeConfig `yaml:"judge"`
+	// Shadow holds gateway-wide shadow-sampling limits.
+	Shadow ShadowConfig `yaml:"shadow"`
+}
+
+// JudgeConfig names the judge model.
+type JudgeConfig struct {
+	// Model is a catalog chat model ID or model@provider. Required when any
+	// policy enables shadow sampling.
+	Model string `yaml:"model"`
+}
+
+// ShadowConfig bounds shadow sampling.
+type ShadowConfig struct {
+	// DailyBudgetUSD caps the combined cost of shadow and judge calls per
+	// tenant per UTC day. Required when any policy enables shadow sampling.
+	DailyBudgetUSD Price `yaml:"daily_budget_usd"`
+	// Concurrency caps in-flight shadow evaluations per replica. Default 4.
+	Concurrency int `yaml:"concurrency"`
+	// MaxOutputTokens caps each shadow and judge completion. Default 1024.
+	MaxOutputTokens int64 `yaml:"max_output_tokens"`
+	// VerifiedMinSamples is how many judged samples a category needs before
+	// its savings count as verified. Default 30.
+	VerifiedMinSamples int `yaml:"verified_min_samples"`
+	// VerifiedMinPassRate is the lower confidence bound the pass rate must
+	// reach for verified savings, in (0, 1]. Default 0.9.
+	VerifiedMinPassRate float64 `yaml:"verified_min_pass_rate"`
 }

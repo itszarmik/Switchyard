@@ -336,6 +336,17 @@ func (r *ChatRequest) Field(name string) (json.RawMessage, bool) {
 	return r.obj.get(name)
 }
 
+// Size returns about how many bytes r holds: the lengths of its members'
+// names and raw values, plus their framing. It allocates nothing, so a
+// caller can bound the memory of retained requests cheaply.
+func (r *ChatRequest) Size() int {
+	n := 2
+	for k, v := range r.obj.vals {
+		n += len(k) + len(v) + 4
+	}
+	return n
+}
+
 // Encode returns the request body to send upstream: the client's object
 // with every member intact and in its original order, except that model is
 // replaced by upstreamModel and, for a streamed request,

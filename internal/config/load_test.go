@@ -93,6 +93,10 @@ func TestLoadHappyPath(t *testing.T) {
 		},
 		Routing: DefaultRouting(),
 		Budgets: Budgets{FailMode: BudgetFailOpen},
+		Evaluation: Evaluation{Shadow: ShadowConfig{
+			Concurrency: DefaultShadowConcurrency, MaxOutputTokens: DefaultShadowMaxOutputTokens,
+			VerifiedMinSamples: DefaultVerifiedMinSamples, VerifiedMinPassRate: DefaultVerifiedMinPassRate,
+		}},
 	}
 	if diff := cmp.Diff(want, cfg, cmp.Comparer(func(a, b Secret) bool { return a.Value() == b.Value() })); diff != "" {
 		t.Errorf("Config mismatch (-want +got):\n%s", diff)

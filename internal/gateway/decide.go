@@ -573,6 +573,7 @@ func (g *Gateway) usePlan(rec *record, rt *routed) {
 		rec.info.Model = p.entries[0].d.Model.ID
 	}
 	rec.excluded = len(exclusions(rt.served.Explanation))
+	g.decideShadow(rec, rt)
 }
 
 // routeInfo returns the response headers a routed request carries before

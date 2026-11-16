@@ -64,6 +64,19 @@ func normalizeQuery(q Query) (Query, error) {
 			}
 		}
 	}
+	v := &q.Verification
+	switch {
+	case v.MinSamples < 0:
+		return Query{}, fmt.Errorf("%w: the verification's minimum number of samples must not be negative", ErrInvalidQuery)
+	case v.MinSamples == 0:
+		v.MinSamples = defaultVerification.MinSamples
+	}
+	switch {
+	case !(v.MinPassRate >= 0 && v.MinPassRate <= 1): // NaN fails both
+		return Query{}, fmt.Errorf("%w: the verification's minimum pass rate must be between 0 and 1", ErrInvalidQuery)
+	case v.MinPassRate == 0:
+		v.MinPassRate = defaultVerification.MinPassRate
+	}
 	q.From, q.To = q.From.UTC(), q.To.UTC()
 	q.GroupBy = slices.Clone(q.GroupBy)
 	return q, nil
@@ -73,7 +86,8 @@ func normalizeQuery(q Query) (Query, error) {
 func validGroupBy(g string) bool {
 	switch g {
 	case GroupByDay, GroupByModel, GroupByDeployment, GroupByProvider, GroupByKey,
-		GroupByEndpoint, GroupByStatusClass, GroupByCacheStatus, GroupByProfile, GroupByRoutingMode:
+		GroupByEndpoint, GroupByStatusClass, GroupByCacheStatus, GroupByProfile, GroupByRoutingMode,
+		GroupByCategory:
 		return true
 	}
 	tag, ok := strings.CutPrefix(g, GroupByTagPrefix)
@@ -103,6 +117,8 @@ func groupValue(ev *Event, g string) string {
 		return ev.Profile
 	case GroupByRoutingMode:
 		return ev.RoutingMode
+	case GroupByCategory:
+		return ev.Category
 	}
 	return ev.Tags[strings.TrimPrefix(g, GroupByTagPrefix)]
 }
@@ -126,6 +142,57 @@ type accumulator struct {
 	routing, cache           Money
 	// projected sums the projected savings of observe-mode events.
 	projected Money
+
+	// cats holds the shadow verification sums of each of
+	// reportCategories, by the category of the events.
+	cats [len(reportCategories)]categorySums
+	// shadowCost sums the joined shadow evaluations' cost.
+	shadowCost Money
+	// feedback counts the joined feedback by score + 1.
+	feedback [3]int64
+}
+
+// categorySums are the sums behind one CategoryQuality.
+type categorySums struct {
+	judged, acceptable, errors int64
+	// savings sums the routing and projected savings of the category's
+	// events, which count as verified if the category is.
+	savings Money
+}
+
+// addJoined adds one event and the shadow evaluation and feedback that
+// join to it, either of which may be nil.
+func (a *accumulator) addJoined(ev *Event, se *ShadowEval, fb *Feedback) {
+	a.add(ev)
+	ci := categoryIndex(ev.Category)
+	if ci >= 0 && ev.CostKnown {
+		var s Money
+		if ev.CacheStatus != CacheStatusHit {
+			s = ev.BaselineCost.Sub(ev.Cost)
+		}
+		if ev.RoutingMode == RoutingModeObserve && ev.ShadowCostKnown {
+			s = s.Add(ev.BaselineCost.Sub(ev.ShadowCost))
+		}
+		a.cats[ci].savings = a.cats[ci].savings.Add(s)
+	}
+	if se != nil {
+		a.shadowCost = a.shadowCost.Add(se.Cost)
+		if ci >= 0 {
+			c := &a.cats[ci]
+			switch {
+			case se.ErrorKind != "":
+				c.errors++
+			case se.Acceptable:
+				c.judged++
+				c.acceptable++
+			default:
+				c.judged++
+			}
+		}
+	}
+	if fb != nil && fb.Score >= ScoreNegative && fb.Score <= ScorePositive {
+		a.feedback[fb.Score+1]++
+	}
 }
 
 // add adds one event.
@@ -159,25 +226,47 @@ func (a *accumulator) add(ev *Event) {
 	}
 }
 
-// totals returns the aggregate.
-func (a *accumulator) totals() Totals {
+// totals returns the aggregate, with the categories that meet v verified.
+func (a *accumulator) totals(v Verification) Totals {
+	// Shadow and judge calls are the gateway's own spend (DESIGN §12.4):
+	// they count as overhead, joined from the shadow evaluations at report
+	// time because they finish after their request's event is written.
+	overhead := a.overhead.Add(a.shadowCost)
 	t := Totals{
 		Requests:         a.requests,
 		Errors:           a.errors,
 		UnpricedRequests: a.unpriced,
 		Tokens:           a.tokens,
-		CostUSD:          a.cost.Add(a.overhead),
+		CostUSD:          a.cost.Add(overhead),
 		BaselineCostUSD:  a.baseline,
-		OverheadUSD:      a.overhead,
+		OverheadUSD:      overhead,
 	}
 	t.SavingsUSD.Routing = a.routing
 	t.SavingsUSD.Cache = a.cache
-	t.SavingsUSD.Net = a.routing.Add(a.cache).Sub(a.overhead)
+	t.SavingsUSD.Net = a.routing.Add(a.cache).Sub(overhead)
 	t.ProjectedSavingsUSD = a.projected
 	if a.requests > 0 {
 		t.CacheHitRate = float64(a.cacheHits) / float64(a.requests)
 		t.FallbackRate = float64(a.fallbacks) / float64(a.requests)
 	}
+	for i, c := range a.cats {
+		if c.judged == 0 && c.errors == 0 {
+			continue
+		}
+		q := CategoryQuality{
+			Category: reportCategories[i], Judged: c.judged, Acceptable: c.acceptable, Errors: c.errors,
+			WilsonLower: WilsonLower(c.acceptable, c.judged), Verified: v.verified(c.acceptable, c.judged),
+		}
+		if c.judged > 0 {
+			q.PassRate = float64(c.acceptable) / float64(c.judged)
+		}
+		if q.Verified {
+			t.VerifiedSavingsUSD = t.VerifiedSavingsUSD.Add(c.savings)
+		}
+		t.Quality = append(t.Quality, q)
+	}
+	t.ShadowCostUSD = a.shadowCost
+	t.Feedback = FeedbackCounts{Negative: a.feedback[0], Neutral: a.feedback[1], Positive: a.feedback[2]}
 	return t
 }
 

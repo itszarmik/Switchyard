@@ -120,6 +120,7 @@ func (g *Gateway) completionTry(ex Exchange, rec *record, req *schema.Completion
 		}
 		info.Shim = ""
 		info.Provider = d.Provider
+		rec.shadow.native = true
 		r, dropped := req.Without(dropFields(e.dropped)...)
 		info.DroppedParams = dropped
 		rec.dropped = dropped

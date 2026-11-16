@@ -63,6 +63,33 @@ bench-overhead: ## Measure the gateway's added latency (pass flags with BENCH_FL
 demo-routing: ## Run the mixed-workload routing demo against fake upstreams (pass flags with DEMO_FLAGS).
 	$(GO) run ./test/demo $(DEMO_FLAGS)
 
+.PHONY: demo-eval
+demo-eval: ## Run the quality evaluation demo (eval run, fit, overrides changing routing) against fake upstreams.
+	$(GO) run ./test/demoeval $(DEMO_FLAGS)
+
+# eval-live runs `switchyard eval run` against real providers. It is opt-in
+# and spends real money, so it needs every variable below and skips without
+# them; MAX_COST_USD caps this invocation's spend. JUDGE names the judge
+# (--judge; default the config's evaluation.judge.model). Run it with
+# DRY_RUN=1 first to see the estimated cost; DRY_RUN=0 (or unset) is a real
+# run. The provider keys come from the environment variables the config
+# references: without them the run fails at config load, before any call,
+# and spends nothing (a dry run needs no keys).
+EVAL_PROMPTS ?= test/eval/prompts/starter.jsonl
+EVAL_OUT     ?= results.jsonl
+JUDGE        ?=
+DRY_RUN      ?=
+
+.PHONY: eval-live
+eval-live: build ## Run eval against real providers (needs EVAL_CONFIG, EVAL_CANDIDATES, EVAL_REFERENCE, MAX_COST_USD and the config's keys; JUDGE=model, DRY_RUN=1 to estimate).
+	@if [ -z "$(EVAL_CONFIG)" ] || [ -z "$(EVAL_CANDIDATES)" ] || [ -z "$(EVAL_REFERENCE)" ] || [ -z "$(MAX_COST_USD)" ]; then \
+		echo "eval-live: skipped; set EVAL_CONFIG, EVAL_CANDIDATES, EVAL_REFERENCE and MAX_COST_USD (and the config's provider keys) to run it"; \
+		exit 0; \
+	fi; \
+	$(BINARY) eval run -c "$(EVAL_CONFIG)" --prompts "$(EVAL_PROMPTS)" --candidates "$(EVAL_CANDIDATES)" \
+		--reference "$(EVAL_REFERENCE)" --max-cost-usd "$(MAX_COST_USD)" --out "$(EVAL_OUT)" \
+		$(if $(strip $(JUDGE)),--judge "$(JUDGE)") $(if $(filter-out 0 false no,$(strip $(DRY_RUN))),--dry-run)
+
 # Integration tests (build tag `integration`) run against the Postgres and
 # redis-state services of deploy/compose.yaml, started in a compose project
 # of their own so that `down -v` never deletes the dev volumes. They use the

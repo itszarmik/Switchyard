@@ -317,7 +317,9 @@ func TestShippedConfigs(t *testing.T) {
 				"GEMINI_API_KEY":    "dummy-gemini",
 				"TOGETHER_API_KEY":  "dummy-together",
 			},
-			wantProvs: 5, wantModels: 11, wantSources: 2,
+			// The example, the model catalog and the (empty) quality
+			// overrides file.
+			wantProvs: 5, wantModels: 11, wantSources: 3,
 		},
 	}
 	for _, tt := range tests {

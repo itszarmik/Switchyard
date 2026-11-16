@@ -1,0 +1,22 @@
+# Measured quality priors (DESIGN §10.7), included by
+# configs/switchyard.example.yaml through its catalog/*.yaml glob.
+#
+# `switchyard eval fit` writes this file from an evaluation run: each entry
+# replaces one model's catalog prior Q for one category with the value the
+# judge measured on your prompts, with its 90% confidence interval, the
+# number of judged samples, the evaluation date and its source. Replace the
+# empty list below with the file eval fit writes, then check the effect with
+# `switchyard config validate` and `switchyard route explain`.
+#
+# An example entry:
+#
+#   quality_overrides:
+#     - model: gpt-6.1-sol
+#       category: coding
+#       value: 0.712
+#       ci_low: 0.655
+#       ci_high: 0.768
+#       samples: 120
+#       evaluated: "2026-11-12"
+#       source: "prompts=starter judge=claude-fable-5-2@anthropic reference=claude-sonnet-5-5@anthropic"
+quality_overrides: []

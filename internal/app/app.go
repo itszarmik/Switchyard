@@ -3,8 +3,9 @@
 // metrics registry and the HTTP server, wired together.
 //
 // The public listener serves the built-in health routes without
-// authentication, and the OpenAI-compatible /v1 routes and the tenant's
-// usage report, GET /switchyard/v1/usage, behind the API key middleware.
+// authentication, and the OpenAI-compatible /v1 routes, the tenant's usage
+// report, GET /switchyard/v1/usage, and feedback on the tenant's requests,
+// POST /switchyard/v1/feedback, behind the API key middleware.
 // The admin listener adds GET /admin/v1/providers, the deployments'
 // health, and GET /admin/v1/usage, the usage report of any tenant, to its
 // built-in routes.
@@ -18,6 +19,12 @@
 // wait for it. With fail_mode closed, /readyz reports Redis as the
 // budget_store check; with open, the replica stays ready and
 // GET /admin/v1/providers reports it.
+//
+// When a policy sets shadow.sample_rate > 0, a shadow.Runner evaluates the
+// sampled requests in the background, with the judge
+// (evaluation.judge.model) and the comparison deployments called through
+// the gateway's adapters, its spend charged to the budget store and its
+// results stored in the usage ledger.
 package app
 
 import (
@@ -36,8 +43,11 @@ import (
 	"switchyard/internal/auth"
 	"switchyard/internal/budget"
 	"switchyard/internal/config"
+	"switchyard/internal/eval"
 	"switchyard/internal/gateway"
+	"switchyard/internal/judge"
 	"switchyard/internal/server"
+	"switchyard/internal/shadow"
 	"switchyard/internal/telemetry"
 	"switchyard/internal/usage"
 	"switchyard/internal/version"
@@ -52,12 +62,17 @@ type App struct {
 	ledger        ledger
 	redis         *redis.Client
 	shutdownGrace time.Duration
+	// shadow is the shadow sampling runner, or nil when no policy samples.
+	shadow *shadow.Runner
 }
 
-// ledger is a usage ledger: where events go, and what reports read.
+// ledger is a usage ledger: where events go, what reports read, and where
+// shadow evaluations and feedback are stored.
 type ledger interface {
 	usage.Sink
 	usage.Reporter
+	usage.ShadowStore
+	usage.FeedbackStore
 }
 
 // Startup timeouts.
@@ -183,6 +198,13 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 		_ = a.closeStorage(context.Background())
 		return nil, fmt.Errorf("app: %w", err)
 	}
+	if a.shadow, err = newShadowRunner(cfg, gw, st.budgets, led, registry, logger); err != nil {
+		_ = a.closeStorage(context.Background())
+		return nil, fmt.Errorf("app: %w", err)
+	}
+	if a.shadow != nil {
+		gw.SetShadow(a.shadow)
+	}
 	store := auth.NewStore(cfg.Tenants)
 	authenticate := auth.Middleware(store)
 	routes := openaiapi.Routes(gw, openaiapi.Options{
@@ -194,9 +216,14 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 		// requests count in the API metrics too.
 		srv.Handle(r.Pattern, gw.Instrument(r.Endpoint, authenticate(r.Handler)))
 	}
-	srv.Handle("GET "+usageEndpoint, gw.Instrument(usageEndpoint, authenticate(usageapi.TenantHandler(led, usageapi.Options{}))))
+	usageOpts := usageapi.Options{Verification: usage.Verification{
+		MinSamples:  cfg.Evaluation.Shadow.VerifiedMinSamples,
+		MinPassRate: cfg.Evaluation.Shadow.VerifiedMinPassRate,
+	}}
+	srv.Handle("GET "+usageEndpoint, gw.Instrument(usageEndpoint, authenticate(usageapi.TenantHandler(led, usageOpts))))
+	srv.Handle("POST "+feedbackEndpoint, gw.Instrument(feedbackEndpoint, authenticate(usageapi.FeedbackHandler(led, usageOpts))))
 	srv.HandleAdmin("GET /admin/v1/providers", gw.ProvidersHandler())
-	srv.HandleAdmin("GET /admin/v1/usage", usageapi.AdminHandler(led, usageapi.Options{}))
+	srv.HandleAdmin("GET /admin/v1/usage", usageapi.AdminHandler(led, usageOpts))
 
 	logger.Info("config loaded",
 		"config_version", snap.Version(),
@@ -227,8 +254,49 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 	return a, nil
 }
 
-// usageEndpoint is the public usage report's path.
-const usageEndpoint = "/switchyard/v1/usage"
+// Paths of the public Switchyard endpoints: the usage report and feedback.
+const (
+	usageEndpoint    = "/switchyard/v1/usage"
+	feedbackEndpoint = "/switchyard/v1/feedback"
+)
+
+// newShadowRunner returns the shadow sampling runner when a policy has
+// shadow.sample_rate > 0, and nil otherwise. The judge is
+// evaluation.judge.model, pinned to one deployment (a model@provider, or
+// the model's cheapest priced deployment) that every sampling policy must
+// permit (eval.ShadowJudge), called through the gateway's
+// adapter; the comparison calls use the gateway's adapters too. Shadow
+// spend is charged to the budget store (through its circuit, with Redis),
+// and the results go to the usage ledger.
+func newShadowRunner(cfg *config.Config, gw *gateway.Gateway, budgets budget.Store, store usage.ShadowStore,
+	reg prometheus.Registerer, logger *slog.Logger) (*shadow.Runner, error) {
+	dep, err := eval.ShadowJudge(gw.Catalog(), cfg)
+	if err != nil || dep == nil {
+		return nil, err
+	}
+	s := cfg.Evaluation.Shadow
+	adapter := gw.Adapter(dep.Provider)
+	if adapter == nil {
+		return nil, fmt.Errorf("evaluation.judge.model: provider type %q of %s is not supported", dep.ProviderType, dep.ID)
+	}
+	// The judge answers within judge.DefaultMaxTokens, whatever
+	// max_output_tokens caps the comparison answer at.
+	j, err := judge.NewLLM(judge.Options{Adapter: adapter, Deployment: dep})
+	if err != nil {
+		return nil, err
+	}
+	r, err := shadow.NewRunner(shadow.RunnerOptions{
+		Adapters: gw.Adapter, Judge: j, JudgeDeployment: dep,
+		Budgets: budgets, DailyBudgetUSD: s.DailyBudgetUSD, Store: store,
+		Concurrency: s.Concurrency, MaxOutputTokens: s.MaxOutputTokens,
+		Registerer: reg, Logger: logger.With("component", "shadow"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("shadow sampling on", "judge", dep.ID, "daily_budget_usd", s.DailyBudgetUSD.String(), "concurrency", s.Concurrency)
+	return r, nil
+}
 
 // newLedger opens the usage ledger that storage.ledger selects. A Postgres
 // ledger connects and runs its migrations now, so an unreachable database
@@ -321,11 +389,14 @@ func (a *App) closeStorage(ctx context.Context) error {
 func (a *App) Logger() *slog.Logger { return a.log }
 
 // Run serves until ctx is done, then shuts down gracefully: the server
-// drains, then the usage ledger writes the events still queued, within
-// the shutdown grace period. Canceling forceCtx aborts the requests still
-// in flight and the flush. It returns nil after a clean shutdown,
-// server.ErrShutdownTimeout if requests had to be aborted, and an error if
-// usage events were lost.
+// drains, then the shadow runner finishes the samples it has started
+// (within half the shutdown grace period, after which it cancels them and
+// drops those still queued), then the usage ledger writes the events
+// still queued, within what is left of the grace period. The runner stops
+// first because it stores its results in the ledger. Canceling forceCtx
+// aborts the requests still in flight, the samples and the flush. It
+// returns nil after a clean shutdown, server.ErrShutdownTimeout if
+// requests had to be aborted, and an error if usage events were lost.
 func (a *App) Run(ctx, forceCtx context.Context) error {
 	info := version.Get()
 	a.log.Info("switchyard starting",
@@ -342,6 +413,13 @@ func (a *App) Run(ctx, forceCtx context.Context) error {
 	defer cancel()
 	stop := context.AfterFunc(forceCtx, cancel)
 	defer stop()
+	if a.shadow != nil {
+		sctx, scancel := context.WithTimeout(cctx, a.shutdownGrace/2)
+		if serr := a.shadow.Close(sctx); serr != nil {
+			a.log.Warn("shadow sampling: samples were canceled at shutdown", "error", serr)
+		}
+		scancel()
+	}
 	if cerr := a.closeStorage(cctx); cerr != nil {
 		err = errors.Join(err, fmt.Errorf("app: %w", cerr))
 	}

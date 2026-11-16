@@ -63,7 +63,8 @@ type Model struct {
 	TokenRatio float64
 	// Quality holds the model's quality priors in [0, 1] by category
 	// (DESIGN §10.2), or nil if the catalog sets none. A category without
-	// a prior falls back to general.
+	// a prior falls back to general. The config's quality_overrides
+	// replace the catalog's priors for their (model, category) pairs.
 	Quality map[string]float64
 	// Deployments serve the model, in config order.
 	Deployments []*Deployment
@@ -173,9 +174,11 @@ func (e *NoEligibleError) Error() string {
 	return fmt.Sprintf("no eligible deployment for model %q: %s", e.Model, strings.Join(parts, "; "))
 }
 
-// New builds the catalog from cfg, which must already be validated. It
+// New builds the catalog from cfg, which must already be validated. Each
+// of cfg.QualityOverrides replaces its model's prior for its category. New
 // returns an error only for inconsistencies that validation rejects, such
-// as a deployment of an undefined provider.
+// as a deployment of an undefined provider or an override of an undefined
+// model.
 func New(cfg *config.Config) (*Catalog, error) {
 	providers := make(map[string]*config.Provider, len(cfg.Providers))
 	for i := range cfg.Providers {
@@ -251,6 +254,17 @@ func New(cfg *config.Config) (*Catalog, error) {
 		}
 		c.models = append(c.models, m)
 		c.byID[m.ID] = m
+	}
+	// Measured priors replace the catalog's (DESIGN §10.7).
+	for _, o := range cfg.QualityOverrides {
+		m := c.byID[o.Model]
+		if m == nil {
+			return nil, fmt.Errorf("catalog: quality override: unknown model %q", o.Model)
+		}
+		if m.Quality == nil {
+			m.Quality = make(map[string]float64, 1)
+		}
+		m.Quality[o.Category] = o.Value
 	}
 	for name, target := range c.aliases {
 		if IsVirtual(target) {

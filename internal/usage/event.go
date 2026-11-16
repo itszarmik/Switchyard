@@ -99,6 +99,11 @@ type Event struct {
 	ShadowCost       Money
 	ShadowCostKnown  bool
 
+	// Category is the quality category the request was assessed in
+	// (DESIGN §10.3), or "" for a request that was not routed. Reports
+	// attribute shadow verification and verified savings by it.
+	Category string
+
 	// LatencyMS is the request's duration and TTFTMS its time to first
 	// token, in milliseconds (0 when not applicable).
 	LatencyMS, TTFTMS float64
@@ -148,6 +153,7 @@ const (
 	GroupByCacheStatus = "cache_status" // Event.CacheStatus
 	GroupByProfile     = "profile"      // Event.Profile
 	GroupByRoutingMode = "routing_mode" // Event.RoutingMode
+	GroupByCategory    = "category"     // Event.Category
 	GroupByTagPrefix   = "tag:"         // the tag's value, or "" if absent
 )
 
@@ -191,13 +197,20 @@ type Query struct {
 	// Limit caps the number of groups: DefaultReportLimit when 0, at most
 	// MaxReportLimit.
 	Limit int
+	// Verification decides which categories' savings count as verified.
+	// Zero fields take the defaults of evaluation.shadow
+	// (config.DefaultVerifiedMinSamples and DefaultVerifiedMinPassRate);
+	// MinSamples must not be negative and MinPassRate must be at most 1.
+	Verification Verification
 }
 
 // Report is the result of a Query.
 type Report struct {
-	// From, To and GroupBy echo the query, with times in UTC.
-	From, To time.Time
-	GroupBy  []string
+	// From, To and GroupBy echo the query, with times in UTC, and
+	// Verification echoes it with the defaults applied.
+	From, To     time.Time
+	GroupBy      []string
+	Verification Verification
 	// Totals cover every matching event, including those in groups beyond
 	// the limit.
 	Totals Totals
@@ -213,12 +226,14 @@ type Totals struct {
 	Requests, Errors, UnpricedRequests int64
 	// Tokens sums the token counts.
 	Tokens Tokens
-	// CostUSD is the known upstream cost plus overhead, so that
-	// SavingsUSD.Net = BaselineCostUSD - CostUSD (DESIGN §12.5).
+	// CostUSD is the known upstream cost plus overhead (ShadowCostUSD
+	// included), so that SavingsUSD.Net = BaselineCostUSD - CostUSD
+	// (DESIGN §12.5).
 	CostUSD Money
 	// BaselineCostUSD sums the baseline cost of events with a known cost.
 	BaselineCostUSD Money
-	// OverheadUSD sums the gateway's own spend.
+	// OverheadUSD sums the gateway's own spend: the events' overhead and
+	// ShadowCostUSD.
 	OverheadUSD Money
 	// SavingsUSD splits the savings (DESIGN §12.4). Routing is baseline
 	// minus cost over priced events that were not cache hits, and can be
@@ -236,6 +251,24 @@ type Totals struct {
 	// cache hits and that fell back to another deployment; 0 without
 	// requests.
 	CacheHitRate, FallbackRate float64
+
+	// Quality is the shadow verification of these requests (DESIGN §10.7),
+	// per category in category order, for every category with a shadow
+	// evaluation among them; nil when there is none. A shadow evaluation
+	// counts in the category of its request's event.
+	Quality []CategoryQuality
+	// VerifiedSavingsUSD is the part of the savings that shadow sampling
+	// verified: SavingsUSD.Routing plus ProjectedSavingsUSD, summed over
+	// the requests whose category is Verified in Quality. It is reported
+	// beside those totals and never replaces them. Each set of totals (the
+	// report's, or a group's) decides verification from its own samples.
+	VerifiedSavingsUSD Money
+	// ShadowCostUSD sums the cost of these requests' shadow evaluations
+	// (comparison and judge calls). It is the part of OverheadUSD (and so
+	// of CostUSD) that shadow sampling spent, broken out.
+	ShadowCostUSD Money
+	// Feedback counts the feedback given on these requests, by score.
+	Feedback FeedbackCounts
 }
 
 // Group is the totals of the events that share one key.

@@ -486,6 +486,9 @@ func (g *Gateway) responseAttempt(ex Exchange, rec *record, start time.Time, res
 	info.UpstreamRequestID = resp.UpstreamRequestID
 	a := attempt{committed: true, ttft: resp.TTFT, usage: resp.Usage}
 	body := resp.Body
+	if rec.shadow.sampled {
+		rec.shadow.body = body
+	}
 	if resp.Usage == nil {
 		rec.outBytes = responseOutputBytes(body)
 	}

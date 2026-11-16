@@ -134,6 +134,9 @@ type Gateway struct {
 	router   *router.Router
 	tenants  map[string]config.Tenant
 	offline  bool
+
+	// shadow takes the shadow samples, or is nil (see SetShadow).
+	shadow Shadow
 }
 
 // Model is one entry of the model list.

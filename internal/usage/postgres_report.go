@@ -64,8 +64,8 @@ func (l *reportLimiter) release(tenant string) {
 }
 
 // aggregateSQL selects the sums an accumulator needs, in scanAccumulator's
-// order. Money sums are exact NUMERIC values, read as text.
-var aggregateSQL = strings.Join([]string{
+// order, from fromSQL. Money sums are exact NUMERIC values, read as text.
+var aggregateSQL = strings.Join(append(append([]string{
 	"count(*)",
 	"count(*) FILTER (WHERE status >= 400)",
 	"count(*) FILTER (WHERE NOT cost_known)",
@@ -81,12 +81,59 @@ var aggregateSQL = strings.Join([]string{
 	"COALESCE(sum(baseline_cost_usd - cost_usd) FILTER (WHERE cost_known AND cache_status <> '" + CacheStatusHit + "'), 0)::text",
 	"COALESCE(sum(baseline_cost_usd) FILTER (WHERE cost_known AND cache_status = '" + CacheStatusHit + "'), 0)::text",
 	"COALESCE(sum(baseline_cost_usd - shadow_cost_usd) FILTER (WHERE cost_known AND shadow_cost_known AND routing_mode = '" + RoutingModeObserve + "'), 0)::text",
-	// The sort key: known cost plus overhead, as Totals.CostUSD.
-	"COALESCE(sum(cost_usd) FILTER (WHERE cost_known), 0) + COALESCE(sum(overhead_cost_usd), 0) AS sort_cost",
-}, ",\n\t")
+}, qualitySQL()...),
+	// The sort key: known cost plus overhead, shadow cost included, as
+	// Totals.CostUSD.
+	"COALESCE(sum(cost_usd) FILTER (WHERE cost_known), 0) + COALESCE(sum(overhead_cost_usd), 0) + COALESCE(sum(s_cost), 0) AS sort_cost",
+), ",\n\t")
 
-// aggregateColumns is the number of columns aggregateSQL selects.
-const aggregateColumns = 16
+// aggregateColumns is the number of columns aggregateSQL selects: 15, the
+// quality columns, and the sort key.
+const aggregateColumns = 15 + qualityColumns + 1
+
+// fromSQL is the FROM clause of a report: the events, each joined to the
+// shadow evaluation and the feedback of its tenant and ID, if any. Both
+// have the key (tenant, request_id), so the joins never repeat an event.
+// Their columns are renamed (s_*, f_*) so that the events' own columns stay
+// unambiguous without a table name.
+const fromSQL = `usage_events
+	LEFT JOIN (SELECT tenant AS s_tenant, request_id AS s_request_id, error_kind AS s_error_kind,
+		acceptable AS s_acceptable, shadow_cost_usd AS s_cost FROM shadow_evals) AS s
+		ON s.s_tenant = usage_events.tenant AND s.s_request_id = usage_events.id
+	LEFT JOIN (SELECT tenant AS f_tenant, request_id AS f_request_id, score AS f_score FROM feedback) AS f
+		ON f.f_tenant = usage_events.tenant AND f.f_request_id = usage_events.id`
+
+// qualityColumns is the number of columns qualitySQL selects: four per
+// report category, the shadow cost, and three feedback counts.
+const qualityColumns = 4*len(reportCategories) + 1 + 3
+
+// qualitySQL selects the sums behind Totals.Quality, VerifiedSavingsUSD,
+// ShadowCostUSD and Feedback, as accumulator.addJoined computes them: per
+// report category, the judged, acceptable and failed shadow evaluations
+// and the routing plus projected savings of its events; then the shadow
+// cost, and the feedback by score. The category names are constants, safe
+// to splice.
+func qualitySQL() []string {
+	var cols []string
+	for _, c := range reportCategories {
+		cat := "category = '" + c + "'"
+		cols = append(cols,
+			"count(*) FILTER (WHERE "+cat+" AND s_request_id IS NOT NULL AND s_error_kind = '')",
+			"count(*) FILTER (WHERE "+cat+" AND s_request_id IS NOT NULL AND s_error_kind = '' AND s_acceptable)",
+			"count(*) FILTER (WHERE "+cat+" AND s_request_id IS NOT NULL AND s_error_kind <> '')",
+			"COALESCE(sum("+
+				"CASE WHEN cache_status <> '"+CacheStatusHit+"' THEN baseline_cost_usd - cost_usd ELSE 0 END + "+
+				"CASE WHEN routing_mode = '"+RoutingModeObserve+"' AND shadow_cost_known THEN baseline_cost_usd - shadow_cost_usd ELSE 0 END"+
+				") FILTER (WHERE "+cat+" AND cost_known), 0)::text",
+		)
+	}
+	return append(cols,
+		"COALESCE(sum(s_cost), 0)::text",
+		"count(*) FILTER (WHERE f_score = -1)",
+		"count(*) FILTER (WHERE f_score = 0)",
+		"count(*) FILTER (WHERE f_score = 1)",
+	)
+}
 
 // dimensionSQL returns the SQL expression for the validated dimension g. A
 // tag dimension's key is bound as argument number arg.
@@ -112,6 +159,8 @@ func dimensionSQL(g string, arg int) string {
 		return "profile"
 	case GroupByRoutingMode:
 		return "routing_mode"
+	case GroupByCategory:
+		return "category"
 	}
 	return "COALESCE(tags ->> $" + strconv.Itoa(arg) + ", '')"
 }
@@ -141,17 +190,17 @@ func (l *PostgresLedger) Report(ctx context.Context, q Query) (*Report, error) {
 		where += " AND tenant = $" + strconv.Itoa(len(args))
 	}
 
-	r := &Report{From: q.From, To: q.To, GroupBy: q.GroupBy}
+	r := &Report{From: q.From, To: q.To, GroupBy: q.GroupBy, Verification: q.Verification}
 	err = pgx.BeginTxFunc(ctx, l.reports, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '"+reportStatementTimeout+"'"); err != nil {
 			return err
 		}
 		var total accumulator
-		row := tx.QueryRow(ctx, "SELECT "+aggregateSQL+"\nFROM usage_events WHERE "+where, args...)
+		row := tx.QueryRow(ctx, "SELECT "+aggregateSQL+"\nFROM "+fromSQL+"\nWHERE "+where, args...)
 		if err := scanAccumulator(row, nil, &total); err != nil {
 			return err
 		}
-		r.Totals = total.totals()
+		r.Totals = total.totals(q.Verification)
 		if len(q.GroupBy) == 0 {
 			return nil
 		}
@@ -199,7 +248,7 @@ func queryGroups(ctx context.Context, tx pgx.Tx, q Query, where string, args []a
 	}
 	args = append(args, q.Limit)
 	sql := "SELECT * FROM (SELECT " + strings.Join(dims, ", ") + ",\n\t" + aggregateSQL +
-		"\nFROM usage_events WHERE " + where +
+		"\nFROM " + fromSQL + "\nWHERE " + where +
 		"\nGROUP BY " + strings.Join(groupBy, ", ") + ") AS grouped" +
 		"\nORDER BY " + strings.Join(order, ", ") +
 		"\nLIMIT $" + strconv.Itoa(len(args))
@@ -219,7 +268,7 @@ func queryGroups(ctx context.Context, tx pgx.Tx, q Query, where string, args []a
 		for i, g := range q.GroupBy {
 			key[g] = values[i]
 		}
-		groups = append(groups, Group{Key: key, Totals: a.totals()})
+		groups = append(groups, Group{Key: key, Totals: a.totals(q.Verification)})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -233,7 +282,8 @@ func queryGroups(ctx context.Context, tx pgx.Tx, q Query, where string, args []a
 // scanAccumulator scans a row of len(values) group values followed by the
 // aggregateSQL columns into values and a.
 func scanAccumulator(row pgx.Row, values []string, a *accumulator) error {
-	var cost, baseline, overhead, routing, cache, projected string
+	var cost, baseline, overhead, routing, cache, projected, shadowCost string
+	var catSavings [len(reportCategories)]string
 	var sortCost any
 	dest := make([]any, 0, len(values)+aggregateColumns)
 	for i := range values {
@@ -242,17 +292,29 @@ func scanAccumulator(row pgx.Row, values []string, a *accumulator) error {
 	dest = append(dest,
 		&a.requests, &a.errors, &a.unpriced, &a.cacheHits, &a.fallbacks,
 		&a.tokens.Input, &a.tokens.CachedInput, &a.tokens.CacheWrite, &a.tokens.Output,
-		&cost, &baseline, &overhead, &routing, &cache, &projected, &sortCost)
+		&cost, &baseline, &overhead, &routing, &cache, &projected)
+	for i := range a.cats {
+		c := &a.cats[i]
+		dest = append(dest, &c.judged, &c.acceptable, &c.errors, &catSavings[i])
+	}
+	dest = append(dest, &shadowCost, &a.feedback[0], &a.feedback[1], &a.feedback[2], &sortCost)
 	if err := row.Scan(dest...); err != nil {
 		return err
 	}
-	for _, f := range []struct {
+	fields := []struct {
 		text string
 		dst  *Money
 	}{
 		{cost, &a.cost}, {baseline, &a.baseline}, {overhead, &a.overhead}, {routing, &a.routing}, {cache, &a.cache},
-		{projected, &a.projected},
-	} {
+		{projected, &a.projected}, {shadowCost, &a.shadowCost},
+	}
+	for i := range a.cats {
+		fields = append(fields, struct {
+			text string
+			dst  *Money
+		}{catSavings[i], &a.cats[i].savings})
+	}
+	for _, f := range fields {
 		m, err := ParseMoney(f.text)
 		if err != nil {
 			return fmt.Errorf("usage: report: decode a NUMERIC sum: %w", err)

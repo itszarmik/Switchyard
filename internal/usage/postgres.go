@@ -75,8 +75,10 @@ type PostgresLedger struct {
 }
 
 var (
-	_ Sink     = (*PostgresLedger)(nil)
-	_ Reporter = (*PostgresLedger)(nil)
+	_ Sink          = (*PostgresLedger)(nil)
+	_ Reporter      = (*PostgresLedger)(nil)
+	_ ShadowStore   = (*PostgresLedger)(nil)
+	_ FeedbackStore = (*PostgresLedger)(nil)
 )
 
 // NewPostgresLedger connects to the database at dsn, applies the embedded
@@ -228,6 +230,7 @@ var ledgerColumns = []string{
 	"baseline_model", "baseline_cost_usd", "overhead_cost_usd", "latency_ms", "ttft_ms",
 	"tags", "config_version",
 	"profile", "routing_mode", "shadow_deployment", "shadow_cost_usd", "shadow_cost_known",
+	"category",
 }
 
 // WriteBatch implements batchStore. It copies the batch into a temporary
@@ -258,6 +261,47 @@ func (l *PostgresLedger) WriteBatch(ctx context.Context, events []*Event) error 
 	if err != nil {
 		l.forgetPartitions()
 		return dbErr("write events", err)
+	}
+	return nil
+}
+
+// RecordShadowEval implements ShadowStore. It writes e at once, not
+// through the event writer: shadow evaluations are already asynchronous
+// and rare. An evaluation of a tenant and request already stored is
+// ignored.
+func (l *PostgresLedger) RecordShadowEval(ctx context.Context, e *ShadowEval) error {
+	if err := checkShadowEval(e); err != nil {
+		return err
+	}
+	_, err := l.pool.Exec(ctx, `INSERT INTO shadow_evals (tenant, request_id, ts, key_id, category, difficulty, profile, mode,
+	candidate_deployment, reference_deployment, judge_model, outcome, acceptable, shadow_cost_usd, error_kind)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+ON CONFLICT (tenant, request_id) DO NOTHING`,
+		cleanText(e.Tenant), cleanText(e.RequestID), e.Time.UTC(), cleanText(e.KeyID), cleanText(e.Category), e.Difficulty,
+		cleanText(e.Profile), cleanText(e.Mode), cleanText(e.CandidateDeployment), cleanText(e.ReferenceDeployment),
+		cleanText(e.JudgeModel), cleanText(e.Outcome), e.Acceptable, numeric(e.Cost), cleanText(e.ErrorKind))
+	if err != nil {
+		return dbErr("write shadow evaluation", err)
+	}
+	return nil
+}
+
+// RecordFeedback implements FeedbackStore. Events reach the database
+// asynchronously, so the ledger cannot tell a request that is not written
+// yet from one that does not exist: it stores every feedback with its
+// tenant, replacing the tenant's earlier feedback on the same request, and
+// never returns ErrUnknownRequest. Reports join feedback only to the
+// tenant's own events.
+func (l *PostgresLedger) RecordFeedback(ctx context.Context, f *Feedback) error {
+	if err := checkFeedback(f); err != nil {
+		return err
+	}
+	_, err := l.pool.Exec(ctx, `INSERT INTO feedback (tenant, request_id, key_id, ts, score, comment)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (tenant, request_id) DO UPDATE SET key_id = EXCLUDED.key_id, ts = EXCLUDED.ts, score = EXCLUDED.score, comment = EXCLUDED.comment`,
+		cleanText(f.Tenant), cleanText(f.RequestID), cleanText(f.KeyID), f.Time.UTC(), f.Score, cleanText(f.Comment))
+	if err != nil {
+		return dbErr("write feedback", err)
 	}
 	return nil
 }
@@ -304,6 +348,7 @@ func eventRow(ev *Event) []any {
 		ev.LatencyMS, ev.TTFTMS, tags, cleanText(ev.ConfigVersion),
 		cleanText(ev.Profile), cleanText(ev.RoutingMode), cleanText(ev.ShadowDeployment),
 		numeric(ev.ShadowCost), ev.ShadowCostKnown,
+		cleanText(ev.Category),
 	}
 }
 

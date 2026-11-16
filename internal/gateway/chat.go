@@ -107,6 +107,7 @@ func (g *Gateway) chatTry(ex Exchange, rec *record, req *schema.ChatRequest, con
 		r, dropped := req.Without(dropFields(e.dropped)...)
 		info.DroppedParams = dropped
 		rec.dropped = dropped
+		rec.shadow.req, rec.shadow.orig, rec.shadow.native = r, req, false
 		adapter := g.adapters[d.Provider]
 		preq := &providers.Request{
 			Chat: r, UpstreamModel: d.UpstreamModel, Header: ex.Header(),
@@ -184,6 +185,7 @@ func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage boo
 			chunk = &stripped
 		}
 		rec.outBytes += chunkOutputBytes(chunk)
+		rec.collectShadowChunk(chunk)
 		data := chunk.Raw
 		if conv != nil {
 			var keep bool

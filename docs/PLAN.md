@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P5 complete** and committed on `main`. Next: P6 (caching). CI and the live smoke tests have not run yet. |
+| Status | Design approved. **P0–P5 complete** and committed on `main`; **P8 complete** (done ahead of P6/P7 at the user's request). Next: P6 (caching). CI, the live smoke tests and a live judge-quality check have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -379,9 +379,51 @@ All nine criteria pass.
 
 **Acceptance**
 
-- [ ] Running eval on a provided prompt set produces a report and an overrides file, and the overrides change routing in a demonstrable way.
-- [ ] Shadow sampling never exceeds its budget, and its results join to ledger rows.
-- [ ] For categories with enough shadow data, observe-mode projected savings can be shown as verified.
+- [x] Running eval on a provided prompt set produces a report and an overrides file, and the overrides change routing in a demonstrable way.
+- [x] Shadow sampling never exceeds its budget, and its results join to ledger rows.
+- [x] For categories with enough shadow data, observe-mode projected savings can be shown as verified.
+
+**P8 outcome.**
+
+All three criteria pass against fake upstreams. No real provider has been called yet.
+
+**Eval demo** (`make demo-eval`):
+- A scripted judge rejects the small model on coding prompts.
+- `eval run` judged 210 pairs on the 105-prompt starter set, spending $1.67 under a $2 cap.
+- `eval fit` measured the small model's coding Q at 0.00, against its prior of 0.85, and wrote 10 overrides.
+- With those overrides included, the small model's share of 26 coding prompts falls from 100% to 12%, and the mid tier's rises from 0% to 88%.
+
+**Shadow budget.**
+- At sample rate 1.0 and a 0.05 USD daily budget, 60 concurrent requests stay within budget: $0.0455 spent, 36–40 judged, the rest dropped and counted.
+- This holds both with the memory ledger and with Postgres plus Redis.
+- Every `shadow_evals` row joins to a usage event.
+- Client status and latency are unaffected.
+
+**Verified savings.**
+- In observe mode with shadow sampling, a category the judge accepts (15 of 15, Wilson lower bound 0.85) is reported as verified, with its savings in `verified_savings_usd`.
+- A category the judge rejects stays unverified.
+- Projected totals are never replaced.
+
+**Statistics.**
+- Q is the maximum-likelihood fit of P(acceptable) = 1 − d·(1 − Q), with a 90% bootstrap interval from 1000 seeded resamples.
+- Verification uses the 90% Wilson lower bound against `verified_min_samples` and `verified_min_pass_rate`.
+
+**Review fixes.** Independent security and correctness reviews found no content leak and no budget overrun. Every finding listed here is fixed with a regression test.
+- **Eval cost cap.** A judge call that failed without usage counted as $0, and the estimate ignored images. Both are fixed: such calls are now charged at their estimate, and images are counted at 1,600 tokens each. Each answer is admitted together with its judge calls. The cap applies per invocation, and the CLI now says so.
+- **Enforce-mode sampling** now samples only routed or substituted requests. Pinned requests are no longer judged against the policy baseline.
+- **Judge validation** checks the exact judge deployment that will be pinned against every sampling policy.
+- **Observe-mode comparison** drops the parameters the router dropped, and strips `store`, `metadata` and `user`.
+- **Incremental shadow reservation.** Each upstream call is reserved just before it is made, and the judge has its own 256-token output cap. At a 0.05 USD budget this raised the judged share from 1 of 60 to about 38 of 60.
+- **Robustness fixes:**
+  - the shadow queue is bounded in bytes;
+  - resume tolerates a torn last line;
+  - the judge's delimiter escaping is case-insensitive, and the parser takes the last verdict;
+  - the memory ledger looks feedback up through an index.
+
+**Open.**
+- A live sanity check of judge quality and a real `make eval-live` run both need provider keys.
+- The bench's 5 ms p99 gate still fails on this machine, for both HEAD and P8. P7 addresses it.
+- `switchyard catalog lint` will flag the shipped prices as stale from 2027-02-10.
 
 ---
 

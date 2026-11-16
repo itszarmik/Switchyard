@@ -106,6 +106,10 @@ type Effective struct {
 	MaxCostPerRequestNano int64
 	// OnUnmet is OnUnmetBestEffort or OnUnmetReject.
 	OnUnmet string
+	// ShadowSampleRate is the base policy's shadow.sample_rate, the
+	// fraction of its requests sampled for shadow evaluation (DESIGN
+	// §10.7); 0 turns sampling off. Rules do not change it.
+	ShadowSampleRate float64
 	// Warnings explain header values that were ignored because they would
 	// have loosened the policy. The gateway returns them in the
 	// X-Switchyard-Policy-Warning response header.

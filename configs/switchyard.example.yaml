@@ -1,6 +1,6 @@
 # Switchyard reference configuration.
 #
-# Every key Phase 5 understands, with its default. The layout mirrors
+# Every key Phase 8 understands, with its default. The layout mirrors
 # docs/DESIGN.md §16.3. Later phases add sections (cache); until then, any
 # other key is rejected at load time.
 # CI validates this file with `switchyard config validate`.
@@ -21,11 +21,14 @@
 version: 1
 
 # Glob patterns of additional files, relative to this file's directory.
-# Included files may define only providers, models and aliases; list
-# entries are appended in sorted file-name order, and a duplicate ID or an
-# alias defined twice is an error. The model catalog lives in
+# Included files may define only providers, models, aliases and
+# quality_overrides; list entries are appended in sorted file-name order,
+# and a duplicate ID, an alias defined twice or a (model, category)
+# override given twice is an error. The model catalog lives in
 # configs/catalog/ (see configs/catalog/README.md); check its prices and
-# sources with `switchyard catalog lint`.
+# sources with `switchyard catalog lint`. The glob also includes
+# catalog/quality-overrides.yaml, where `switchyard eval fit` output goes:
+# measured quality priors that replace the catalog's hand-set ones.
 include:
   - catalog/*.yaml
 
@@ -309,6 +312,20 @@ routing:
 #   rules                     governance rules (the first match applies),
 #                             then quality rules on top; see below and the
 #                             README
+#   shadow.sample_rate        the fraction of this policy's chat and
+#                             completion requests sampled for shadow
+#                             evaluation (DESIGN §10.7), in [0, 1]; default 0
+#                             (off). A sampled request is also answered by
+#                             the comparison deployment (baseline_model in
+#                             enforce mode, the router's choice in observe
+#                             mode) and both answers go to the judge
+#                             (evaluation.judge), in the background, within
+#                             evaluation.shadow.daily_budget_usd. The
+#                             request and the answers are sent to those
+#                             deployments, which must pass the policy's
+#                             allow, deny and require_tags; nothing of the
+#                             content is logged or stored. Needs
+#                             baseline_model and the evaluation section
 # Request headers can only tighten a policy: X-Switchyard-Profile (an
 # allowed profile), X-Switchyard-Max-Cost-Usd (a lower cap),
 # X-Switchyard-Min-Quality (a higher bar, up to the best min_quality among
@@ -352,12 +369,20 @@ policies:
       - name: code-needs-quality
         match: { task: coding, difficulty_gte: 0.5 }
         set: { min_quality: 0.85 }
+    # Verify enforced routing on 1% of the traffic: the served answer is
+    # judged against the baseline model's.
+    # shadow: { sample_rate: 0.01 }
   # Onboarding: route nothing, measure what routing would save. Concrete
   # model names may be served by an equivalent model once enforced.
   - id: observe
     routing_mode: observe
     baseline_model: claude-sonnet-5-5
     substitution: { mode: equivalent, max_quality_drop: 0.05 }
+    # Judge 5% of the traffic: the answer of the model routing would have
+    # chosen against the served baseline's. Once a category has enough
+    # acceptable samples, the usage report marks its projected savings as
+    # verified (totals.quality, verified_savings_usd).
+    shadow: { sample_rate: 0.05 }
   # Batch jobs: the cheap profile only, zero-data-retention providers
   # only, and a 400 rather than a weaker model when nothing qualifies.
   - id: batch
@@ -436,3 +461,34 @@ budgets:
   # budget_unavailable. After a failure, or no answer within 1s, the store
   # is skipped for 5s, then one request tries it again.
   fail_mode: open
+
+# Quality evaluation (DESIGN §10.7): the LLM judge that `switchyard eval`
+# and shadow sampling use, and shadow sampling's limits. Required when a
+# policy sets shadow.sample_rate > 0.
+evaluation:
+  judge:
+    # The judge model: a catalog chat model, or model@provider to pin one
+    # deployment; otherwise its cheapest priced deployment judges. Use a
+    # strong model, at least as capable as the baselines, with known prices
+    # (its calls count against the shadow budget). It receives the prompts
+    # and both answers.
+    model: claude-fable-5-2
+  shadow:
+    # Caps the shadow spend (comparison and judge calls) of each tenant per
+    # UTC day, an exact decimal in USD; required with shadow sampling. A
+    # sample is admitted at its worst-case cost before any call and settled
+    # at its actual cost, so the cap is never exceeded; a sample that does
+    # not fit is dropped and counted (switchyard_shadow_samples_total
+    # {outcome="dropped_budget"}). Shadow spend counts as overhead in the
+    # usage report (overhead_usd, and shadow_cost_usd on its own).
+    daily_budget_usd: "5"
+    # Samples evaluated at once per replica; more wait in a queue of 100,
+    # and beyond it are dropped. Default 4.
+    concurrency: 4
+    # Output token cap of each comparison and judge completion. Default 1024.
+    max_output_tokens: 1024
+    # A category's savings count as verified once it has at least this many
+    # judged samples (default 30) and the 90% Wilson lower bound of their
+    # pass rate reaches verified_min_pass_rate (default 0.9).
+    verified_min_samples: 30
+    verified_min_pass_rate: 0.9

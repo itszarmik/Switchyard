@@ -167,6 +167,25 @@ func InputTokens(n int64, ratio float64) int64 {
 	return int64(float64(max(n, 0)) / 4 * ratio)
 }
 
+// ImageTokens is the input-token estimate of one image part, whatever its
+// size: providers bill an image by its resolution (about 1,600 tokens for
+// a large one), not by the bytes of its encoding. The gateway's estimates
+// and InputTokenBound both use it.
+const ImageTokens = 1600
+
+// InputTokenBound bounds the input tokens of req for the cost caps of
+// background calls (shadow sampling, switchyard eval and the judge): one
+// token per byte of the encoded request, which no tokenizer exceeds for
+// text and which leaves room for the per-message framing, plus
+// ImageTokens per image part in place of its inline bytes. Provider-side
+// tokens the request does not show, such as a hidden system prompt, are
+// not counted.
+func InputTokenBound(req *schema.ChatRequest) int64 {
+	body := len(req.EncodeFor(req.Model(), false))
+	images, inline := req.ImageParts()
+	return int64(max(body-inline, 0)) + int64(images)*ImageTokens
+}
+
 // Decision is the outcome of Decide.
 type Decision struct {
 	// Plan is the deployments to try, primary first, each with the

@@ -111,6 +111,9 @@ type record struct {
 	// dryRun is set for the explain endpoint, which neither settles a
 	// budget nor records usage.
 	dryRun bool
+	// shadow is what a request in its policy's shadow sample collects
+	// (see decideShadow).
+	shadow shadowState
 }
 
 // startAttempt makes the admitted attempt adm on d the attempt in
@@ -251,6 +254,7 @@ func (r *record) finish() {
 	if !r.dryRun {
 		r.settle()
 		r.recordUsage(latency)
+		r.offerShadow()
 	}
 	overhead := max(latency-r.upstreamWait-r.clientWait-r.backoff, 0)
 	r.g.metrics.overhead.WithLabelValues(r.endpoint).Observe(overhead.Seconds())

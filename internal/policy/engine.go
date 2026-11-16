@@ -50,6 +50,7 @@ type compiled struct {
 	baseline                         string
 	capNano                          int64
 	onUnmet                          string
+	sampleRate                       float64
 	// governance and quality are the policy's rules of each layer, in
 	// order (see config.IsQualityRule).
 	governance, quality []rule
@@ -140,6 +141,7 @@ func (e *Engine) compile(p *config.Policy) (*compiled, error) {
 		baseline:        p.BaselineModel,
 		capNano:         priceNano(p.MaxCostPerRequestUSD),
 		onUnmet:         cmpOr(p.OnUnmet, OnUnmetBestEffort),
+		sampleRate:      p.Shadow.SampleRate,
 	}
 	if p.Substitution.Mode == "" && p.Substitution.MaxQualityDrop == 0 {
 		// Not loaded through config.Load, which always sets the mode.
@@ -361,6 +363,7 @@ func (e *Engine) resolve(tenant config.Tenant, keyID string, r Request, soft str
 		BaselineModel:         pol.baseline,
 		MaxCostPerRequestNano: pol.capNano,
 		OnUnmet:               pol.onUnmet,
+		ShadowSampleRate:      pol.sampleRate,
 	}
 	if gov != nil {
 		applyOverride(&eff, gov)

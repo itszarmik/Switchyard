@@ -79,35 +79,36 @@ func TestTenantReport(t *testing.T) {
 		t.Fatalf("status %d: %s", code, raw)
 	}
 	want := map[string]any{
-		"object":   "usage_report",
-		"period":   map[string]any{"from": "2026-11-04T12:00:00Z", "to": "2026-11-11T12:00:00Z"},
-		"tenant":   "a",
-		"group_by": []any{"model"},
-		"totals": map[string]any{
+		"object":       "usage_report",
+		"period":       map[string]any{"from": "2026-11-04T12:00:00Z", "to": "2026-11-11T12:00:00Z"},
+		"tenant":       "a",
+		"group_by":     []any{"model"},
+		"verification": map[string]any{"min_samples": 30.0, "min_pass_rate": 0.9, "bound": "wilson_lower_90"},
+		"totals": withoutShadow(map[string]any{
 			"requests": 3.0, "errors": 1.0, "unpriced_requests": 0.0,
 			"tokens":   map[string]any{"input": 30.0, "cached_input": 0.0, "cache_write": 0.0, "output": 15.0},
 			"cost_usd": "1.750000000000001", "baseline_cost_usd": "2.000000000000001", "overhead_usd": "0",
 			"savings_usd":           map[string]any{"routing": "0.25", "cache": "0", "net": "0.25"},
 			"projected_savings_usd": "0.4",
 			"cache_hit_rate":        0.0, "fallback_rate": 0.0,
-		},
+		}),
 		"groups": []any{
-			map[string]any{
+			withoutShadow(map[string]any{
 				"model": "m2", "requests": 1.0, "errors": 1.0, "unpriced_requests": 0.0,
 				"tokens":   map[string]any{"input": 10.0, "cached_input": 0.0, "cache_write": 0.0, "output": 5.0},
 				"cost_usd": "1.5", "baseline_cost_usd": "1.5", "overhead_usd": "0",
 				"savings_usd":           map[string]any{"routing": "0", "cache": "0", "net": "0"},
 				"projected_savings_usd": "0",
 				"cache_hit_rate":        0.0, "fallback_rate": 0.0,
-			},
-			map[string]any{
+			}),
+			withoutShadow(map[string]any{
 				"model": "m1", "requests": 2.0, "errors": 0.0, "unpriced_requests": 0.0,
 				"tokens":   map[string]any{"input": 20.0, "cached_input": 0.0, "cache_write": 0.0, "output": 10.0},
 				"cost_usd": "0.250000000000001", "baseline_cost_usd": "0.500000000000001", "overhead_usd": "0",
 				"savings_usd":           map[string]any{"routing": "0.25", "cache": "0", "net": "0.25"},
 				"projected_savings_usd": "0.4",
 				"cache_hit_rate":        0.0, "fallback_rate": 0.0,
-			},
+			}),
 		},
 	}
 	if diff := cmp.Diff(want, body); diff != "" {
@@ -128,6 +129,16 @@ func TestTenantReport(t *testing.T) {
 	if code, _, raw := get(t, h, "/switchyard/v1/usage", nil); code != http.StatusUnauthorized {
 		t.Errorf("without a principal: %d %s", code, raw)
 	}
+}
+
+// withoutShadow adds to totals the shadow fields of requests without any
+// shadow evaluation or feedback.
+func withoutShadow(totals map[string]any) map[string]any {
+	totals["quality"] = []any{}
+	totals["verified_savings_usd"] = "0"
+	totals["shadow_cost_usd"] = "0"
+	totals["feedback"] = map[string]any{"negative": 0.0, "neutral": 0.0, "positive": 0.0}
+	return totals
 }
 
 func TestQueryParameters(t *testing.T) {

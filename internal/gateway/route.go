@@ -11,6 +11,7 @@ import (
 	"switchyard/internal/catalog"
 	"switchyard/internal/config"
 	"switchyard/internal/health"
+	"switchyard/internal/router"
 	"switchyard/internal/schema"
 )
 
@@ -60,10 +61,9 @@ func (g *Gateway) resolve(name, endpoint, wantType string) (catalog.Resolution, 
 	return res, nil
 }
 
-// imageTokens is the input-token estimate of one image part, whatever its
-// size: providers bill an image by its resolution (about 1,600 tokens for
-// a large one), not by the bytes of its encoding.
-const imageTokens = 1600
+// imageTokens is the input-token estimate of one image part
+// (router.ImageTokens).
+const imageTokens = router.ImageTokens
 
 // inputSize is the input of a request body of n bytes, of which inline
 // bytes are image data in images image parts, for the token estimates: the

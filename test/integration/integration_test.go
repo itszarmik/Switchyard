@@ -360,3 +360,77 @@ tenants:
 		t.Errorf("%s: %d requests, %d events written and %v dropped; want drops, and written + dropped = requests", b.name, sent, rows, dropped)
 	}
 }
+
+// pgRedisStorage is the storage section of a gateway with the Postgres
+// ledger at $DATABASE_URL and the budget counters in the Redis state
+// instance.
+func pgRedisStorage(t *testing.T) string {
+	t.Helper()
+	redisURL := env(t, redisEnv)
+	u, err := url.Parse(redisURL)
+	if err != nil {
+		t.Fatalf("%s must be a URL", redisEnv)
+	}
+	cache := *u
+	cache.Path = "/1"
+	return fmt.Sprintf(`storage:
+  mode: redis
+  redis: {cache_url: %q, state_url: %q}
+  ledger: {driver: postgres, dsn: "${DATABASE_URL}", batch_size: 50, flush_interval: 100ms, queue_size: 10000}`, cache.String(), redisURL)
+}
+
+// TestShadowBudgetPostgres runs the shadow budget scenario with the
+// Postgres ledger and the shadow budget in Redis, then checks in the
+// database that every shadow_evals row's request_id is a usage event of
+// its tenant, and one of the scenario's requests.
+func TestShadowBudgetPostgres(t *testing.T) {
+	s := newSchema(t)
+	storage := pgRedisStorage(t)
+	res := scenario.ShadowBudget(t, scenario.Options{Storage: storage, Env: []string{"DATABASE_URL=" + s.dsn}, Race: raceEnabled}, 60)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Rows: the judged samples and the errors, and the samples the budget
+	// stopped before a judge call (judge_budget), which count as
+	// dropped_budget.
+	var rows, stopped, orphans int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*),
+	count(*) FILTER (WHERE s.error_kind = 'judge_budget'),
+	count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM usage_events e WHERE e.tenant = s.tenant AND e.id = s.request_id))
+FROM shadow_evals s WHERE s.tenant = $1`, res.Gateway.Tenant).Scan(&rows, &stopped, &orphans); err != nil {
+		t.Fatalf("query shadow_evals: %v", err)
+	}
+	if want := int64(res.Outcomes["judged"] + res.Outcomes["error"]); rows-stopped != want || float64(stopped) > res.Outcomes["dropped_budget"] || orphans != 0 {
+		t.Errorf("shadow_evals: %d rows, %d of them judge_budget (want %d others, at most %v judge_budget), %d without a usage event",
+			rows, stopped, want, res.Outcomes["dropped_budget"], orphans)
+	}
+	ids := map[string]bool{}
+	for _, id := range res.RequestIDs {
+		ids[id] = true
+	}
+	r, err := s.pool.Query(ctx, `SELECT request_id FROM shadow_evals WHERE tenant = $1`, res.Gateway.Tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	for r.Next() {
+		var id string
+		if err := r.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if !ids[id] {
+			t.Errorf("shadow_evals row %s is none of the scenario's requests", id)
+		}
+	}
+	if err := r.Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("shadow_evals: %d rows (%d judge_budget), all joined to usage_events", rows, stopped)
+}
+
+// TestShadowVerifiedSavingsPostgres runs the verified savings scenario
+// with the Postgres ledger, whose report joins the shadow evaluations in
+// SQL, and Redis budgets.
+func TestShadowVerifiedSavingsPostgres(t *testing.T) {
+	s := newSchema(t)
+	scenario.VerifiedSavings(t, scenario.Options{Storage: pgRedisStorage(t), Env: []string{"DATABASE_URL=" + s.dsn}, Race: raceEnabled}, 15)
+}

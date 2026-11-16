@@ -178,6 +178,19 @@ const (
 	KindCanceled Kind = "canceled"
 )
 
+// MayHaveBilled reports whether an upstream call that failed with kind k
+// may still have been billed: the upstream may have generated before the
+// failure (a transport failure, a timeout, a 5xx, or a cancellation). The
+// refusals (4xx statuses and the adapter's own rejections) were not.
+// Callers that cap spending charge such a call its estimate.
+func (k Kind) MayHaveBilled() bool {
+	switch k {
+	case KindTransport, KindTimeout, KindServerError, KindCanceled:
+		return true
+	}
+	return false
+}
+
 // Retryable reports whether a failure of kind k may be retried on the same
 // deployment. A rate-limited failure is retryable only when its
 // Retry-After fits the remaining deadline, which the caller checks. A

@@ -7,7 +7,7 @@ Switchyard is a cost-aware, OpenAI-compatible LLM inference gateway written in G
 
 ## Status
 
-**Phase 5: cost-aware routing, quality scoring and the rule engine.** Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment that has every capability it needs and meets its policy, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Every request gets an exact cost in a usage ledger (memory or Postgres) with tenant-scoped reports, and tenants and keys can have daily or monthly budgets (see [Usage ledger and reporting](#usage-ledger-and-reporting) and [Budgets](#budgets)). With `model: "auto"`, a policy with a baseline model, and quality priors in the catalog, the gateway picks the cheapest model whose estimated quality for the request clears the profile's bar, explains every decision, and measures the savings against the baseline (see [Routing](#routing)). Caching comes in a later phase ([docs/PLAN.md](docs/PLAN.md)).
+**Phase 8: quality feedback loop**, on top of Phase 5's cost-aware routing (Phases 6 and 7, caching and production hardening, are not done yet). Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment that has every capability it needs and meets its policy, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Every request gets an exact cost in a usage ledger (memory or Postgres) with tenant-scoped reports, and tenants and keys can have daily or monthly budgets (see [Usage ledger and reporting](#usage-ledger-and-reporting) and [Budgets](#budgets)). With `model: "auto"`, a policy with a baseline model, and quality priors in the catalog, the gateway picks the cheapest model whose estimated quality for the request clears the profile's bar, explains every decision, and measures the savings against the baseline (see [Routing](#routing)). `switchyard eval` measures the quality priors on your own prompts, and opt-in shadow sampling and client feedback check on live traffic that the savings do not cost quality (see [Evaluation and verification](#evaluation-and-verification)). Caching comes in a later phase ([docs/PLAN.md](docs/PLAN.md)).
 
 ## Quickstart
 
@@ -438,11 +438,11 @@ Log lines about the ledger carry event IDs and counts, never event contents.
 
 **Metrics.** On the admin `/metrics`: `switchyard_cost_usd_total{provider,model}` (a float approximation of the ledger's exact sums; over a run they agree to within 1e-6), `switchyard_tokens_total{provider,model,class}` with class `input` (uncached), `cached_input`, `cache_write` and `output`, `switchyard_savings_usd_total{source="routing"}`, the running total of `baseline − cost`, which decreases when a fallback costs more than the baseline, and `switchyard_routing_projected_savings_usd_total`, observe mode's running total of projected savings. Both savings metrics are gauges, not counters, because a request's savings can be negative.
 
-**Reports.** A report aggregates the events of one tenant over a time range `[from, to)`, in UTC, optionally grouped by one or more of `day`, `model` (the requested model), `deployment`, `provider`, `key`, `endpoint`, `status_class` (`2xx`, `4xx`, …), `cache_status`, `profile` (the routing profile; empty for embeddings), `routing_mode` (`enforce` or `observe`) and `tag:<name>`. It returns totals for the whole range and, per group, the same fields:
+**Reports.** A report aggregates the events of one tenant over a time range `[from, to)`, in UTC, optionally grouped by one or more of `day`, `model` (the requested model), `deployment`, `provider`, `key`, `endpoint`, `status_class` (`2xx`, `4xx`, …), `cache_status`, `profile` (the routing profile; empty for embeddings), `routing_mode` (`enforce` or `observe`), `category` (the quality category; see [Shadow sampling and feedback](#shadow-sampling-and-feedback)) and `tag:<name>`. It returns totals for the whole range and, per group, the same fields:
 
 - `requests`, `errors` (status 400 and above) and `unpriced_requests`;
 - token counts per class;
-- `cost_usd` (the known cost plus overhead), `baseline_cost_usd`, `overhead_usd`, and `savings_usd` with `routing`, `cache` and `net` (`net = baseline_cost_usd − cost_usd`); money is an exact decimal string;
+- `cost_usd` (the known cost plus overhead), `baseline_cost_usd`, `overhead_usd` (the gateway's own spend, shadow sampling's included; see [Shadow sampling and feedback](#shadow-sampling-and-feedback)), and `savings_usd` with `routing`, `cache` and `net` (`net = baseline_cost_usd − cost_usd`); money is an exact decimal string;
 - `projected_savings_usd`: what observe mode estimates routing would have saved, `baseline − shadow` over the observe-mode events whose cost and shadow cost are known. It is **projected, not realized**: the shadow deployment never served those requests and its quality is unverified, so it is never part of `savings_usd`;
 - `cache_hit_rate` and `fallback_rate`.
 
@@ -742,6 +742,147 @@ The category is the strongest category signal, or `general` when none is strong 
 
 **How well it works.** `internal/quality/testdata/sanity.json` holds 105 realistic prompts across every category, each labeled easy (`d` < 0.35), medium or hard (`d` ≥ 0.65) by reading the prompt, not by running the heuristic. With the default weights, 98 of them (93 %) land in their labeled band, and `go test -v -run TestSanitySet ./internal/quality/` lists the ones that don't. The heuristic is English-centric and can be fooled by phrasing, which is why prompt content only ever affects the quality estimate, never authorization, allow lists, budgets or cost caps; `observe` routing mode and the explain endpoint let you check its decisions before you rely on them.
 
+## Evaluation and verification
+
+The quality feedback loop (DESIGN §10.7, PLAN P8) in five steps: measure the catalog's quality priors on your prompts, route with the measurements, then check on live traffic that the savings hold up. `make demo-eval` runs steps 1 to 3 end to end against fake upstreams. The details are in [Quality evaluation](#quality-evaluation) and [Shadow sampling and feedback](#shadow-sampling-and-feedback).
+
+**What leaves the gateway.** Evaluation and shadow sampling send prompts to the candidate, reference and comparison deployments, and **the prompt and both answers to the judge deployment**. Choose deployments you may send that data to; shadow sampling enforces the policy's `allow`, `deny` and `require_tags` on both. Neither ever logs or stores prompt or answer content: results files and `shadow_evals` rows hold ids, models, categories, difficulties, verdicts, costs and error kinds only. Feedback comments are stored with the tenant's feedback and never logged.
+
+1. **Run an evaluation, after a dry run.** Every command that can spend money needs `--max-cost-usd`, a cap on that invocation's spend (see [Cost](#quality-evaluation) for exactly what it guarantees); `--dry-run` prints the planned calls and their estimated cost first. Rerunning with the same `--out` resumes, with a fresh cap for the new spend only.
+
+   ```sh
+   switchyard eval run -c switchyard.yaml --prompts test/eval/prompts/starter.jsonl \
+     --candidates claude-haiku-5-5,gpt-6.1-sol --reference claude-sonnet-5-5 --judge claude-fable-5-2 \
+     --max-cost-usd 5 --dry-run
+   switchyard eval run ... --max-cost-usd 5      # the same flags, without --dry-run
+   ```
+
+   `make eval-live EVAL_CONFIG=… EVAL_CANDIDATES=… EVAL_REFERENCE=… MAX_COST_USD=… [JUDGE=…]` runs the same against your real config (`DRY_RUN=1` to estimate, `DRY_RUN=0` or unset for a real run); it skips unless every variable is set. It needs the real provider keys in the environment variables the config references; without them it fails at config load, before any call, and spends nothing.
+
+2. **Fit.** `eval fit` prints the report (Q, its 90% interval and the change from the current prior, per model and category) and writes the estimates with enough samples:
+
+   ```sh
+   switchyard eval fit --results results.jsonl -c switchyard.yaml --out configs/catalog/quality-overrides.yaml
+   ```
+
+3. **Include the overrides.** The example config's `catalog/*.yaml` glob already includes `configs/catalog/quality-overrides.yaml` (shipped empty, with a commented example); elsewhere, add `include: [quality-overrides.yaml]`. Check with `switchyard config validate` and see the effect with `switchyard route explain` before you reload.
+
+4. **Verify on live traffic in observe mode.** Give the onboarding policy `routing_mode: observe` and `shadow: {sample_rate: 0.05}`, and set `evaluation.judge.model` and `evaluation.shadow.daily_budget_usd`. The gateway keeps serving the baseline, and for 5% of requests it also asks the model routing would have chosen, in the background, and has the judge compare the answers. Each tenant's shadow spend stays within the daily budget, and it counts as overhead.
+
+5. **Read the verified savings.** `GET /switchyard/v1/usage?group_by=category` (or `/admin/v1/usage`) reports per category the judged samples, the pass rate and its 90% Wilson lower bound, and `verified` once a category has `verified_min_samples` samples and a lower bound of at least `verified_min_pass_rate`. `verified_savings_usd` is the routing plus projected savings of the verified categories, beside `projected_savings_usd`, which it never replaces. Switch a policy to `enforce` once the categories you care about are verified, and keep a small `sample_rate` there to keep checking. Clients can add their own judgment with `POST /switchyard/v1/feedback`.
+
+## Quality evaluation
+
+`switchyard eval` replaces the catalog's hand-set quality priors with measurements on your own prompts (DESIGN §10.7). It runs a prompt set against candidate models and a reference model, has an LLM judge compare each candidate answer with the reference answer, fits each model's prior `Q` per category with a confidence interval, and writes the estimates as `quality_overrides` that the config includes.
+
+**Privacy.** `eval run` sends every prompt to the reference and to each candidate, and **the prompt and both answers to the judge deployment**. Pick deployments you may send that data to. The results file holds no prompt or answer content: only ids, models, categories, difficulties, outcomes, costs and error kinds. Nothing is logged.
+
+**Cost.** `eval run` calls paid models, so `--max-cost-usd` is required, and `--dry-run` prints the planned calls and their estimated cost without calling anything:
+
+```sh
+switchyard eval run -c switchyard.yaml --prompts test/eval/prompts/starter.jsonl \
+  --candidates claude-haiku-5-5,qwen3.5-9b --reference claude-sonnet-5-5 --judge claude-opus-5-5 \
+  --max-cost-usd 5 --dry-run
+```
+
+Before any call, its worst-case cost is admitted against the cap. Each call's estimate is its input at the same bound the gateway and shadow sampling use (one token per byte of the request, and 1,600 tokens per image in place of its bytes) plus its output at its token cap: an answer's whole output budget (`--max-output-tokens`, default 1024; prompts' own `max_tokens` are lowered to it), a judge call's 256 tokens. Each candidate answer is admitted together with its 4 judge calls (two runs, each retried once) as one unit, and each prompt's reference answer with the prompt's first pair, so a pair is all or nothing and a cap stop never leaves a paid answer unwritten. What has been spent plus the estimates of the calls in flight never exceeds the cap. Each call is then charged at its actual cost, from the reported usage and the catalog's exact prices; a call that fails without usage after it may have been billed (a timeout, a transport error, a 5xx) is charged its estimate, and only a refused call (a 4xx) nothing.
+
+What the cap guarantees: the run's spend stays within `--max-cost-usd` whenever each call costs no more than its estimate. The estimate can be exceeded only by provider-side tokens it cannot see, such as a hidden system prompt a provider adds for tool use, or an image a provider bills above 1,600 tokens. The cap covers one invocation: a resumed run prints what the results file already records and gets a fresh cap for its new spend, so rerun with what you are willing to spend on the remaining pairs. When the next pair does not fit, the run stops cleanly with exit code 3, keeping what it finished, and prints this run's spend and the file's total. Every deployment involved needs known prices. There are no provider keys in the test suite: the tests run against fake upstreams, and a live run is simply `eval run` with a real config.
+
+**The run.** For each prompt, the reference answers once, then each candidate answers through its provider's adapter, pinned to one deployment for the whole run (a `model@provider`, or a model's cheapest priced deployment), and the judge compares the two. Answers are never streamed. `--concurrency` (default 4) prompts run at once. Each (prompt, candidate) pair appends one line to `--out` (default `results.jsonl`). Rerunning with the same `--out` resumes: pairs with a verdict are skipped, and pairs that failed (an answer error, a judge failure, a deployment that lacks a capability the prompt needs) are retried. Judge failures are counted and reported, never scored. If a run was killed mid-write and left a torn last line, the next `eval run`, `fit` or `report` warns (naming the file and the size, never the content) and ignores it, and `eval run` cuts it off before appending; a line that does not parse anywhere else is still an error.
+
+**Prompt sets** are JSONL, one `{"id": …, "request": {chat request}, "category"?: …}` per line. `category` is optional, and the assessor's category is used without it; the difficulty `d` always comes from the assessor. `test/eval/prompts/starter.jsonl` is a starter set of 105 prompts across every category, built from the labeled sanity set.
+
+**The judge** comes from `--judge`, else `evaluation.judge.model`. Use a strong model, at least as capable as the reference, and not one of the candidates: judges tend to prefer their own answers, and `eval run` warns when a candidate is the judge. Each pair is judged twice, the candidate first as answer A and then as answer B, to cancel position bias, against a rubric for the prompt's category, at temperature 0 when the deployment accepts it and with structured output when it supports it. The judge is not told which answer is the reference, and is told not to reward length. It replies `{"winner": "A"|"B"|"tie", "reason": …}` within 256 tokens (the judge's own fixed output cap, in `eval` and shadow sampling alike); a reply that cannot be parsed is retried once. The prompt's delimiters are escaped in the request and answers whatever their case or spacing, and the judge's last `{"winner": …}` object decides, since it gives its own verdict last and an earlier one may be quoted from an answer. Even so, the judge reads text that the request and answers control: a tenant whose prompts make both models append instructions to the judge can steer it and inflate its own verification. This is an accepted residual risk; the judge never changes routing by itself, and the eval prompts are the operator's own. Both runs tie: `equivalent`; the candidate wins at least one and loses neither: `candidate_better`; the reference wins at least one and loses neither: `reference_better`; the runs disagree: `inconsistent`. Only `equivalent` and `candidate_better` are acceptable.
+
+**Fitting.** `eval fit` estimates `Q` for every (model, category) and writes the overrides; `eval report` prints the same table without writing:
+
+```sh
+switchyard eval fit --results results.jsonl -c switchyard.yaml --out quality-overrides.yaml
+```
+
+```
+MODEL             CATEGORY  N   N_INFORMATIVE  Q      CI (90%)        PRIOR  CHANGE  NOTE
+claude-haiku-5-5  coding    26  26             0.812  [0.701, 0.903]  0.780  +0.032
+claude-haiku-5-5  tool_use  9   9              0.934  [0.811, 1.000]  0.700  +0.234  insufficient; not written (needs 10 informative)
+```
+
+Under the model of §10.4, a candidate answer is acceptable with probability `1 − d·(1 − Q)`; `Q` is the maximum-likelihood estimate over [0, 1] from the judged samples, with a 90% percentile-bootstrap interval of 1000 resamples, seeded so that the same results always give the same numbers. Samples with `d = 0` carry no information about `Q` and are left out (`N` counts them, `N_INFORMATIVE` does not). With fewer than 10 informative samples an estimate is marked insufficient, and an estimate is written only with at least `--min-samples` (default 10). When every informative sample is acceptable (or none is), every resample gives the same estimate and the interval collapses to `[1, 1]` (or `[0, 0]`): that is inherent to the percentile bootstrap, so read `N_INFORMATIVE` as the measure of confidence when the interval has no width. `PRIOR` is what routing uses today (with `-c`), and `CHANGE` the difference. Each override records its value, interval, sample count, date (`--date`, default today) and source (the prompt set, the judge and the reference).
+
+**Using the overrides.** Include the file from the main config; included files may define `quality_overrides`:
+
+```yaml
+include: [quality-overrides.yaml]
+```
+
+Each entry replaces its model's catalog prior for its category, and `config validate` checks that the model exists, the category is known, `ci_low ≤ value ≤ ci_high` within [0, 1], `samples ≥ 0`, `evaluated` is a date, and no (model, category) pair appears twice. `switchyard route explain` shows the effect on a request before you deploy it.
+
+**Fitting the assessor's weights.** `eval fit-weights` fits the heuristic's weights to a labeled set by least squares (targets 0.2, 0.5 and 0.85 for easy, medium and hard), with projected gradient descent keeping every weight in [-1, 1], and reports the in-band accuracy before and after:
+
+```sh
+switchyard eval fit-weights --labeled internal/quality/testdata/sanity.json --out weights.yaml
+```
+
+It writes a `routing.assessor.weights` section to merge into the main config (included files cannot set `routing`); the defaults in code never change. On the shipped sanity set, the hand-tuned defaults already place 94.3% of prompts in their band and the least-squares fit 93.3%, so the fit earns its keep on your own labeled prompts rather than on this one.
+
+## Shadow sampling and feedback
+
+Shadow sampling checks, on live traffic, that routing to cheaper models does not cost quality (DESIGN §10.7). For a sample of a policy's requests, after the client has its answer, Switchyard asks a **comparison** deployment for a second answer in the background and has an **LLM judge** compare the two:
+
+- in `enforce` mode the served (routed) answer is the candidate, and the reference is the model the request's savings are measured against: the policy's `baseline_model` for `auto` and `auto:<profile>`, or the requested model when an equivalent substitute served it. A request pinned to a concrete model and served by it is not sampled: the client chose the model, so there are no routing savings to verify;
+- in `observe` mode the deployment routing would have chosen gives the candidate and the served baseline answer is the reference.
+
+The judge decides whether the candidate could replace the reference (`equivalent` or `candidate_better` are acceptable; `reference_better` and `inconsistent` are not).
+
+**It is off unless a policy opts in**, and it needs a judge and a budget:
+
+```yaml
+evaluation:
+  judge:
+    model: gpt-5            # a chat model, or model@provider
+  shadow:
+    daily_budget_usd: 5     # per tenant per UTC day; required with sampling
+    concurrency: 4          # evaluations in flight per replica (default 4)
+    max_output_tokens: 1024 # cap on each comparison answer (default 1024); the judge's is a fixed 256
+    verified_min_samples: 30     # default 30
+    verified_min_pass_rate: 0.9  # default 0.9
+policies:
+  - id: default
+    baseline_model: gpt-5   # required with sampling: the comparison in enforce mode
+    shadow:
+      sample_rate: 0.02     # 2% of requests, in [0, 1]
+```
+
+**Privacy.** Shadow sampling sends the request's prompt to the comparison deployment, and the prompt and both answers to the judge deployment. Both must pass the policy's `allow`, `deny` and `require_tags`. The judge is pinned to one deployment (a `model@provider`, or the model's cheapest priced deployment), and `config validate` and `serve` reject the config unless that exact deployment passes every sampling policy's rules; name a permitted one as `evaluation.judge.model: model@provider`. The config is also rejected if a sampling policy permits no deployment of its baseline, and at run time a sample is dropped if the request's effective policy (after rules) does not permit the comparison or the judge. The comparison call is sent without the client's `store` (set to false), `metadata`, `user` and `service_tier`, since the client never asked for it; `eval` answers likewise. Prompts and answers are never logged and never stored; only verdicts and metadata are.
+
+**Cost.** Each tenant's shadow spend is capped by its own daily budget, `shadow:<tenant>/day` in the budget store (Redis or in memory, like the other budgets). The budget is reserved one call at a time: before the comparison call, its worst case is admitted (one token per byte of the request, 1,600 per image, and its output cap), and the call is settled at its actual cost right after; then each judge call (up to 4: two runs, each retried once) is admitted at its own worst case, from its real prompt and the judge's 256-token output cap, and settled after it. Costs come from the reported usage and the catalog prices, and a call that may have been billed without reporting usage is charged its estimate. A sample whose comparison does not fit is dropped; one whose next judge call does not fit stops there, with its spend so far charged and stored as a row with error kind `judge_budget` and no verdict. Both count as `dropped_budget`. Since no call starts before its worst case is admitted, concurrent samples never take the budget past its limit, except by a single call's estimator error: the estimate ignores cache-write prices for requests with `cache_control`, images a provider bills above 1,600 tokens, and hidden provider tokens such as a tool-use system prompt. Requests are sampled deterministically by a hash of their request ID, so every replica agrees.
+
+**Runtime.** Shadow calls run asynchronously after the response and never delay it: at most `concurrency` at once per replica, with a bounded queue (a full queue drops the sample, and so does one whose queued requests and served answers would exceed 64 MiB in all), each answer capped at `max_output_tokens`, each sample bounded by a timeout. Comparison calls are never streamed. A request is sampled only when it is served with status 200 and ends cleanly, by another model than the comparison, with a chat answer that no content filter stopped; a sampled stream collects its answer text (at most 64 KiB, or the sample is skipped) as it is relayed, and unsampled requests collect nothing. On shutdown, after the server has drained, the samples get half of `server.shutdown_grace` to finish, then running ones are canceled and queued ones dropped, and their last settlements and rows get no more than that half (a settlement that cannot be made keeps its estimate counted); the usage ledger flushes in the remaining time.
+
+**Results.** Each evaluated sample stores one row (`shadow_evals` in Postgres, or in memory): request ID, time, tenant, key, category, difficulty, profile, mode, candidate and reference deployments, judge model, outcome, acceptable, cost, and an error kind when there was no verdict. Rows join to the usage ledger by request ID and tenant; usage events also record their quality `category`.
+
+**Verified savings in reports.** Every set of totals in a usage report (see [Usage ledger and reporting](#usage-ledger-and-reporting)) adds:
+
+| Field | Meaning |
+|---|---|
+| `quality` | Per category with shadow samples: `judged`, `acceptable`, `errors`, `pass_rate` (acceptable / judged), `wilson_lower` (the lower bound of its 90% Wilson score interval) and `verified` |
+| `verified_savings_usd` | Routing savings plus projected savings of the requests in verified categories. It is reported beside `savings_usd` and `projected_savings_usd` and never replaces them |
+| `shadow_cost_usd` | What these requests' shadow evaluations (comparison and judge calls) cost. Shadow spend is the gateway's own (DESIGN §12.4), so it is part of `overhead_usd`, and so of `cost_usd` and net savings; this field breaks it out. It is joined from the shadow evaluations when the report runs, since they finish after their request is recorded |
+| `feedback` | Feedback on these requests: `negative`, `neutral`, `positive` |
+
+A category is **verified** when it has at least `verified_min_samples` judged samples and `wilson_lower ≥ verified_min_pass_rate`; the report's `verification` object states the rule. Each set of totals decides from its own samples: grouped by `day`, a day is verified only if that day has enough samples. Add `group_by=category` to break everything down by quality category. The judge is itself a model and can be wrong, and the pass rate measures agreement with the baseline, not absolute quality.
+
+**Feedback.** Clients can score their own requests:
+
+```sh
+curl localhost:8080/switchyard/v1/feedback -H "Authorization: Bearer $SWITCHYARD_API_KEY" \
+  -d '{"request_id":"019a7c1e-...","score":1,"comment":"spot on"}'
+```
+
+`request_id` is the response's `X-Request-Id`; `score` is -1, 0 or 1; `comment` is optional, at most 500 characters, stored and never logged. The answer is 202. A tenant can score only its own requests: an ID it never made gets 404 `request_not_found` where the ledger can tell (the in-memory ledger), and otherwise (Postgres, written asynchronously) the feedback is stored with the tenant and reports join it only to that tenant's requests, so a wrong ID reveals nothing. Later feedback on the same request replaces earlier. A malformed body gets 400 `invalid_feedback`, without echoing it. The usage event is recorded just after the response completes, so with the in-memory ledger, feedback sent the instant a response arrives (a stream's last byte, say) can get a 404 before the event is in; retry it after a moment.
+
+**Metrics.** `switchyard_shadow_samples_total{outcome}` with outcome `judged`, `dropped_budget`, `dropped_queue`, `dropped_policy` or `error`; `switchyard_shadow_cost_usd_total`; and `switchyard_shadow_acceptable_ratio{category}`, the share of judged samples found acceptable since the replica started.
+
 ## Docker
 
 ```sh
@@ -802,8 +943,10 @@ Run `make` or `make help` to list them.
 |---|---|
 | `build` | Builds `bin/switchyard` with `-trimpath` and version metadata from git. |
 | `test` | `go test -race -count=1 ./...` |
-| `test-integration` | Starts Postgres and `redis-state` from `deploy/compose.yaml` in a separate compose project (`switchyard-test`), runs the tests tagged `integration` with `SWITCHYARD_TEST_POSTGRES_DSN`, `SWITCHYARD_TEST_REDIS_URL` and `SWITCHYARD_TEST_COMPOSE` (the compose command of that project) set, and always removes the containers and their volumes afterwards. The tests cover the Postgres ledger and the Redis budget store, and in `test/integration` the P4 acceptance scenarios through the gateway binary: exact costs checked against the ledger rows, 1,000 concurrent requests against a Redis budget, and Postgres stopped for 60 s under load. It takes a few minutes. It uses the same host ports as `dev-up`, so run `make dev-down` first. Without those variables, `go test -tags integration` skips these tests. Override the packages with `INTEGRATION_PKGS` and the flags with `INTEGRATION_FLAGS` (default `-race -count=1 -p 1 -timeout 20m`; `-p 1` because the outage test stops the shared Postgres). |
+| `test-integration` | Starts Postgres and `redis-state` from `deploy/compose.yaml` in a separate compose project (`switchyard-test`), runs the tests tagged `integration` with `SWITCHYARD_TEST_POSTGRES_DSN`, `SWITCHYARD_TEST_REDIS_URL` and `SWITCHYARD_TEST_COMPOSE` (the compose command of that project) set, and always removes the containers and their volumes afterwards. The tests cover the Postgres ledger and the Redis budget store, and in `test/integration` the P4 acceptance scenarios through the gateway binary: exact costs checked against the ledger rows, 1,000 concurrent requests against a Redis budget, and Postgres stopped for 60 s under load; and the P8 shadow scenarios: the shadow budget in Redis under concurrent sampled requests, with every `shadow_evals` row checked against `usage_events`, and verified savings from the Postgres report. It takes a few minutes. It uses the same host ports as `dev-up`, so run `make dev-down` first. Without those variables, `go test -tags integration` skips these tests. Override the packages with `INTEGRATION_PKGS` and the flags with `INTEGRATION_FLAGS` (default `-race -count=1 -p 1 -timeout 20m`; `-p 1` because the outage test stops the shared Postgres). |
 | `cover` | Writes `coverage.out` and prints a per-function coverage summary. |
+| `demo-eval` | The quality evaluation demo (`test/demoeval`): one scripted fake plays the candidates, the reference and a judge that rejects the small tier on coding; runs `eval run --dry-run`, `eval run` under a cost cap and `eval fit` on the starter prompt set, prints the report, then starts the gateway without and with the overrides and shows how the coding prompts are routed. Fails unless the small tier's coding share drops and the prompts move to the mid tier. See [Evaluation and verification](#evaluation-and-verification). |
+| `eval-live` | `switchyard eval run` against real providers. Opt-in and billed: it skips unless `EVAL_CONFIG`, `EVAL_CANDIDATES`, `EVAL_REFERENCE` and `MAX_COST_USD` are set, and needs the real provider keys in the environment variables the config references (without them it fails at config load and spends nothing). `MAX_COST_USD` caps the invocation's spend, `JUDGE` is passed as `--judge`, `DRY_RUN=1` prints the estimate only (`DRY_RUN=0` runs for real), `EVAL_PROMPTS` and `EVAL_OUT` default to the starter set and `results.jsonl`. |
 | `demo-routing` | The mixed-workload routing demo: fake OpenAI-wire and Anthropic upstreams, a three-tier catalog, 30 easy, 30 medium and 30 hard prompts from the quality sanity set sent as `auto:balanced`; prints how each band was routed and the usage API's cost, baseline and savings, and fails unless most easy prompts went to the small tier, most hard ones to the large tier, and savings are above 0. See [Routing](#routing). Pass flags with `DEMO_FLAGS`. |
 | `bench-overhead` | Measures the latency the gateway adds against a zero-latency fake upstream; results in [test/load/RESULTS.md](test/load/RESULTS.md). Pass flags with `BENCH_FLAGS="-mode stream -concurrency 200"`; the default is the P1 acceptance run (non-stream, concurrency 100). |
 | `smoke` | Live smoke test against OpenAI with the SDK. Opt-in: it skips unless `OPENAI_API_KEY` is set; `SMOKE_MODEL` defaults to `gpt-5-mini`. |
@@ -828,30 +971,34 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same checks o
 ## Project layout
 
 ```
-cmd/switchyard/     CLI: serve, config validate, catalog lint, route explain, keys generate, version
+cmd/switchyard/     CLI: serve, config validate, catalog lint, route explain, keys generate, eval, version
 internal/
   api/openaiapi/    HTTP handlers for /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
                     and /switchyard/v1/route/explain
-  api/usageapi/     usage reports: /switchyard/v1/usage and /admin/v1/usage
+  api/usageapi/     usage reports: /switchyard/v1/usage and /admin/v1/usage; POST /switchyard/v1/feedback
   apierror/         errors in the OpenAI-compatible JSON envelope
   app/              composition root: config snapshot to running service
   auth/             gateway API keys: hashing, store, middleware
   budget/           budget scopes and windows; memory and Redis (Lua) stores
   catalog/          models, deployments, prices; resolution, selection, lint
   config/           schema, loading, ${…} expansion, includes, validation, snapshot
+  eval/             switchyard eval: runner with a cost cap, Q fit with bootstrap CIs, overrides, weights
   gateway/          request pipeline: routing (assessment, policy, downgrade, router), the
                     retry/fallback executor, completions shim, budget admission, usage events,
                     explain, metrics, log fields, /admin/v1/providers
+  judge/            pairwise LLM judge, both presentation orders, per-category rubrics
   health/           per-replica breakers, cooldowns, retry budgets, concurrency, latency stats
   policy/           effective policy: base policy, governance and quality rules, header tightening
   quality/          the heuristic assessor, the quality estimate, the labeled sanity set
   router/           candidates, hard filters, estimates, soft checks, ranking, plan, explanation
   providers/        adapter interfaces; openai/ (OpenAI wire) and anthropic/ (Messages API)
   schema/           lossless chat, legacy completion and embedding requests; capabilities
+  shadow/           shadow sampling: deterministic sampler, budgeted background runner
   server/           listeners, middleware, health checks, graceful shutdown
   sse/              server-sent events reader and writer
   telemetry/        slog with secret redaction, Prometheus registry
-  usage/            exact money and costs, usage events, memory and Postgres ledgers, reports
+  usage/            exact money and costs, usage events, shadow evaluations, feedback, memory and
+                    Postgres ledgers, reports with verified savings
   reqctx/           request ID and request-scoped logger in context
   version/          build metadata
 test/
@@ -859,9 +1006,11 @@ test/
   fakeanthropic/    scriptable fake Messages API (make record-fixtures records real ones)
   fixtures/         Anthropic fixtures, handcrafted from the docs until recorded
   conformance/      OpenAI SDK conformance suite, direct and through the gateway (OpenAI and
-                    Anthropic upstreams), plus the P2 to P5 acceptance cases
-  scenario/         the P4 acceptance scenarios, shared by conformance/ and integration/
-  integration/      P4 scenarios on Postgres and Redis, Postgres outage (make test-integration)
+                    Anthropic upstreams), plus the P2 to P5 and P8 acceptance cases
+  scenario/         the P4 and P8 acceptance scenarios, shared by conformance/ and integration/
+  integration/      P4 and P8 scenarios on Postgres and Redis, Postgres outage (make test-integration)
+  eval/             fake judge (fakejudge/), the starter prompt set (prompts/starter.jsonl)
+  demoeval/         quality evaluation demo (make demo-eval)
   load/             overhead benchmark (make bench-overhead)
   demo/             mixed-workload routing demo (make demo-routing)
   smoke/            opt-in live smoke test (make smoke)

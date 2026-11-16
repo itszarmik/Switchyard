@@ -7,6 +7,7 @@
 //	switchyard catalog lint [-c FILE]
 //	switchyard route explain [-c FILE] --tenant ID [--key ID] [--header 'Name: value']... [FILE|-]
 //	switchyard keys generate [--tenant ID] [--key-id ID]
+//	switchyard eval run|fit|report|fit-weights [flags]
 //	switchyard version
 //	switchyard help
 //
@@ -28,7 +29,9 @@ import (
 	"time"
 
 	"switchyard/internal/app"
+	"switchyard/internal/catalog"
 	"switchyard/internal/config"
+	"switchyard/internal/eval"
 	"switchyard/internal/version"
 )
 
@@ -50,6 +53,7 @@ Usage:
   switchyard catalog lint [-c FILE]    check catalog prices and sources; exit 1 on warnings
   switchyard route explain [flags]     explain how a chat request would be routed, offline
   switchyard keys generate [flags]     create a gateway API key
+  switchyard eval SUBCOMMAND [flags]   measure model quality: run, fit, report, fit-weights (see eval help)
   switchyard version                   print the build metadata
   switchyard help                      print this help
 
@@ -104,6 +108,8 @@ func run(args []string, stdout, stderr io.Writer, lookupEnv func(string) (string
 		return runRoute(rest, os.Stdin, stdout, stderr, lookupEnv)
 	case "keys":
 		return runKeys(rest, stdout, stderr)
+	case "eval":
+		return runEval(rest, stdout, stderr, lookupEnv)
 	case "version", "--version":
 		fmt.Fprintln(stdout, version.Get().String())
 		return exitOK
@@ -210,11 +216,22 @@ func runValidate(args []string, stdout, stderr io.Writer, lookupEnv func(string)
 	if !ok {
 		return exitError
 	}
+	cfg := snap.Config()
+	// The checks that need the catalog: the deployment shadow sampling
+	// pins the judge to must pass every sampling policy.
+	cat, err := catalog.New(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return exitError
+	}
+	if _, err := eval.ShadowJudge(cat, cfg); err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", path, err)
+		return exitError
+	}
 	warnings := snap.Warnings()
 	for _, w := range warnings {
 		fmt.Fprintln(stdout, w.String())
 	}
-	cfg := snap.Config()
 	fmt.Fprintf(stdout, "%s: OK (config version %s; %s, %s; %s)\n", path, snap.Version(),
 		plural(len(cfg.Providers), "provider"), plural(len(cfg.Models), "model"), plural(len(warnings), "warning"))
 	return exitOK

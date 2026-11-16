@@ -21,7 +21,8 @@ type includeMatch struct {
 }
 
 // includeFiles resolves the include patterns in inc, parses each matched file
-// and appends its providers, models and aliases to the root mapping.
+// and appends its providers, models, aliases and quality_overrides to the
+// root mapping.
 func (st *loadState) includeFiles(root, inc *yaml.Node) {
 	if inc.Kind != yaml.SequenceNode {
 		return // the decoder reports the type error
@@ -111,7 +112,7 @@ func (st *loadState) includeFile(root *yaml.Node, m includeMatch) {
 			if v = resolveAlias(v); v.Kind != yaml.ScalarNode || v.ShortTag() != intTag || v.Value != "1" {
 				st.addProblem(SeverityError, v, k.Value, "the version of an included file must be 1")
 			}
-		case "providers", "models":
+		case "providers", "models", "quality_overrides":
 			v = resolveAlias(v)
 			if v.Kind == yaml.ScalarNode && v.ShortTag() == nullTag {
 				continue
@@ -144,7 +145,7 @@ func (st *loadState) includeFile(root *yaml.Node, m includeMatch) {
 				what = strconv.Quote(shown)
 			}
 			st.addProblem(SeverityError, k, shown, fmt.Sprintf(
-				"%s is not allowed in included file %s; only version, providers, models and aliases are", what, m.file))
+				"%s is not allowed in included file %s; only version, providers, models and aliases are, plus quality_overrides", what, m.file))
 		}
 	}
 }

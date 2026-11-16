@@ -45,11 +45,11 @@ func TestRedisStoreKeys(t *testing.T) {
 		value string
 		ttl   time.Duration
 	}{
-		// The day ends at 2026-11-12 00:00, 12 h after noon, plus 48 h.
-		{"sy:b:v1:acme/key:k1/day:20261111", "600", 60 * time.Hour},
-		{"sy:b:v1:acme/key:k1/day:20261111:soft", "1", 60 * time.Hour},
-		// The month ends at 2026-12-01 00:00, 19.5 days after noon, plus 48 h.
-		{"sy:b:v1:acme/month:20261101", "600", (19*24+12)*time.Hour + 48*time.Hour},
+		// The day ends at 2126-11-12 00:00, 12 h after noon, plus 48 h.
+		{"sy:b:v1:acme/key:k1/day:21261111", "600", 60 * time.Hour},
+		{"sy:b:v1:acme/key:k1/day:21261111:soft", "1", 60 * time.Hour},
+		// The month ends at 2126-12-01 00:00, 19.5 days after noon, plus 48 h.
+		{"sy:b:v1:acme/month:21261101", "600", (19*24+12)*time.Hour + 48*time.Hour},
 	}
 	for _, tt := range tests {
 		got, err := mr.Get(tt.key)
@@ -60,7 +60,7 @@ func TestRedisStoreKeys(t *testing.T) {
 			t.Errorf("TTL %s = %s, want %s", tt.key, ttl, tt.ttl)
 		}
 	}
-	if mr.Exists("sy:b:v1:acme/month:20261101:soft") {
+	if mr.Exists("sy:b:v1:acme/month:21261101:soft") {
 		t.Error("a soft flag was set for a scope without a soft threshold")
 	}
 	if n := len(mr.Keys()); n != 3 {
@@ -69,14 +69,14 @@ func TestRedisStoreKeys(t *testing.T) {
 
 	// A settlement that arrives after the counter expired recreates it
 	// with the same expiry, not without one.
-	mr.Del("sy:b:v1:acme/month:20261101")
+	mr.Del("sy:b:v1:acme/month:21261101")
 	if err := st.Settle(ctx, a, 700); err != nil {
 		t.Fatalf("Settle: %v", err)
 	}
-	if got, _ := mr.Get("sy:b:v1:acme/month:20261101"); got != "100" {
+	if got, _ := mr.Get("sy:b:v1:acme/month:21261101"); got != "100" {
 		t.Errorf("recreated counter = %q, want 100", got)
 	}
-	if ttl := mr.TTL("sy:b:v1:acme/month:20261101"); ttl != (19*24+12)*time.Hour+48*time.Hour {
+	if ttl := mr.TTL("sy:b:v1:acme/month:21261101"); ttl != (19*24+12)*time.Hour+48*time.Hour {
 		t.Errorf("recreated counter TTL = %s", ttl)
 	}
 }
@@ -100,7 +100,7 @@ func TestRedisStoreLargeAmountsAreExact(t *testing.T) {
 		t.Errorf("spent = %d, want the limit", got)
 	}
 	_, err := st.Admit(context.Background(), []Scope{s}, 1, noon)
-	wantExhausted(t, err, "acme/month", time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC))
+	wantExhausted(t, err, "acme/month", time.Date(2126, 12, 1, 0, 0, 0, 0, time.UTC))
 }
 
 func TestRedisStoreUnavailable(t *testing.T) {

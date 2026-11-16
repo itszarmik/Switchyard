@@ -160,6 +160,7 @@ func applyDefaults(c *Config, explicit func(path string) bool) {
 	applyRoutingDefaults(&c.Routing, explicit)
 	applyBudgetDefaults(c)
 	applyPolicyDefaults(c.Policies, explicit)
+	applyEvaluationDefaults(&c.Evaluation)
 }
 
 // applyPolicyDefaults fills substitution, routing_mode and on_unmet on every

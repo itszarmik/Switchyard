@@ -480,6 +480,9 @@ func (r *record) recordUsage(latency time.Duration) {
 	if shadow != nil {
 		ev.ShadowDeployment, ev.ShadowCost, ev.ShadowCostKnown = shadow.ID, shadowCost, shadowKnown
 	}
+	if r.route != nil {
+		ev.Category = r.route.assessment.Category
+	}
 	switch {
 	case d != nil:
 		ev.Deployment, ev.Provider = d.ID, d.Provider

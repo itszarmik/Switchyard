@@ -231,7 +231,7 @@ func TestMemoryLedgerTenantIsolation(t *testing.T) {
 						want.add(ev)
 					}
 				}
-				if diff := cmp.Diff(want.totals(), r.Totals); diff != "" {
+				if diff := cmp.Diff(want.totals(defaultVerification), r.Totals); diff != "" {
 					t.Errorf("totals include another tenant's events (-want +got):\n%s", diff)
 				}
 				if g != "" {
@@ -532,7 +532,7 @@ func reportQueries() []Query {
 	from := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
 	dims := []string{GroupByDay, GroupByModel, GroupByDeployment, GroupByProvider, GroupByKey, GroupByEndpoint,
-		GroupByStatusClass, GroupByCacheStatus, GroupByProfile, GroupByRoutingMode, "tag:team", "tag:env"}
+		GroupByStatusClass, GroupByCacheStatus, GroupByProfile, GroupByRoutingMode, GroupByCategory, "tag:team", "tag:env"}
 	var qs []Query
 	for _, tenant := range []string{"acme", "globex", "nobody", ""} {
 		qs = append(qs, Query{Tenant: tenant, From: from, To: to})
@@ -553,8 +553,17 @@ func reportQueries() []Query {
 
 // checkTotalsAgainstEvents recomputes r's totals directly from events,
 // with an independent loop, and compares the money sums exactly.
-func checkTotalsAgainstEvents(t *testing.T, q Query, r *Report, events []*Event) {
+//
+// The shadow evaluations that join to the matching events (same tenant and
+// request ID) are overhead too (DESIGN §12.4).
+func checkTotalsAgainstEvents(t *testing.T, q Query, r *Report, events []*Event, shadows ...*ShadowEval) {
 	t.Helper()
+	shadowCost := map[rowKey]Money{}
+	for _, s := range shadows {
+		if _, dup := shadowCost[rowKey{s.Tenant, s.RequestID}]; !dup { // the first evaluation is kept
+			shadowCost[rowKey{s.Tenant, s.RequestID}] = s.Cost
+		}
+	}
 	var n int64
 	var cost, baseline, overhead, projected Money
 	for _, ev := range events {
@@ -562,7 +571,7 @@ func checkTotalsAgainstEvents(t *testing.T, q Query, r *Report, events []*Event)
 			continue
 		}
 		n++
-		overhead = overhead.Add(ev.OverheadCost)
+		overhead = overhead.Add(ev.OverheadCost).Add(shadowCost[rowKey{ev.Tenant, ev.ID}])
 		if ev.CostKnown {
 			cost = cost.Add(ev.Cost)
 			baseline = baseline.Add(ev.BaselineCost)
@@ -594,5 +603,65 @@ func TestMemoryLedgerRandomTotals(t *testing.T) {
 		if len(q.GroupBy) > 0 && q.Limit == 0 {
 			checkGroupsSumToTotals(t, r)
 		}
+	}
+}
+
+// TestMemoryFeedbackIndex: feedback finds its request through the
+// ledger's index of tenant and ID, which follows the ring: a forgotten
+// event, another tenant's event and an unknown ID are all unknown, and an
+// ID recorded twice stays known until both are forgotten.
+func TestMemoryFeedbackIndex(t *testing.T) {
+	ctx := context.Background()
+	l := NewMemoryLedger(WithMaxEvents(3))
+	fb := func(tenant, id string) error {
+		return l.RecordFeedback(ctx, &Feedback{RequestID: id, Tenant: tenant, Score: ScorePositive})
+	}
+	for _, id := range []string{"e1", "dup", "dup"} {
+		l.Record(&Event{ID: id, Tenant: "acme"})
+	}
+	if err := fb("acme", "e1"); err != nil {
+		t.Errorf("e1: %v", err)
+	}
+	if err := fb("globex", "e1"); !errors.Is(err, ErrUnknownRequest) {
+		t.Errorf("another tenant's e1: %v, want ErrUnknownRequest", err)
+	}
+	l.Record(&Event{ID: "e4", Tenant: "acme"}) // forgets e1
+	if err := fb("acme", "e1"); !errors.Is(err, ErrUnknownRequest) {
+		t.Errorf("forgotten e1: %v, want ErrUnknownRequest", err)
+	}
+	l.Record(&Event{ID: "e5", Tenant: "acme"}) // forgets the first dup
+	if err := fb("acme", "dup"); err != nil {
+		t.Errorf("dup, still held once: %v", err)
+	}
+	l.Record(&Event{ID: "e6", Tenant: "acme"}) // forgets the second dup
+	if err := fb("acme", "dup"); !errors.Is(err, ErrUnknownRequest) {
+		t.Errorf("dup, forgotten: %v, want ErrUnknownRequest", err)
+	}
+	l.mu.Lock()
+	n := len(l.ids)
+	l.mu.Unlock()
+	if n != 3 {
+		t.Errorf("the index holds %d IDs, want the ring's 3", n)
+	}
+}
+
+// TestMemoryFeedbackFullLedger: on a full ledger, feedback does not scan
+// the events under the ledger's lock (security L3, correctness L2): a
+// scan of 100,000 events takes about 0.7 ms a call, so 2,000 calls would
+// take over a second; the index takes microseconds.
+func TestMemoryFeedbackFullLedger(t *testing.T) {
+	ctx := context.Background()
+	l := NewMemoryLedger()
+	for i := range DefaultMemoryMaxEvents {
+		l.Record(&Event{ID: fmt.Sprint("e", i), Tenant: "acme"})
+	}
+	start := time.Now()
+	for i := range 2000 {
+		if err := l.RecordFeedback(ctx, &Feedback{RequestID: fmt.Sprint("unknown-", i), Tenant: "acme"}); !errors.Is(err, ErrUnknownRequest) {
+			t.Fatalf("unknown ID: %v", err)
+		}
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("2000 feedback calls took %v on a full ledger", d)
 	}
 }

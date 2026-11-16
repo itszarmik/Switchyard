@@ -940,3 +940,33 @@ func TestPriceNano(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveShadowSampleRate: the base policy's shadow.sample_rate is in
+// the effective policy, whatever rule matches; a policy without it samples
+// nothing.
+func TestResolveShadowSampleRate(t *testing.T) {
+	cfg := &config.Config{
+		Policies: []config.Policy{
+			{ID: "sampled", BaselineModel: "m", Shadow: config.ShadowPolicy{SampleRate: 0.25},
+				Rules: []config.Rule{{Name: "observe-all", Set: config.PolicyOverride{RoutingMode: ModeObserve}}}},
+			{ID: "plain", BaselineModel: "m"},
+		},
+		Tenants: []config.Tenant{{ID: "a", Policy: "sampled"}, {ID: "b", Policy: "plain"}},
+	}
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		tenant config.Tenant
+		want   float64
+	}{{cfg.Tenants[0], 0.25}, {cfg.Tenants[1], 0}} {
+		got, err := e.Resolve(tt.tenant, "", Request{Model: "auto"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ShadowSampleRate != tt.want {
+			t.Errorf("tenant %s: sample rate %v, want %v", tt.tenant.ID, got.ShadowSampleRate, tt.want)
+		}
+	}
+}

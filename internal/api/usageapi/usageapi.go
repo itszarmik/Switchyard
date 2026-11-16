@@ -1,7 +1,8 @@
 // Package usageapi serves the usage reports over HTTP (DESIGN §12.5):
 // GET /switchyard/v1/usage on the public listener, for the authenticated
 // caller's own tenant, and GET /admin/v1/usage on the admin listener, for
-// any tenant or all of them.
+// any tenant or all of them. It also takes feedback on the caller's own
+// requests, POST /switchyard/v1/feedback (see FeedbackHandler).
 //
 // Both take the same query parameters:
 //
@@ -11,7 +12,7 @@
 //     days.
 //   - group_by is a comma-separated list of dimensions: day, model,
 //     deployment, provider, key, endpoint, status_class, cache_status,
-//     profile, routing_mode and tag:<name>.
+//     profile, routing_mode, category and tag:<name>.
 //   - limit caps the number of groups (default 1000, at most 10000).
 //
 // group_by may list at most 8 dimensions, at most 3 of them tags; more is
@@ -22,6 +23,17 @@
 // covers every tenant. Money is serialized as exact decimal strings.
 // totals.projected_savings_usd is observe mode's projected routing
 // savings, which never ran and are reported apart from savings_usd.
+//
+// Shadow sampling's verification (DESIGN §10.7) appears in every set of
+// totals: quality lists, per category, the judged shadow samples, the pass
+// rate, its 90% Wilson lower bound and whether the category is verified
+// under the report's verification rule (also in the report, as
+// verification); verified_savings_usd is the routing plus projected
+// savings of the requests in verified categories, reported beside the
+// other savings and never replacing them; shadow_cost_usd is what the
+// shadow evaluations cost, which is part of overhead_usd (and so of
+// cost_usd and the net savings); feedback counts feedback by score. Each set of
+// totals decides verification from its own samples.
 package usageapi
 
 import (
@@ -64,8 +76,13 @@ const (
 
 // Options configures the handlers.
 type Options struct {
-	// Now is the clock for the default period; nil means time.Now.
+	// Now is the clock for the default period and the time of feedback;
+	// nil means time.Now.
 	Now func() time.Time
+	// Verification is the rule for verified savings, from
+	// evaluation.shadow.verified_min_samples and verified_min_pass_rate;
+	// zero fields take their defaults.
+	Verification usage.Verification
 }
 
 func (o Options) now() time.Time {
@@ -113,6 +130,7 @@ func serve(w http.ResponseWriter, req *http.Request, r usage.Reporter, opts Opti
 		return
 	}
 	q.Tenant = tenant
+	q.Verification = opts.Verification
 	ctx, cancel := context.WithTimeout(req.Context(), reportTimeout)
 	defer cancel()
 	rep, err := r.Report(ctx, q)
@@ -219,7 +237,7 @@ func queryMessage(err error) string {
 	if i := strings.LastIndex(msg, usage.ErrInvalidQuery.Error()+": "); i >= 0 {
 		msg = msg[i+len(usage.ErrInvalidQuery.Error())+2:]
 	}
-	return "Invalid query: " + msg + ". The group_by dimensions are day, model, deployment, provider, key, endpoint, status_class, cache_status, profile, routing_mode and tag:<name>, each at most once, at most 8 of them and at most 3 tags."
+	return "Invalid query: " + msg + ". The group_by dimensions are day, model, deployment, provider, key, endpoint, status_class, cache_status, profile, routing_mode, category and tag:<name>, each at most once, at most 8 of them and at most 3 tags."
 }
 
 // badRequest writes a 400 invalid_query error about param.
@@ -230,12 +248,20 @@ func badRequest(w http.ResponseWriter, param, msg string) {
 // Wire shapes (DESIGN §12.5).
 type (
 	reportJSON struct {
-		Object  string            `json:"object"`
-		Period  periodJSON        `json:"period"`
-		Tenant  *string           `json:"tenant"`
-		GroupBy []string          `json:"group_by"`
-		Totals  totalsJSON        `json:"totals"`
-		Groups  []json.RawMessage `json:"groups"`
+		Object       string            `json:"object"`
+		Period       periodJSON        `json:"period"`
+		Tenant       *string           `json:"tenant"`
+		GroupBy      []string          `json:"group_by"`
+		Verification verificationJSON  `json:"verification"`
+		Totals       totalsJSON        `json:"totals"`
+		Groups       []json.RawMessage `json:"groups"`
+	}
+	// verificationJSON labels verified_savings_usd with the rule behind it.
+	verificationJSON struct {
+		MinSamples  int     `json:"min_samples"`
+		MinPassRate float64 `json:"min_pass_rate"`
+		// Bound names the statistic compared with min_pass_rate.
+		Bound string `json:"bound"`
 	}
 	periodJSON struct {
 		From time.Time `json:"from"`
@@ -254,6 +280,25 @@ type (
 		ProjectedSavingsUSD usage.Money `json:"projected_savings_usd"`
 		CacheHitRate        float64     `json:"cache_hit_rate"`
 		FallbackRate        float64     `json:"fallback_rate"`
+		// Shadow verification (DESIGN §10.7).
+		Quality            []qualityJSON `json:"quality"`
+		VerifiedSavingsUSD usage.Money   `json:"verified_savings_usd"`
+		ShadowCostUSD      usage.Money   `json:"shadow_cost_usd"`
+		Feedback           feedbackJSON  `json:"feedback"`
+	}
+	qualityJSON struct {
+		Category    string  `json:"category"`
+		Judged      int64   `json:"judged"`
+		Acceptable  int64   `json:"acceptable"`
+		Errors      int64   `json:"errors"`
+		PassRate    float64 `json:"pass_rate"`
+		WilsonLower float64 `json:"wilson_lower"`
+		Verified    bool    `json:"verified"`
+	}
+	feedbackJSON struct {
+		Negative int64 `json:"negative"`
+		Neutral  int64 `json:"neutral"`
+		Positive int64 `json:"positive"`
 	}
 	tokensJSON struct {
 		Input       int64 `json:"input"`
@@ -270,6 +315,13 @@ type (
 
 // totals converts t to its wire shape.
 func totals(t usage.Totals) totalsJSON {
+	q := make([]qualityJSON, len(t.Quality))
+	for i, c := range t.Quality {
+		q[i] = qualityJSON{
+			Category: c.Category, Judged: c.Judged, Acceptable: c.Acceptable, Errors: c.Errors,
+			PassRate: c.PassRate, WilsonLower: c.WilsonLower, Verified: c.Verified,
+		}
+	}
 	return totalsJSON{
 		Requests: t.Requests, Errors: t.Errors, UnpricedRequests: t.UnpricedRequests,
 		Tokens: tokensJSON{
@@ -280,6 +332,8 @@ func totals(t usage.Totals) totalsJSON {
 		SavingsUSD:          savingsJSON{Routing: t.SavingsUSD.Routing, Cache: t.SavingsUSD.Cache, Net: t.SavingsUSD.Net},
 		ProjectedSavingsUSD: t.ProjectedSavingsUSD,
 		CacheHitRate:        t.CacheHitRate, FallbackRate: t.FallbackRate,
+		Quality: q, VerifiedSavingsUSD: t.VerifiedSavingsUSD, ShadowCostUSD: t.ShadowCostUSD,
+		Feedback: feedbackJSON{Negative: t.Feedback.Negative, Neutral: t.Feedback.Neutral, Positive: t.Feedback.Positive},
 	}
 }
 
@@ -291,8 +345,12 @@ func encodeReport(rep *usage.Report, tenant string) ([]byte, error) {
 		Object:  "usage_report",
 		Period:  periodJSON{From: rep.From, To: rep.To},
 		GroupBy: rep.GroupBy,
-		Totals:  totals(rep.Totals),
-		Groups:  make([]json.RawMessage, 0, len(rep.Groups)),
+		Verification: verificationJSON{
+			MinSamples: rep.Verification.MinSamples, MinPassRate: rep.Verification.MinPassRate,
+			Bound: "wilson_lower_90",
+		},
+		Totals: totals(rep.Totals),
+		Groups: make([]json.RawMessage, 0, len(rep.Groups)),
 	}
 	if out.GroupBy == nil {
 		out.GroupBy = []string{}

@@ -123,6 +123,8 @@ func (st *loadState) validate(c *Config) {
 	st.validateRouting(&c.Routing)
 	refs := st.validatePolicies(c.Policies, profiles, models, c.Aliases)
 	st.validatePolicyRefs(c.Tenants, refs)
+	st.validateEvaluation(c, models)
+	st.validateShadow(c, models)
 	st.checkLiteralSecrets(c)
 }
 
