@@ -1,8 +1,7 @@
 # Switchyard reference configuration.
 #
-# Every key Phase 8 understands, with its default. The layout mirrors
-# docs/DESIGN.md §16.3. Later phases add sections (cache); until then, any
-# other key is rejected at load time.
+# Every key Switchyard understands, with its default. The layout mirrors
+# docs/DESIGN.md §16.3. Any other key is rejected at load time.
 # CI validates this file with `switchyard config validate`.
 #
 # Values may reference the environment or files:
@@ -82,10 +81,15 @@ storage:
   # URLs are secrets because they may embed passwords. `make dev-up` starts
   # matching instances on ports 6379 and 6380.
   redis:
-    # Evictable cache instance (maxmemory-policy allkeys-lru).
+    # Evictable cache instance (maxmemory-policy allkeys-lru): exact-cache
+    # entries and the semantic vector index. Every cache failure is a miss,
+    # so it may be down; /readyz never checks it. With the semantic cache
+    # on, this must be database 0, the only one the Redis query engine
+    # indexes.
     cache_url: ${REDIS_CACHE_URL:-redis://localhost:6379/0}
-    # Non-evictable state instance for budgets and limits
-    # (maxmemory-policy noeviction). A single server or a failover pair, not
+    # Non-evictable state instance for budgets, limits and the tenants'
+    # cache namespace versions (maxmemory-policy noeviction: an evicted
+    # version would bring purged entries back). A single server or a failover pair, not
     # a Cluster. It may be down at startup: budgets then follow
     # budgets.fail_mode. With fail_mode closed, /readyz fails its
     # budget_store check while it is down; with open, /admin/v1/providers
@@ -372,6 +376,41 @@ policies:
     # Verify enforced routing on 1% of the traffic: the served answer is
     # judged against the baseline model's.
     # shadow: { sample_rate: 0.01 }
+    # Response caching (DESIGN §11) of /v1/chat/completions. Only a
+    # governance rule's set.cache can change it, replacing the whole block.
+    cache:
+      # The exact cache: an identical request (same resolved model, or
+      # auto profile and policy; same messages, tools and parameters;
+      # stream, stream_options, user and metadata don't count) is
+      # answered from the cache at cost 0. Default off.
+      exact:
+        enabled: true
+        # How long an entry is served, at most 720h. Default 24h.
+        ttl: 24h
+        # Who shares entries, always within one tenant: tenant (default),
+        # key, or user (the request's user field; the key without one).
+        # The user scope keys hold an unsalted SHA-256 of user: send an
+        # opaque user ID, not an email. A hit is served only when the
+        # requesting key's own policy permits the deployment that
+        # produced it.
+        scope: tenant
+        # Cache only requests with temperature 0 or a seed, so sampled
+        # requests always get a fresh answer. Default false.
+        deterministic_only: false
+      # The semantic cache: a request whose context matches exactly and
+      # whose last user message is similar enough (cosine similarity of
+      # their embeddings) is answered with the earlier answer. A near
+      # miss ("capital of France" vs "of Germany") can be a false hit, so
+      # it is off by default; it needs semantic_cache.embedding_model.
+      # semantic:
+      #   enabled: true
+      #   # The similarity a match needs, in (0, 1]. Default 0.95.
+      #   min_similarity: 0.95
+      #   # Default 72h, at most 720h.
+      #   ttl: 72h
+      #   # The longest last user message compared, in characters.
+      #   # Default 2000.
+      #   max_chars: 2000
   # Onboarding: route nothing, measure what routing would save. Concrete
   # model names may be served by an equivalent model once enforced.
   - id: observe
@@ -461,6 +500,35 @@ budgets:
   # budget_unavailable. After a failure, or no answer within 1s, the store
   # is skipped for 5s, then one request tries it again.
   fail_mode: open
+
+# Response cache limits for every policy (DESIGN §11).
+cache:
+  # The exact lookup (namespace version and entry) must finish within this,
+  # or it is a miss, so a hung Redis adds at most this to a request: up to
+  # 1s. Default 25ms.
+  lookup_timeout: 25ms
+  # Larger responses are not cached: 1KiB to 16MiB, in bytes. Default
+  # 1048576 (1 MiB).
+  max_entry_bytes: 1048576
+  # With storage.mode memory, each in-memory cache (exact entries, semantic
+  # vectors) holds at most this many entries, and at most 256 MiB, least
+  # recently used evicted first. Default 10000.
+  memory_max_entries: 10000
+
+# The semantic cache's embeddings, required when a policy enables it. The
+# last user message of every eligible request is sent to this deployment
+# to be embedded, and its cost is recorded as the request's overhead and
+# charged to its budgets: pick a provider your data-handling terms allow
+# for prompts. Every policy that enables the semantic cache must permit
+# the deployment by its allow, deny and require_tags. Changing the model
+# (or its dimensions) starts a new, empty vector index.
+# semantic_cache:
+#   # An embedding model id, or model@provider to pin one deployment;
+#   # otherwise its cheapest priced deployment embeds.
+#   embedding_model: text-embedding-3-small
+#   # The embedding and vector search must finish within this, or the
+#   # lookup is a miss. Default 150ms, at most 5s.
+#   lookup_timeout: 150ms
 
 # Quality evaluation (DESIGN §10.7): the LLM judge that `switchyard eval`
 # and shadow sampling use, and shadow sampling's limits. Required when a

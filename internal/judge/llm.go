@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/big"
 	"strings"
 	"time"
 
@@ -305,7 +304,7 @@ func callCost(u *schema.Usage, p config.Pricing, est int64) int64 {
 	if !ok {
 		return est
 	}
-	return NanoCeil(c)
+	return c.NanoUSDCeil()
 }
 
 // estimate is the cost bound of one call with req (see CallCostNano).
@@ -340,7 +339,7 @@ func EstimateNano(d *catalog.Deployment, inputTokens, maxOutput int64) int64 {
 	if written, ok := usage.Cost(usage.Tokens{CacheWrite: in, Output: out}, d.Prices); ok && written.Cmp(plain) > 0 {
 		plain = written
 	}
-	return NanoCeil(plain)
+	return plain.NanoUSDCeil()
 }
 
 // costAcc sums the charges of a Judge's calls.
@@ -369,26 +368,4 @@ func (a *costAcc) nano() int64 {
 		return -1
 	}
 	return a.total
-}
-
-// NanoCeil returns m in whole nano-USD, rounded up towards positive
-// infinity; amounts beyond the int64 range saturate.
-func NanoCeil(m usage.Money) int64 {
-	r, ok := new(big.Rat).SetString(m.String())
-	if !ok {
-		return math.MaxInt64
-	}
-	r.Mul(r, big.NewRat(1_000_000_000, 1))
-	q, rem := new(big.Int).QuoRem(r.Num(), r.Denom(), new(big.Int))
-	if rem.Sign() > 0 {
-		q.Add(q, big.NewInt(1))
-	}
-	switch {
-	case q.IsInt64():
-		return q.Int64()
-	case q.Sign() > 0:
-		return math.MaxInt64
-	default:
-		return math.MinInt64
-	}
 }

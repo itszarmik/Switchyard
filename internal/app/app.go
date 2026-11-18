@@ -7,8 +7,9 @@
 // report, GET /switchyard/v1/usage, and feedback on the tenant's requests,
 // POST /switchyard/v1/feedback, behind the API key middleware.
 // The admin listener adds GET /admin/v1/providers, the deployments'
-// health, and GET /admin/v1/usage, the usage report of any tenant, to its
-// built-in routes.
+// health, GET /admin/v1/usage, the usage report of any tenant, and
+// POST /admin/v1/cache/purge, which purges a tenant's cache entries, to
+// its built-in routes.
 //
 // The usage ledger is kept in memory or in Postgres (storage.ledger), and
 // the budget counters in memory or, with storage.mode redis, in the Redis
@@ -19,6 +20,16 @@
 // wait for it. With fail_mode closed, /readyz reports Redis as the
 // budget_store check; with open, the replica stays ready and
 // GET /admin/v1/providers reports it.
+//
+// The response caches (DESIGN §11) follow storage.mode too: with redis,
+// exact entries and the semantic vector index live in the cache instance
+// (storage.redis.cache_url, which should run allkeys-lru) and the tenants'
+// namespace versions in the state instance, beside the budgets; with
+// memory, all of it is in process. A cache Redis that is unreachable is
+// only logged, since every cache failure is a miss, and /readyz never
+// checks it. The semantic cache is built only when a policy enables it,
+// with semantic_cache.embedding_model called through the gateway's
+// adapters. POST /admin/v1/cache/purge purges a tenant.
 //
 // When a policy sets shadow.sample_rate > 0, a shadow.Runner evaluates the
 // sampled requests in the background, with the judge
@@ -42,10 +53,14 @@ import (
 	"switchyard/internal/api/usageapi"
 	"switchyard/internal/auth"
 	"switchyard/internal/budget"
+	"switchyard/internal/cache"
+	"switchyard/internal/cache/semantic"
+	"switchyard/internal/catalog"
 	"switchyard/internal/config"
 	"switchyard/internal/eval"
 	"switchyard/internal/gateway"
 	"switchyard/internal/judge"
+	"switchyard/internal/providers"
 	"switchyard/internal/server"
 	"switchyard/internal/shadow"
 	"switchyard/internal/telemetry"
@@ -64,6 +79,10 @@ type App struct {
 	shutdownGrace time.Duration
 	// shadow is the shadow sampling runner, or nil when no policy samples.
 	shadow *shadow.Runner
+	// gw is the gateway, whose cache writes drain at shutdown; cacheRedis
+	// is the cache instance's client, if any.
+	gw         *gateway.Gateway
+	cacheRedis *redis.Client
 }
 
 // ledger is a usage ledger: where events go, what reports read, and where
@@ -92,6 +111,29 @@ const (
 	redisIOTimeout   = time.Second
 )
 
+// Cache Redis client settings, used unless the URL sets them. A dial is
+// bounded by cacheRedisDialTimeout. With ContextTimeoutEnabled, go-redis
+// bounds each socket read and write by the earlier of the call's context
+// deadline and the client's ReadTimeout or WriteTimeout, so those are set
+// above every deadline the cache calls carry (see cacheRedisIOTimeout):
+// the contexts are the real bound, cache.lookup_timeout for an exact
+// lookup, semantic_cache.lookup_timeout for a semantic one and
+// gateway.CacheWriteTimeout for a write, rather than a shorter client
+// timeout cutting them off. A failed command is not retried: the lookup is
+// a miss instead.
+const (
+	cacheRedisDialTimeout = 200 * time.Millisecond
+	// cacheRedisIOMargin is added to the longest context deadline.
+	cacheRedisIOMargin = 100 * time.Millisecond
+	cacheRedisPoolSize = 64
+)
+
+// cacheRedisIOTimeout is the cache Redis client's read and write timeout:
+// the longest deadline its calls carry, plus cacheRedisIOMargin.
+func cacheRedisIOTimeout(cfg *config.Config) time.Duration {
+	return max(cfg.Cache.LookupTimeout.Std(), cfg.SemanticCache.LookupTimeout.Std(), gateway.CacheWriteTimeout) + cacheRedisIOMargin
+}
+
 // New builds the service from snap, writing logs to logOutput.
 //
 // It also installs the service logger as slog's default logger, and logs the
@@ -102,11 +144,14 @@ func New(snap *config.Snapshot, logOutput io.Writer) (*App, error) {
 }
 
 // storage is what the storage settings open: the usage ledger, the budget
-// store and, with storage.mode redis, the client of the state instance.
+// store, the exact cache and the namespace versions and, with
+// storage.mode redis, the clients of the state and cache instances.
 type storage struct {
-	ledger  ledger
-	budgets budget.Store
-	redis   *redis.Client
+	ledger     ledger
+	budgets    budget.Store
+	redis      *redis.Client
+	cache      gateway.CacheOptions
+	cacheRedis *redis.Client
 }
 
 // storageOpener opens the storage for New; tests replace openStorage.
@@ -123,7 +168,15 @@ func openStorage(cfg *config.Config, reg prometheus.Registerer, logger *slog.Log
 		closeLedger(led, logger)
 		return storage{}, err
 	}
-	return storage{ledger: led, budgets: budgets, redis: rdb}, nil
+	caches, cacheRdb, err := newCacheStorage(cfg, rdb, logger)
+	if err != nil {
+		closeLedger(led, logger)
+		if rdb != nil {
+			_ = rdb.Close()
+		}
+		return storage{}, err
+	}
+	return storage{ledger: led, budgets: budgets, redis: rdb, cache: caches, cacheRedis: cacheRdb}, nil
 }
 
 // newApp is New with the storage opened by open.
@@ -178,7 +231,7 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 		return nil, err
 	}
 	led, rdb := st.ledger, st.redis
-	a := &App{log: logger, srv: srv, ledger: led, redis: rdb, shutdownGrace: cfg.Server.ShutdownGrace.Std()}
+	a := &App{log: logger, srv: srv, ledger: led, redis: rdb, cacheRedis: st.cacheRedis, shutdownGrace: cfg.Server.ShutdownGrace.Std()}
 	var budgetCheck func(ctx context.Context) error
 	if rdb != nil {
 		budgetCheck = func(ctx context.Context) error { return rdb.Ping(ctx).Err() }
@@ -193,10 +246,20 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 	gw, err := gateway.New(gateway.Options{
 		Config: cfg, Logger: logger, Registry: registry,
 		Ledger: led, Budgets: st.budgets, BudgetStoreCheck: budgetCheck, ConfigVersion: snap.Version(),
+		Cache: st.cache,
 	})
 	if err != nil {
 		_ = a.closeStorage(context.Background())
 		return nil, fmt.Errorf("app: %w", err)
+	}
+	a.gw = gw
+	if semanticEnabled(cfg) {
+		sc, dep, err := newSemanticCache(cfg, gw, st.cacheRedis, logger)
+		if err != nil {
+			_ = a.closeStorage(context.Background())
+			return nil, fmt.Errorf("app: %w", err)
+		}
+		gw.SetSemanticCache(sc, dep)
 	}
 	if a.shadow, err = newShadowRunner(cfg, gw, st.budgets, led, registry, logger); err != nil {
 		_ = a.closeStorage(context.Background())
@@ -224,6 +287,7 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 	srv.Handle("POST "+feedbackEndpoint, gw.Instrument(feedbackEndpoint, authenticate(usageapi.FeedbackHandler(led, usageOpts))))
 	srv.HandleAdmin("GET /admin/v1/providers", gw.ProvidersHandler())
 	srv.HandleAdmin("GET /admin/v1/usage", usageapi.AdminHandler(led, usageOpts))
+	srv.HandleAdmin("POST /admin/v1/cache/purge", gw.CachePurgeHandler())
 
 	logger.Info("config loaded",
 		"config_version", snap.Version(),
@@ -362,6 +426,109 @@ func newBudgetStore(cfg *config.Config, logger *slog.Logger) (budget.Store, *red
 	return budget.NewCircuit(budget.NewRedisStore(rdb), budget.CircuitOptions{}), rdb, nil
 }
 
+// cachingEnabled reports whether any policy, or any of its rules, turns
+// on a response cache layer.
+func cachingEnabled(cfg *config.Config, semanticOnly bool) bool {
+	on := func(p *config.CachePolicy) bool {
+		return p.Semantic.Enabled || (!semanticOnly && p.Exact.Enabled)
+	}
+	for i := range cfg.Policies {
+		p := &cfg.Policies[i]
+		if on(&p.Cache) {
+			return true
+		}
+		for j := range p.Rules {
+			if c := p.Rules[j].Set.Cache; c != nil && on(c) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// semanticEnabled reports whether any policy or rule turns on the semantic
+// cache.
+func semanticEnabled(cfg *config.Config) bool { return semantic.Enabled(cfg) }
+
+// newCacheStorage returns the exact cache and the namespace versions. With
+// storage.mode redis and caching enabled by some policy, entries go to the
+// cache instance, through a client of its own returned for the semantic
+// index and Close, and namespace versions to the state instance, through
+// state (the budget store's client), which never evicts them. Otherwise
+// both are in memory, the store capped at cache.memory_max_entries. An
+// unreachable cache Redis is only logged: its lookups are misses.
+func newCacheStorage(cfg *config.Config, state *redis.Client, logger *slog.Logger) (gateway.CacheOptions, *redis.Client, error) {
+	if cfg.Storage.Mode != "redis" || !cachingEnabled(cfg, false) {
+		return gateway.CacheOptions{
+			Store:      cache.NewMemoryStore(cfg.Cache.MemoryMaxEntries, time.Now),
+			Namespaces: cache.NewMemoryNamespaces(),
+		}, nil, nil
+	}
+	opts, err := redis.ParseURL(cfg.Storage.Redis.CacheURL.Value())
+	if err != nil {
+		// go-redis may quote parts of the URL, which can hold a password.
+		return gateway.CacheOptions{}, nil, errors.New("app: storage.redis.cache_url is not a valid Redis URL")
+	}
+	if opts.DialTimeout == 0 {
+		opts.DialTimeout = cacheRedisDialTimeout
+	}
+	for _, d := range []*time.Duration{&opts.ReadTimeout, &opts.WriteTimeout} {
+		if *d == 0 {
+			*d = cacheRedisIOTimeout(cfg)
+		}
+	}
+	if opts.PoolSize == 0 {
+		opts.PoolSize = cacheRedisPoolSize
+	}
+	if opts.MaxRetries == 0 {
+		opts.MaxRetries = -1 // no retries
+	}
+	// Honor the context's deadline on every socket operation, so that
+	// cache.lookup_timeout bounds a lookup on a Redis that accepts
+	// connections but never answers.
+	opts.ContextTimeoutEnabled = true
+	rdb := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), redisPingTimeout)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		logger.Warn("the Redis cache instance is unreachable; cache lookups are misses until it is back", "error", err)
+	}
+	return gateway.CacheOptions{Store: cache.NewRedisStore(rdb), Namespaces: cache.NewRedisNamespaces(state)}, rdb, nil
+}
+
+// newSemanticCache returns the semantic cache and the deployment it embeds
+// with: semantic_cache.embedding_model resolved to one deployment, which
+// every policy that enables the semantic cache must permit
+// (semantic.ConfiguredDeployment), and called through the gateway's
+// adapter, and a vector index named after that deployment and its
+// dimensions, in the cache instance when client is set (the query engine
+// indexes only database 0, which validation enforces) and in memory
+// otherwise.
+func newSemanticCache(cfg *config.Config, gw *gateway.Gateway, client *redis.Client, logger *slog.Logger) (*semantic.Cache, *catalog.Deployment, error) {
+	adapters := make(map[string]providers.Adapter, len(cfg.Providers))
+	for _, p := range cfg.Providers {
+		if a := gw.Adapter(p.ID); a != nil {
+			adapters[p.ID] = a
+		}
+	}
+	dep, emb, err := semantic.ConfiguredDeployment(cfg, gw.Catalog(), adapters)
+	if err != nil {
+		return nil, nil, err
+	}
+	timeout := cfg.SemanticCache.LookupTimeout.Std()
+	e := semantic.NewEmbedder(emb, dep, dep.Model.Dimensions, timeout)
+	var idx cache.VectorIndex
+	index := "memory"
+	if client != nil {
+		ri := semantic.NewRedisIndex(client, e.Model(), e.Dimensions())
+		idx, index = ri, ri.Name()
+	} else {
+		idx = semantic.NewMemoryIndex(cfg.Cache.MemoryMaxEntries, time.Now)
+	}
+	logger.Info("semantic cache on", "embedding_deployment", dep.ID, "dimensions", e.Dimensions(), "index", index)
+	return semantic.New(e, idx, semantic.Options{LookupTimeout: timeout}), dep, nil
+}
+
 // closeLedger closes l at once, for a failed startup.
 func closeLedger(l ledger, logger *slog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -382,6 +549,9 @@ func (a *App) closeStorage(ctx context.Context) error {
 	if a.redis != nil {
 		_ = a.redis.Close()
 	}
+	if a.cacheRedis != nil {
+		_ = a.cacheRedis.Close()
+	}
 	return err
 }
 
@@ -391,12 +561,15 @@ func (a *App) Logger() *slog.Logger { return a.log }
 // Run serves until ctx is done, then shuts down gracefully: the server
 // drains, then the shadow runner finishes the samples it has started
 // (within half the shutdown grace period, after which it cancels them and
-// drops those still queued), then the usage ledger writes the events
-// still queued, within what is left of the grace period. The runner stops
+// drops those still queued), then the cache writes still in flight finish
+// (within a quarter of it; each is bounded by its own one-second timeout
+// anyway), then the usage ledger writes the events still queued, within
+// what is left of the grace period, at least a quarter. The runner stops
 // first because it stores its results in the ledger. Canceling forceCtx
-// aborts the requests still in flight, the samples and the flush. It
-// returns nil after a clean shutdown, server.ErrShutdownTimeout if
-// requests had to be aborted, and an error if usage events were lost.
+// aborts the requests still in flight, the samples, the cache writes and
+// the flush. It returns nil after a clean shutdown,
+// server.ErrShutdownTimeout if requests had to be aborted, and an error if
+// usage events were lost.
 func (a *App) Run(ctx, forceCtx context.Context) error {
 	info := version.Get()
 	a.log.Info("switchyard starting",
@@ -419,6 +592,13 @@ func (a *App) Run(ctx, forceCtx context.Context) error {
 			a.log.Warn("shadow sampling: samples were canceled at shutdown", "error", serr)
 		}
 		scancel()
+	}
+	if a.gw != nil {
+		wctx, wcancel := context.WithTimeout(cctx, a.shutdownGrace/4)
+		if werr := a.gw.CloseCache(wctx); werr != nil {
+			a.log.Warn("response cache: writes were abandoned at shutdown", "error", werr)
+		}
+		wcancel()
 	}
 	if cerr := a.closeStorage(cctx); cerr != nil {
 		err = errors.Join(err, fmt.Errorf("app: %w", cerr))

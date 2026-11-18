@@ -167,7 +167,7 @@ func (a *accumulator) addJoined(ev *Event, se *ShadowEval, fb *Feedback) {
 	ci := categoryIndex(ev.Category)
 	if ci >= 0 && ev.CostKnown {
 		var s Money
-		if ev.CacheStatus != CacheStatusHit {
+		if !IsCacheHit(ev.CacheStatus) {
 			s = ev.BaselineCost.Sub(ev.Cost)
 		}
 		if ev.RoutingMode == RoutingModeObserve && ev.ShadowCostKnown {
@@ -201,7 +201,7 @@ func (a *accumulator) add(ev *Event) {
 	if ev.Status >= 400 {
 		a.errors++
 	}
-	hit := ev.CacheStatus == CacheStatusHit
+	hit := IsCacheHit(ev.CacheStatus)
 	if hit {
 		a.cacheHits++
 	}

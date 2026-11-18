@@ -13,8 +13,12 @@ import (
 // integers, so every cost is a whole number of femto-USD.
 const femtoDigits = 15
 
-// femtoPerMicro is the number of femto-USD in one micro-USD.
-const femtoPerMicro = 1_000_000_000
+// femtoPerMicro and femtoPerNano are the numbers of femto-USD in one
+// micro-USD and in one nano-USD.
+const (
+	femtoPerMicro = 1_000_000_000
+	femtoPerNano  = 1_000_000
+)
 
 // Money is an exact amount of USD, held as a whole number of femto-USD
 // (1e-15 USD). It is an immutable value: every operation returns a new
@@ -148,13 +152,23 @@ func (m Money) Float64() float64 {
 // positive infinity, for budget counters, where over-counting is the safe
 // error. Amounts beyond the int64 range saturate at math.MaxInt64 or
 // math.MinInt64.
-func (m Money) MicroUSDCeil() int64 {
+func (m Money) MicroUSDCeil() int64 { return m.ceilDiv(femtoPerMicro) }
+
+// NanoUSDCeil returns m in whole nano-USD (1e-9 USD), rounded up towards
+// positive infinity, for the nano-USD estimates and charges of judge,
+// shadow and embedding calls. Amounts beyond the int64 range saturate at
+// math.MaxInt64 or math.MinInt64.
+func (m Money) NanoUSDCeil() int64 { return m.ceilDiv(femtoPerNano) }
+
+// ceilDiv returns m in whole units of unit femto-USD, rounded up towards
+// positive infinity and saturated at the int64 range.
+func (m Money) ceilDiv(unit int64) int64 {
 	if m.IsZero() {
 		return 0
 	}
 	// QuoRem truncates towards zero, which is already the ceiling for a
 	// negative amount.
-	q, r := new(big.Int).QuoRem(m.femto, big.NewInt(femtoPerMicro), new(big.Int))
+	q, r := new(big.Int).QuoRem(m.femto, big.NewInt(unit), new(big.Int))
 	if r.Sign() > 0 {
 		q.Add(q, big.NewInt(1))
 	}

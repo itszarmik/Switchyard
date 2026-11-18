@@ -97,6 +97,11 @@ func TestLoadHappyPath(t *testing.T) {
 			Concurrency: DefaultShadowConcurrency, MaxOutputTokens: DefaultShadowMaxOutputTokens,
 			VerifiedMinSamples: DefaultVerifiedMinSamples, VerifiedMinPassRate: DefaultVerifiedMinPassRate,
 		}},
+		Cache: CacheConfig{
+			LookupTimeout: Duration(DefaultCacheLookupTimeout), MaxEntryBytes: DefaultCacheMaxEntryBytes,
+			MemoryMaxEntries: DefaultCacheMemoryMaxEntries,
+		},
+		SemanticCache: SemanticCacheConfig{LookupTimeout: Duration(DefaultSemanticLookupTimeout)},
 	}
 	if diff := cmp.Diff(want, cfg, cmp.Comparer(func(a, b Secret) bool { return a.Value() == b.Value() })); diff != "" {
 		t.Errorf("Config mismatch (-want +got):\n%s", diff)

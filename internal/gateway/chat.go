@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"time"
 
+	"switchyard/internal/cache"
+	"switchyard/internal/policy"
 	"switchyard/internal/providers"
 	"switchyard/internal/schema"
 )
@@ -14,27 +16,33 @@ import (
 // ChatCompletions serves one POST /v1/chat/completions request:
 //
 //  1. read and validate the body (413, 400) and the deadline header;
-//  2. route it (see route): resolve the model field (404 for an unknown
-//     model, 400 model_not_supported for a non-chat model, or for auto
-//     the policy does not allow), assess it with the client's hints and
-//     resolve its policy (400 invalid_header for a malformed routing
-//     header), and plan the deployments that meet the policy and have
-//     every capability the request needs, the cheapest eligible first
-//     (400 no_eligible_model, naming each deployment and why it was
-//     excluded; 503 no_healthy_upstream when every eligible one is
-//     unhealthy);
-//  3. execute the plan (see execute): for each attempt, remove the
+//  2. resolve the model field (404 for an unknown model, 400
+//     model_not_supported for a non-chat model, or for auto the policy
+//     does not allow), assess it with the client's hints and resolve its
+//     policy (400 invalid_header for a malformed routing or cache header);
+//     see routePolicy;
+//  3. look it up in the policy's response caches (see lookupCache); a hit
+//     is answered from the cache at once (see serveHit), before any budget
+//     or health check, and a miss carries on;
+//  4. plan the deployments that meet the policy and have every capability
+//     the request needs, the cheapest eligible first (400
+//     no_eligible_model, naming each deployment and why it was excluded;
+//     503 no_healthy_upstream when every eligible one is unhealthy); see
+//     routeDecide. An identical concurrent non-streaming miss waits for
+//     this request's answer instead (see serveMiss);
+//  5. execute the plan (see execute): for each attempt, remove the
 //     parameters the deployment cannot honor, if they may be dropped, and
 //     call its adapter; a non-streaming answer is returned byte for byte;
-//  4. for a stream, commit (200 and the SSE headers) only once the first
+//  6. for a stream, commit (200 and the SSE headers) only once the first
 //     upstream event has arrived, so that a failure before it can still
 //     be retried or fall back; forward each event as it comes, and end
 //     with [DONE]. Unless the client asked for usage, the usage-only chunk
 //     is dropped and usage on any other chunk is set to null. A failure
 //     after the commit is sent as an error event, without [DONE], and is
 //     never retried;
-//  5. record the metrics, and annotate the request's access-log line with
-//     the completion fields (see reqctx.Annotate).
+//  7. write a cacheable answer to the caches, asynchronously (see
+//     writeCache); record the metrics, and annotate the request's
+//     access-log line with the completion fields (see reqctx.Annotate).
 //
 // Canceling ctx, which net/http does when the client disconnects, cancels
 // the upstream request.
@@ -64,24 +72,65 @@ func (g *Gateway) ChatCompletions(ctx context.Context, ex Exchange) {
 		return
 	}
 
-	if !g.planChat(ctx, ex, rec, req, len(body)) {
-		return
+	rr := chatRoute(ex, rec, req, len(body))
+	rt, preq, e := g.routePolicy(rec.endpoint, &rr, &rec.rt)
+	if e == nil {
+		e = g.lookupCache(ctx, ex, rec, req, rt)
 	}
-	g.execute(ctx, ex, rec, g.chatTry(ex, rec, req, nil))
-}
-
-// planChat routes a chat request (see route) and makes the decision rec's
-// plan. When it fails it has already answered the client and returns
-// false.
-func (g *Gateway) planChat(ctx context.Context, ex Exchange, rec *record, req *schema.ChatRequest, size int) bool {
-	rr := chatRoute(ex, rec, req, size)
-	rt, e := g.route(ctx, rec.endpoint, &rr, &rec.rt)
 	if e != nil {
 		g.failRoute(ex, rec, rt, e)
-		return false
+		return
 	}
-	g.usePlan(rec, rt)
-	return true
+	if rec.cache.entry != nil && g.serveHit(ex, rec, req, rt) {
+		return
+	}
+	g.serveMiss(ctx, ex, rec, req, &rr, rt, preq)
+}
+
+// serveMiss serves a chat request the caches did not answer: it plans the
+// request (see routeDecide) and executes the plan, then writes the
+// response to the caches it was looked up in (see writeCache).
+//
+// A non-streaming request with an exact key shares its upstream call with
+// identical concurrent misses (cache.Coalescer): the first executes, and
+// when its response is cacheable the others are answered with it as exact
+// hits, without an upstream call; otherwise, or when the first fails or
+// its client goes away, each executes on its own. So does one whose own
+// policy forbids the deployment that answered the first (see
+// entryAllowed), as for any cached answer.
+func (g *Gateway) serveMiss(ctx context.Context, ex Exchange, rec *record, req *schema.ChatRequest, rr *routeRequest, rt *routed, preq policy.Request) {
+	run := func(ctx context.Context) {
+		rt, e := g.routeDecide(ctx, rr, rt, preq)
+		if e != nil {
+			g.failRoute(ex, rec, rt, e)
+			return
+		}
+		g.usePlan(rec, rt)
+		rec.cache.startAggregating(req.Stream())
+		g.execute(ctx, ex, rec, g.chatTry(ex, rec, req, nil))
+	}
+	if !rec.cache.coalesces(req.Stream()) {
+		run(ctx)
+		g.writeCache(rec)
+		return
+	}
+	led := false
+	e, shared, _ := g.cache.coalescer.Do(ctx, rec.cache.key, func(ctx context.Context) (*cache.Entry, bool) {
+		led = true
+		run(ctx)
+		e, _ := g.cacheEntry(rec)
+		return e, e != nil
+	})
+	switch {
+	case shared && g.entryAllowed(rt, e):
+		g.metrics.cacheCoalesced.Inc()
+		rec.cache.entry, rec.cache.status = e, cache.StatusExact
+		g.serveHit(ex, rec, req, rt)
+		return
+	case !led:
+		run(ctx)
+	}
+	g.writeCache(rec)
 }
 
 // chatRoute describes a chat request for routing.
@@ -173,7 +222,12 @@ func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage boo
 				rec.wroteClient(start)
 			}
 			return kind, err
-		case chunk.IsUsageOnly() && !wantUsage:
+		}
+		// The cache aggregates the chunk as the upstream sent it, usage
+		// included, so that a hit can report the cached answer's tokens.
+		text := chunkOutputBytes(chunk)
+		rec.cache.aggregate(chunk, rec.g.cache.maxEntryBytes)
+		if chunk.IsUsageOnly() && !wantUsage {
 			continue
 		}
 		if chunk.Usage != nil && !wantUsage {
@@ -184,7 +238,7 @@ func pump(ex Exchange, rec *record, s providers.Stream, info Info, wantUsage boo
 			stripped.Usage = nil
 			chunk = &stripped
 		}
-		rec.outBytes += chunkOutputBytes(chunk)
+		rec.outBytes += text
 		rec.collectShadowChunk(chunk)
 		data := chunk.Raw
 		if conv != nil {

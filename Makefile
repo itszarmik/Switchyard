@@ -90,29 +90,58 @@ eval-live: build ## Run eval against real providers (needs EVAL_CONFIG, EVAL_CAN
 		--reference "$(EVAL_REFERENCE)" --max-cost-usd "$(MAX_COST_USD)" --out "$(EVAL_OUT)" \
 		$(if $(strip $(JUDGE)),--judge "$(JUDGE)") $(if $(filter-out 0 false no,$(strip $(DRY_RUN))),--dry-run)
 
-# Integration tests (build tag `integration`) run against the Postgres and
-# redis-state services of deploy/compose.yaml, started in a compose project
-# of their own so that `down -v` never deletes the dev volumes. They use the
-# same host ports as `make dev-up`, so stop the dev dependencies first. The
-# credentials are the throwaway dev ones from the compose file. The
-# packages run one at a time (-p 1), because the Postgres outage test in
-# test/integration stops and restarts the test project's Postgres through
-# SWITCHYARD_TEST_COMPOSE.
+# Integration tests (build tag `integration`) run against the Postgres,
+# redis-state and redis-cache services of deploy/compose.yaml, started in a
+# compose project of their own so that `down -v` never deletes the dev
+# volumes. They use the same host ports as `make dev-up`, so stop the dev
+# dependencies first. The credentials are the throwaway dev ones from the
+# compose file. The packages run one at a time (-p 1), because the outage
+# tests in test/integration stop and restart the test project's Postgres
+# and cache Redis through SWITCHYARD_TEST_COMPOSE.
 TEST_COMPOSE_PROJECT ?= switchyard-test
-INTEGRATION_PKGS     ?= ./internal/usage/... ./internal/budget/... ./test/integration/...
+INTEGRATION_PKGS     ?= ./internal/usage/... ./internal/budget/... ./internal/cache/... ./test/integration/...
 INTEGRATION_FLAGS    ?= -race -count=1 -p 1 -timeout 20m
 TEST_POSTGRES_DSN    := postgres://switchyard:switchyard@127.0.0.1:5433/switchyard?sslmode=disable
 TEST_REDIS_URL       := redis://127.0.0.1:6380/0
+TEST_CACHE_REDIS_URL := redis://127.0.0.1:6379/0
+TEST_COMPOSE         := $(COMPOSE) -p $(TEST_COMPOSE_PROJECT) -f $(CURDIR)/$(COMPOSE_FILE)
 
 .PHONY: test-integration
 test-integration: ## Run the integration tests against Postgres and Redis from deploy/compose.yaml, then tear them down.
-	@compose="$(COMPOSE) -p $(TEST_COMPOSE_PROJECT) -f $(COMPOSE_FILE)"; \
+	@compose="$(TEST_COMPOSE)"; \
 	trap '$$compose down -v' EXIT; \
-	$$compose up -d --wait postgres redis-state || exit 1; \
+	$$compose up -d --wait postgres redis-state redis-cache || exit 1; \
 	echo "$(GO) test -tags integration $(INTEGRATION_FLAGS) $(INTEGRATION_PKGS)"; \
 	SWITCHYARD_TEST_POSTGRES_DSN='$(TEST_POSTGRES_DSN)' SWITCHYARD_TEST_REDIS_URL='$(TEST_REDIS_URL)' \
-	SWITCHYARD_TEST_COMPOSE="$(COMPOSE) -p $(TEST_COMPOSE_PROJECT) -f $(CURDIR)/$(COMPOSE_FILE)" \
+	SWITCHYARD_TEST_CACHE_REDIS_URL='$(TEST_CACHE_REDIS_URL)' SWITCHYARD_TEST_COMPOSE="$(TEST_COMPOSE)" \
 		$(GO) test -tags integration $(INTEGRATION_FLAGS) $(INTEGRATION_PKGS)
+
+# bench-cache measures exact-cache hits through the gateway binary with
+# storage.mode redis, against the cache and state Redis of the
+# test-integration compose project (same ports), which it starts and tears
+# down: one entry is warmed, then 20,000 hits are fired at it at each of
+# concurrency 1, 8 and 50 (change with BENCH_CACHE_FLAGS). It reports p50,
+# p90 and p99 of the client-observed latency per level and fails if p99 at
+# concurrency 1 exceeds 5 ms: that measures one hit's latency; 8 and 50 are
+# information only, since on a shared machine a closed loop at higher
+# concurrency measures queueing and CPU contention rather than the hit.
+BENCH_CACHE_FLAGS ?=
+
+.PHONY: bench-cache
+bench-cache: ## Measure exact-cache hit latency through the gateway with Redis (fails if p99 > 5 ms at concurrency 1).
+	@compose="$(TEST_COMPOSE)"; \
+	trap '$$compose down -v' EXIT; \
+	$$compose up -d --wait redis-state redis-cache || exit 1; \
+	$(GO) run ./test/cachebench -cache-url '$(TEST_CACHE_REDIS_URL)' -state-url '$(TEST_REDIS_URL)' $(BENCH_CACHE_FLAGS)
+
+# semantic-eval runs the semantic cache's paraphrase and near-miss sets
+# (test/cache) through a real embedding model: SWITCHYARD_SEMANTIC_CONFIG
+# names a config whose semantic_cache.embedding_model is that deployment,
+# with its provider key in the environment. It spends a few hundred small
+# embedding calls, and skips without the variable.
+.PHONY: semantic-eval
+semantic-eval: ## Evaluate the semantic cache's test sets against a real embedding model (needs SWITCHYARD_SEMANTIC_CONFIG; skips without it).
+	$(GO) test -tags semanticlive -count=1 -v -run TestSemanticLive ./test/cache/
 
 smoke: ## Run the live smoke test against a real provider (needs OPENAI_API_KEY; SMOKE_MODEL optional).
 	$(GO) test -tags smoke -count=1 -v ./test/smoke/...

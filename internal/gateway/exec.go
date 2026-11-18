@@ -489,6 +489,9 @@ func (g *Gateway) responseAttempt(ex Exchange, rec *record, start time.Time, res
 	if rec.shadow.sampled {
 		rec.shadow.body = body
 	}
+	if rec.cache.eligible && conv == nil {
+		rec.cache.body = body
+	}
 	if resp.Usage == nil {
 		rec.outBytes = responseOutputBytes(body)
 	}

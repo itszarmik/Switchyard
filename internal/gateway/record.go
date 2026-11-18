@@ -114,6 +114,8 @@ type record struct {
 	// shadow is what a request in its policy's shadow sample collects
 	// (see decideShadow).
 	shadow shadowState
+	// cache is what the cache layer knows of a chat request.
+	cache cacheState
 }
 
 // startAttempt makes the admitted attempt adm on d the attempt in
@@ -260,8 +262,11 @@ func (r *record) finish() {
 	r.g.metrics.overhead.WithLabelValues(r.endpoint).Observe(overhead.Seconds())
 
 	deployment := ""
-	if d := r.deployment; d != nil {
-		deployment = d.ID
+	switch {
+	case r.deployment != nil:
+		deployment = r.deployment.ID
+	case r.cache.entry != nil:
+		deployment = r.cache.entry.Deployment
 	}
 
 	attrs := make([]slog.Attr, 0, 32)
@@ -302,8 +307,11 @@ func (r *record) finish() {
 	case !r.served:
 		attrs = append(attrs, slog.Int64("prompt_tokens", 0), slog.Int64("completion_tokens", 0))
 	}
-	if a := r.account(); r.served && a.costKnown {
+	if a := r.account(); (r.served || r.cache.entry != nil) && a.costKnown {
 		attrs = append(attrs, slog.String("cost_usd", a.cost.String()))
+	}
+	if r.cache.status != "" {
+		attrs = append(attrs, slog.String("cache", r.cache.status))
 	}
 	attrs = append(attrs,
 		slog.String("upstream_request_id", r.upstreamRequestID),

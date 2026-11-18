@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"switchyard/internal/app"
+	"switchyard/internal/cache/semantic"
 	"switchyard/internal/catalog"
 	"switchyard/internal/config"
 	"switchyard/internal/eval"
@@ -218,7 +219,8 @@ func runValidate(args []string, stdout, stderr io.Writer, lookupEnv func(string)
 	}
 	cfg := snap.Config()
 	// The checks that need the catalog: the deployment shadow sampling
-	// pins the judge to must pass every sampling policy.
+	// pins the judge to must pass every sampling policy, and the one the
+	// semantic cache embeds with every policy that enables it.
 	cat, err := catalog.New(cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
@@ -227,6 +229,17 @@ func runValidate(args []string, stdout, stderr io.Writer, lookupEnv func(string)
 	if _, err := eval.ShadowJudge(cat, cfg); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", path, err)
 		return exitError
+	}
+	if semantic.Enabled(cfg) {
+		adapters, err := eval.Adapters(cfg)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return exitError
+		}
+		if _, _, err := semantic.ConfiguredDeployment(cfg, cat, adapters); err != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", path, err)
+			return exitError
+		}
 	}
 	warnings := snap.Warnings()
 	for _, w := range warnings {

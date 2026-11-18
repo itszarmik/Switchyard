@@ -556,11 +556,12 @@ Lookups go to the exact cache, then the semantic cache, then the upstream. Both 
 
 ### 11.2 Exact cache
 
-- **Key:** `sy:x:v1:{scope}:{nsver}:{sha256(canonical)}`. `canonical` is the sorted-key JSON of every field that affects the output: the resolved target (the model ID, or profile plus policy ID for `auto`), messages, tools, `tool_choice`, `response_format`, temperature, `top_p`, `max_tokens`, `stop`, `seed`, `n`, `logprobs`, penalties, reasoning parameters, and any unknown fields passed through. It excludes `stream`, `stream_options`, `user`, `metadata` and Switchyard's own headers.
+- **Key:** `sy:x:v1:{scope}:{nsver}:{sha256(canonical)}`. `canonical` is the sorted-key JSON of every field that affects the output: the resolved target (the model ID, or for `auto` the profile, policy ID and any constraint a header tightened: quality floor, TTFT target and cost cap), messages, tools, `tool_choice`, `response_format`, temperature, `top_p`, `max_tokens`, `stop`, `seed`, `n`, `logprobs`, penalties, reasoning parameters, and any unknown fields passed through. It excludes `stream`, `stream_options`, `user`, `metadata` and Switchyard's own headers.
 - **Scope:** the tenant by default, or the key, or the end user (the `user` field), chosen per policy.
 - **`nsver`:** a per-tenant namespace version stored in Redis state. Bumping it invalidates everything for that tenant in O(1).
-- **Value:** the full `ChatResponse` plus metadata (the serving deployment, the original cost, and the creation time). Entries are capped at 1 MiB.
-- **Written only for complete, successful responses**, with `finish_reason` of `stop`, `tool_calls` or `length`. Errors, content-filtered responses and partial streams are never cached.
+- **Value:** the full `ChatResponse` plus metadata (the serving deployment, the parameters it dropped, and the creation time). Entries are capped at 1 MiB (`cache.max_entry_bytes`). A hit replays the dropped-parameters header the original response carried.
+- **Policy check on every hit.** Entries are shared within a scope, but policies differ by key and rule, so a hit (exact, semantic or coalesced) is served only if the entry's deployment passes the request's own effective policy: allow, deny and `require_tags`, and for a pinned concrete model, the same model. Otherwise it counts as a miss (`result="policy"`) and the request is served upstream.
+- **Written only for complete, successful responses**, with `finish_reason` of `stop`, `tool_calls` or `length`. Errors, content-filtered responses, partial streams and answers served under a budget-downgraded profile are never cached.
 - **Temperature.** Identical requests with temperature above 0 all get the same cached sample. That's right for most applications but wrong for "generate N variations" loops, so `exact.deterministic_only: true` restricts caching to requests with temperature 0 or a seed.
 - **Coalescing.** Identical non-streaming misses that arrive at the same time share one upstream call (an in-process singleflight). Coalescing across replicas is post-MVP.
 - **Streaming.** Hits are replayed as described in §7. Streamed misses are aggregated and stored once the stream completes.
@@ -574,7 +575,7 @@ Lookups go to the exact cache, then the semantic cache, then the upstream. Both 
 - **Time budget:** the embedding and search must finish within `lookup_timeout` (default 150 ms). A timeout counts as a miss, and so does any error.
 - **Write:** done asynchronously after a successful response, reusing the embedding from the lookup. The TTL defaults to 72 hours.
 - **Tuning from data:** Switchyard exports similarity histograms for hits and near misses, so operators can set thresholds from evidence.
-- **Overhead:** the embedding's cost is recorded as overhead and subtracted from savings.
+- **Overhead:** the embedding's cost is recorded as overhead and subtracted from savings, and it is charged to the request's budgets. The semantic layer is skipped when a blocking budget is already exhausted, and when the request's effective policy excludes the embedding deployment; configuration validation also checks the embedding deployment against every policy that enables the semantic cache, since the last user message is sent to it.
 - **Known failure mode:** near-duplicate questions with different answers, such as "What's the capital of France?" and "What's the capital of Germany?". The high threshold, narrow partitions, the short-message limit and the opt-in all guard against it, and a committed near-miss test set must not produce hits at default settings (Phase 6 acceptance).
 
 ### 11.4 Provider-side prompt caching
@@ -583,6 +584,7 @@ This is complementary: it discounts input tokens rather than reusing responses. 
 
 ### 11.5 Operations and privacy
 
+- The Redis query engine indexes only logical database 0, so with the semantic cache enabled `cache_url` must name database 0 (validated).
 - Run the **cache** Redis with `maxmemory` and `allkeys-lru`, and the **state** Redis with `noeviction`, because budgets and rate limits must never be evicted. A small install can point both roles at one Redis with separate logical databases, but that's documented as unsuitable for production because the eviction policy applies to the whole instance.
 - An admin endpoint purges a tenant's cache.
 - **The cache is the only place Switchyard stores prompt and response content.** It is opt-in, bounded by TTLs, scoped to the tenant and purgeable, and the Redis instance must be private, with AUTH and TLS. Per-tenant encryption at rest is post-MVP.
@@ -760,8 +762,11 @@ All metric names are prefixed `switchyard_`.
 | `tokens_total` | counter | provider, model, class |
 | `cost_usd_total` | counter | provider, model |
 | `savings_usd_total` | counter | source (`routing`, `cache`) |
-| `cache_lookups_total` | counter | layer (`exact`, `semantic`), result (`hit`, `miss`, `error`, `skipped`) |
-| `semantic_similarity` | histogram | result |
+| `cache_lookups_total` | counter | layer (`exact`, `semantic`), result (`hit`, `miss`, `error`, `skipped`, `policy`, `budget`) |
+| `cache_writes_total` | counter | layer, result (`ok`, `error`, `dropped`, `too_large`, `not_cacheable`) |
+| `cache_similarity` | histogram | outcome (`hit`, `miss`) |
+| `cache_lookup_seconds` | histogram | layer |
+| `cache_coalesced_total` | counter | |
 | `route_decisions_total` | counter | profile, served_model, reason |
 | `route_relaxations_total` | counter | constraint |
 | `fallbacks_total` | counter | from, to, reason |

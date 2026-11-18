@@ -100,11 +100,12 @@ func TestPolicyDefaults(t *testing.T) {
 		"{id: b, baseline_model: m, substitution: {mode: equivalent, max_quality_drop: 0}, routing_mode: observe, on_unmet: reject}",
 		"{id: c, baseline_model: m, substitution: {max_quality_drop: 0.1}, rules: [{name: r, set: {min_quality: 0.9}}]}",
 	)), nil, nil).Config()
+	cache := CachePolicyWithDefaults(CachePolicy{})
 	want := []Policy{
-		{ID: "a", BaselineModel: "m", Substitution: Substitution{Mode: "pinned", MaxQualityDrop: 0.05}, RoutingMode: "enforce", OnUnmet: "best_effort"},
-		{ID: "b", BaselineModel: "m", Substitution: Substitution{Mode: "equivalent"}, RoutingMode: "observe", OnUnmet: "reject"},
+		{ID: "a", BaselineModel: "m", Substitution: Substitution{Mode: "pinned", MaxQualityDrop: 0.05}, RoutingMode: "enforce", OnUnmet: "best_effort", Cache: cache},
+		{ID: "b", BaselineModel: "m", Substitution: Substitution{Mode: "equivalent"}, RoutingMode: "observe", OnUnmet: "reject", Cache: cache},
 		{ID: "c", BaselineModel: "m", Substitution: Substitution{Mode: "pinned", MaxQualityDrop: 0.1}, RoutingMode: "enforce", OnUnmet: "best_effort",
-			Rules: []Rule{{Name: "r", Set: PolicyOverride{MinQuality: 0.9}}}},
+			Rules: []Rule{{Name: "r", Set: PolicyOverride{MinQuality: 0.9}}}, Cache: cache},
 	}
 	if diff := cmp.Diff(want, cfg.Policies); diff != "" {
 		t.Errorf("policies (-want +got):\n%s", diff)

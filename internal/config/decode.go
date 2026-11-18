@@ -144,6 +144,18 @@ func (st *loadState) decodeValueAt(at, n *yaml.Node, v reflect.Value, path strin
 		}
 		v.SetBool(b)
 
+	case reflect.Pointer:
+		// An optional block, such as a rule's set.cache: null or absent
+		// leaves it nil, anything else is decoded into a new value.
+		if isNull {
+			v.SetZero()
+			return
+		}
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		st.decodeValueAt(at, n, v.Elem(), path)
+
 	default:
 		// Only reachable if the schema gains a field of a kind this decoder
 		// does not handle yet.

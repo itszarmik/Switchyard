@@ -195,8 +195,8 @@ func (g *Gateway) estimate(rec *record, d *catalog.Deployment) int64 {
 // admitBudget admits the request against the budgets of its tenant and key
 // (DESIGN §12.3) before its first attempt, at the estimated cost on the
 // first deployment of its plan. A request with no budgets is not admitted
-// at all. Phase 6's cache hits are answered before execute and never
-// reach this point, so they are not admitted.
+// at all. Cache hits are answered before routing and never reach this
+// point, so they are neither admitted nor charged.
 //
 // When a blocking budget has no room it answers 429 budget_exceeded and
 // returns false: no upstream is called. A request under a blocking budget
@@ -342,6 +342,13 @@ func (r *record) account() *accounting {
 	}
 	a := &accounting{costKnown: true}
 	r.acct = a
+	if e := r.cache.entry; e != nil {
+		// A cache hit costs nothing; its tokens are the cached answer's.
+		if u := cachedUsage(e.Body); u != nil {
+			a.tokens, a.usageKnown = usage.FromUsage(u), true
+		}
+		return a
+	}
 	d := r.deployment
 	if !r.served || d == nil {
 		if s := r.sentTo; s != nil && !r.served {
@@ -383,9 +390,15 @@ func (r *record) costHeader() string {
 // against: 0 if no attempt reached an upstream that may have billed it,
 // the exact cost rounded up to micro-USD when known, and the admitted
 // estimate otherwise, as for a request canceled after the upstream
-// received it. It runs even when the client has gone away.
+// received it; plus the semantic cache's embedding cost, rounded up to
+// micro-USD, if a lookup embedded the request's message. A request that
+// was not admitted (a hit, or a miss refused or failed before admission)
+// is charged its embedding cost alone (see chargeOverhead). It runs even
+// when the client has gone away.
 func (r *record) settle() {
+	overhead := r.cache.overhead.MicroUSDCeil()
 	if !r.admitted {
+		r.chargeOverhead(overhead)
 		return
 	}
 	a := r.account()
@@ -399,9 +412,40 @@ func (r *record) settle() {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.ctx), settleTimeout)
 	defer cancel()
-	if err := r.g.budgets.Settle(ctx, r.adm, actual); err != nil {
+	if err := r.g.budgets.Settle(ctx, r.adm, actual+overhead); err != nil {
 		r.g.metrics.budgetStoreErrors.Inc()
+		if overhead > 0 {
+			r.g.metrics.overheadUncharged.Inc()
+		}
 		warnStore(r.ctx, "budget settlement failed; the budgets keep the estimate", err)
+	}
+}
+
+// chargeOverhead charges amount, the embedding cost of a request that was
+// not admitted against its budgets, to the budgets of its tenant and key,
+// through the store's admission with nothing reserved and a settlement.
+// The response has been sent by then, so a failure never affects it: it
+// is counted (switchyard_cache_overhead_uncharged_total, and
+// switchyard_budget_store_errors_total when the store failed) and the
+// usage ledger still records the cost as overhead.
+func (r *record) chargeOverhead(amount int64) {
+	scopes := r.g.scopes[principal{r.tenant, r.keyID}]
+	if amount <= 0 || len(scopes) == 0 || r.g.offline {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.ctx), settleTimeout)
+	defer cancel()
+	adm, err := r.g.budgets.Admit(ctx, scopes, 0, r.g.now())
+	if err == nil {
+		err = r.g.budgets.Settle(ctx, adm, amount)
+	}
+	if err == nil {
+		return
+	}
+	r.g.metrics.overheadUncharged.Inc()
+	if !errors.Is(err, budget.ErrExhausted) {
+		r.g.metrics.budgetStoreErrors.Inc()
+		warnStore(r.ctx, "budget store unavailable; the semantic cache's embedding cost was not charged to the budgets", err)
 	}
 }
 
@@ -415,18 +459,18 @@ func (r *record) recordUsage(latency time.Duration) {
 		d = nil
 	}
 	var baseline usage.Money
+	hit := r.cache.entry != nil
+	if hit && r.model != nil {
+		// Cache savings: the baseline cost of the call the hit avoided.
+		baseline = r.baselineCost(a.tokens)
+		r.g.metrics.savingsCache.Add(baseline.Float64())
+	}
 	if d != nil && a.costKnown {
 		m := r.g.metrics
 		m.cost.WithLabelValues(d.Provider, d.Model.ID).Add(a.cost.Float64())
 		addTokens(m.tokens, d, a.tokens)
 		if r.model != nil {
-			prices := make([]config.Pricing, len(r.model.Deployments))
-			for i, md := range r.model.Deployments {
-				prices[i] = md.Prices
-			}
-			if b, ok := usage.BaselineCost(r.model.Type, a.tokens, prices); ok {
-				baseline = b
-			}
+			baseline = r.baselineCost(a.tokens)
 		}
 		m.savingsRouting.Add(baseline.Sub(a.cost).Float64())
 	} else if d != nil {
@@ -463,6 +507,7 @@ func (r *record) recordUsage(latency time.Duration) {
 		FallbackReason: r.fallbackReason,
 		RouteReason:    r.info.RouteReason,
 		CacheStatus:    usage.CacheStatusMiss,
+		OverheadCost:   r.cache.overhead,
 		Tokens:         a.tokens,
 		UsageKnown:     a.usageKnown,
 		UsageEstimated: a.usageEstimated,
@@ -483,7 +528,12 @@ func (r *record) recordUsage(latency time.Duration) {
 	if r.route != nil {
 		ev.Category = r.route.assessment.Category
 	}
+	if r.cache.status != "" {
+		ev.CacheStatus = r.cache.status
+	}
 	switch {
+	case hit:
+		ev.Deployment, ev.Provider = r.cache.entry.Deployment, entryProvider(r.cache.entry.Deployment)
 	case d != nil:
 		ev.Deployment, ev.Provider = d.ID, d.Provider
 	case r.sentTo != nil:
@@ -493,6 +543,17 @@ func (r *record) recordUsage(latency time.Duration) {
 		ev.BaselineModel = r.model.ID
 	}
 	r.g.ledger.Record(ev)
+}
+
+// baselineCost prices t at the request's baseline model's cheapest priced
+// deployment (DESIGN §12.4), or returns 0 when none is priced.
+func (r *record) baselineCost(t usage.Tokens) usage.Money {
+	prices := make([]config.Pricing, len(r.model.Deployments))
+	for i, md := range r.model.Deployments {
+		prices[i] = md.Prices
+	}
+	b, _ := usage.BaselineCost(r.model.Type, t, prices)
+	return b
 }
 
 // addTokens counts t in the tokens metric of deployment d.

@@ -117,18 +117,29 @@ type routed struct {
 // observe reports whether the request runs in observe mode.
 func (rt *routed) observe() bool { return rt.eff.RoutingMode == policy.ModeObserve }
 
-// route routes rr (steps 1–6 of the pipeline): it resolves the model
-// field, assesses the request with the client's hints, resolves the
-// effective policy with header tightening, downgrades the profile of an
-// auto request whose budget's soft threshold has been crossed, and asks
-// the router for a decision, which in observe mode is the shadow decision
-// next to the pinned one that is served.
+// route routes rr (steps 1–9 of the pipeline): routePolicy, then
+// routeDecide.
 //
 // The outcome is written to rt, which route returns with any error, so
 // that the caller can send the headers known by then; it returns nil only
 // when the model field could not be resolved. rt is the caller's, usually
 // part of the request's record, to spare an allocation per request.
 func (g *Gateway) route(ctx context.Context, endpoint string, rr *routeRequest, rt *routed) (*routed, *Error) {
+	out, preq, e := g.routePolicy(endpoint, rr, rt)
+	if e != nil {
+		return out, e
+	}
+	return g.routeDecide(ctx, rr, rt, preq)
+}
+
+// routePolicy is the first half of routing (steps 4–7): it resolves the
+// model field, assesses the request with the client's hints and resolves
+// the effective policy with header tightening, and for auto the policy's
+// baseline model. It reads no shared state, so that the cache lookup,
+// which needs the policy, can come before anything that depends on the
+// budgets or the deployments' health. Its results are written to rt, as
+// for route; it also returns the policy request, which routeDecide needs.
+func (g *Gateway) routePolicy(endpoint string, rr *routeRequest, rt *routed) (*routed, policy.Request, *Error) {
 	*rt = routed{}
 	rt.served = &rt.full
 	target, virtual := g.catalog.VirtualTarget(rr.model)
@@ -140,14 +151,14 @@ func (g *Gateway) route(ctx context.Context, endpoint string, rr *routeRequest, 
 	} else {
 		res, e := g.resolve(rr.model, endpoint, chatType)
 		if e != nil {
-			return nil, e
+			return nil, policy.Request{}, e
 		}
 		rt.res, rt.alias, rt.baseline, rt.requested = res, res.Alias, res.Model, res.Model.ID
 	}
 
 	hints, e := parseHints(rr.header)
 	if e != nil {
-		return rt, e
+		return rt, policy.Request{}, e
 	}
 	ratio := 1.0
 	if !rt.auto {
@@ -179,24 +190,33 @@ func (g *Gateway) route(ctx context.Context, endpoint string, rr *routeRequest, 
 	}
 	if p, ok := strings.CutPrefix(rt.requested, "auto:"); rt.auto && ok {
 		if p == "" {
-			return rt, g.emptyProfile(tenant, rr)
+			return rt, policy.Request{}, g.emptyProfile(tenant, rr)
 		}
 		preq.Profile = p
 	}
 	eff, err := g.policy.Resolve(tenant, rr.keyID, preq)
 	if err != nil {
-		return rt, policyError(rr.model, err)
+		return rt, policy.Request{}, policyError(rr.model, err)
 	}
 	rt.eff = eff
 	if rt.auto {
 		if err := policy.CheckAuto(eff); err != nil {
-			return rt, policyError(rr.model, err)
+			return rt, policy.Request{}, policyError(rr.model, err)
 		}
 		if rt.baseline, e = g.baselineModel(eff.BaselineModel); e != nil {
-			return rt, e
+			return rt, policy.Request{}, e
 		}
 	}
+	return rt, preq, nil
+}
 
+// routeDecide is the second half of routing (step 9), after routePolicy
+// has filled rt and returned preq: it downgrades the profile of an auto request whose
+// budget's soft threshold has been crossed, and asks the router for a
+// decision, which in observe mode is the shadow decision next to the
+// pinned one that is served.
+func (g *Gateway) routeDecide(ctx context.Context, rr *routeRequest, rt *routed, preq policy.Request) (*routed, *Error) {
+	tenant := g.tenants[rr.tenant]
 	remaining, soft := g.budgetState(ctx, rr.tenant, rr.keyID)
 	downgrade := ""
 	if rt.auto && soft != nil {
@@ -553,13 +573,8 @@ func parseCost(s string) (usage.Money, bool) {
 // usePlan makes the routed request's served decision rec's plan and sets
 // what the response headers, logs and usage event say about it.
 func (g *Gateway) usePlan(rec *record, rt *routed) {
-	rec.route = rt
-	rec.alias = rt.alias
-	rec.model = rt.baseline
-	rec.inBytes, rec.inImages, rec.estOut = rt.inBytes, rt.inImages, rt.estOut
-	rec.profile, rec.routingMode = rt.eff.Profile, rt.eff.RoutingMode
+	rec.useRoute(rt)
 	rec.baseReason = rt.reason
-	rec.info = routeInfo(rt)
 	p := &rec.plan
 	p.model, p.pinned = rt.requested, rt.res.Pinned
 	p.entries = make([]planEntry, 0, len(rt.served.Plan))
@@ -574,6 +589,28 @@ func (g *Gateway) usePlan(rec *record, rt *routed) {
 	}
 	rec.excluded = len(exclusions(rt.served.Explanation))
 	g.decideShadow(rec, rt)
+}
+
+// useRoute sets what the response headers, logs and usage event say
+// about a request routed as far as rt: its policy, profile and baseline,
+// and the cache status the cache layer gave it.
+func (rec *record) useRoute(rt *routed) {
+	rec.route = rt
+	rec.alias = rt.alias
+	rec.model = rt.baseline
+	rec.inBytes, rec.inImages, rec.estOut = rt.inBytes, rt.inImages, rt.estOut
+	rec.profile, rec.routingMode = rt.eff.Profile, rt.eff.RoutingMode
+	rec.info = routeInfo(rt)
+	rec.info.Cache = rec.cacheHeader()
+}
+
+// cacheHeader is the X-Switchyard-Cache response header of the request:
+// its cache status when the cache layer saw it, else "".
+func (rec *record) cacheHeader() string {
+	if !rec.cache.eligible {
+		return ""
+	}
+	return rec.cache.status
 }
 
 // routeInfo returns the response headers a routed request carries before
@@ -600,6 +637,7 @@ func (g *Gateway) failRoute(ex Exchange, rec *record, rt *routed, e *Error) {
 		info = routeInfo(rt)
 		rec.excluded = len(exclusions(rt.served.Explanation))
 	}
+	info.Cache = rec.cacheHeader()
 	rec.info = info
 	rec.respondError(ex, info, e)
 }

@@ -3,7 +3,10 @@
 // request; route it (assess its difficulty, resolve its effective policy
 // with header tightening and the budgets' soft-profile downgrade, resolve
 // the model field, and let the router plan the deployments that can honor
-// it, the best first, skipping those that are unhealthy; see route); admit
+// it, the best first, skipping those that are unhealthy; see route), and
+// for chat completions look it up in the response caches as soon as its
+// policy is known, serving a hit before any budget or health check (see
+// lookupCache); admit
 // the request's estimated cost against its tenant's and
 // key's budgets, then execute the plan: call each deployment's adapter,
 // with the parameters it may drop removed, retrying and falling back as
@@ -81,6 +84,9 @@ type Options struct {
 	BudgetStoreCheck func(ctx context.Context) error
 	// ConfigVersion identifies the config snapshot in usage events.
 	ConfigVersion string
+	// Cache holds the response caches (DESIGN §11). Its zero value keeps
+	// them in memory.
+	Cache CacheOptions
 	// Offline makes a gateway for explaining routing decisions without
 	// live state (switchyard route explain): every deployment counts as
 	// healthy, latency estimates come from the catalog's hints, and every
@@ -137,6 +143,8 @@ type Gateway struct {
 
 	// shadow takes the shadow samples, or is nil (see SetShadow).
 	shadow Shadow
+	// cache is the response caches.
+	cache *cacheLayer
 }
 
 // Model is one entry of the model list.
@@ -219,6 +227,7 @@ func New(opts Options) (*Gateway, error) {
 		g.now = time.Now
 	}
 	g.configVersion = opts.ConfigVersion
+	g.cache = newCacheLayer(cfg.Cache, opts.Cache, g.now)
 	g.scopes, g.allScopes = budgetScopes(cfg.Tenants)
 	met, err := newMetrics(opts.Registry)
 	if err != nil {
@@ -360,8 +369,13 @@ type Info struct {
 	// chosen, or "".
 	ShadowModel string
 	// CostUSD is the request's exact cost in USD as a decimal, set on a
-	// successful non-streaming response whose usage and prices are known.
+	// successful non-streaming response whose usage and prices are known,
+	// and "0" on a non-streaming cache hit.
 	CostUSD string
+	// Cache is the request's cache status, miss, exact or semantic, for a
+	// chat request the cache layer saw, or "". A hit (exact or semantic)
+	// made no upstream attempt.
+	Cache string
 }
 
 // Error is a failed request, ready to be sent in the OpenAI error

@@ -2,13 +2,14 @@
 // on httptest.Server, for the conformance suite, the load harness and any
 // test that needs a provider to talk to.
 //
-// It serves POST /v1/chat/completions (streaming and non-streaming) and
-// GET /v1/models. The canned answer follows the request the way OpenAI's
-// does: tools produce tool calls (one per tool when parallel tool calls are
-// allowed), response_format json_object or json_schema produces JSON, n
-// produces n choices, stop sequences truncate the text, and a usage chunk is
-// streamed only when stream_options.include_usage is true. The request's
-// model is echoed, and every response carries an x-request-id header.
+// It serves POST /v1/chat/completions (streaming and non-streaming),
+// GET /v1/models and, when [Options.Embed] is set, POST /v1/embeddings.
+// The canned answer follows the request the way OpenAI's does: tools
+// produce tool calls (one per tool when parallel tool calls are allowed),
+// response_format json_object or json_schema produces JSON, n produces n
+// choices, stop sequences truncate the text, and a usage chunk is streamed
+// only when stream_options.include_usage is true. The request's model is
+// echoed, and every response carries an x-request-id header.
 //
 // Errors, delays and connection faults are scripted per test with
 // [Server.Script], or request by request with [Server.Sequence] (such as
@@ -50,8 +51,10 @@ const (
 	FaultHang
 )
 
-// Behavior scripts how the fake answers chat completion requests. The zero
-// value answers immediately and successfully.
+// Behavior scripts how the fake answers chat completion requests, and
+// embeddings requests when [Options.Embed] is set; for embeddings, only
+// Status, Body, Header, TTFT, Hold, Fault and Usage.PromptTokens apply.
+// The zero value answers immediately and successfully.
 type Behavior struct {
 	// Status, when non-zero, makes every chat completion fail with this
 	// HTTP status after TTFT, before anything else is checked except the
@@ -108,6 +111,14 @@ type Options struct {
 	APIKey string
 	// DisableRecording turns request recording off, for load tests.
 	DisableRecording bool
+	// Embed, when set, makes the fake serve POST /v1/embeddings: each
+	// input string is embedded as Embed returns, in float or base64
+	// encoding as requested, and prompt_tokens is one token per 4 bytes
+	// of each input, rounded up (at least 1), unless Behavior.Usage sets
+	// it. Embeddings requests take their Behavior from Script and
+	// Sequence, as chat completions do. Without Embed, the path is unknown
+	// (404). Embed must be safe for concurrent use.
+	Embed func(input string) []float32
 }
 
 // Request is a recorded request and what the fake did with it.
@@ -392,6 +403,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		out.error(http.StatusUnauthorized, s.authError(r))
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 		s.chat(r.Context(), out, body)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/embeddings" && s.opts.Embed != nil:
+		s.embeddings(r.Context(), out, body)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		s.models(out)
 	default:

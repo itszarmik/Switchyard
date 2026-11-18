@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"switchyard/internal/apierror"
+	"switchyard/internal/cache"
 	"switchyard/internal/gateway"
 	"switchyard/internal/reqctx"
 	"switchyard/internal/server"
@@ -44,6 +45,7 @@ const (
 	headerProfile           = "X-Switchyard-Profile"
 	headerPolicyWarning     = "X-Switchyard-Policy-Warning"
 	headerShadowModel       = "X-Switchyard-Shadow-Model"
+	headerCache             = gateway.HeaderCache
 )
 
 // Defaults for the zero values of Options.
@@ -289,7 +291,8 @@ func setInfo(h http.Header, info gateway.Info) {
 	if info.UpstreamRequestID != "" {
 		h.Set(headerUpstreamRequestID, info.UpstreamRequestID)
 	}
-	if info.Attempts > 0 {
+	// A cache hit says it made no attempt.
+	if info.Attempts > 0 || info.Cache == cache.StatusExact || info.Cache == cache.StatusSemantic {
 		h.Set(headerAttempts, strconv.Itoa(info.Attempts))
 	}
 	if info.RouteReason != "" {
@@ -306,6 +309,9 @@ func setInfo(h http.Header, info gateway.Info) {
 	}
 	if info.ShadowModel != "" {
 		h.Set(headerShadowModel, info.ShadowModel)
+	}
+	if info.Cache != "" {
+		h.Set(headerCache, info.Cache)
 	}
 }
 

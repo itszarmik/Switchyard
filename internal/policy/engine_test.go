@@ -133,6 +133,7 @@ func TestResolveBasePolicy(t *testing.T) {
 		Allow:       []string{"m@*"}, Deny: []string{"m@b"}, Prefer: []string{"m@a"},
 		Substitution: SubstitutionPinned, MaxQualityDrop: 0.05, RoutingMode: ModeEnforce,
 		BaselineModel: "m", MaxCostPerRequestNano: 500_000_000, OnUnmet: OnUnmetBestEffort,
+		Cache: defaultCache,
 	}
 	strictEff := Effective{
 		PolicyID: "strict", Profile: "cheap",
@@ -140,11 +141,13 @@ func TestResolveBasePolicy(t *testing.T) {
 		AllowedProfiles: []string{"cheap", "balanced"}, RequireTags: []string{"zdr"},
 		Substitution: SubstitutionEquivalent, MaxQualityDrop: 0.1, RoutingMode: ModeObserve,
 		BaselineModel: "m", OnUnmet: OnUnmetReject,
+		Cache: defaultCache,
 	}
 	nobaseEff := Effective{
 		PolicyID: "nobase", Profile: "balanced",
 		Constraints:  Constraints{MinQuality: 0.8, Objective: ObjectiveCost},
 		Substitution: SubstitutionPinned, MaxQualityDrop: 0.05, RoutingMode: ModeEnforce, OnUnmet: OnUnmetBestEffort,
+		Cache: defaultCache,
 	}
 	tests := []struct {
 		name   string
@@ -182,6 +185,7 @@ func TestResolveBuiltIn(t *testing.T) {
 		Profile:      "balanced",
 		Constraints:  Constraints{MinQuality: 0.8, Objective: ObjectiveCost},
 		Substitution: SubstitutionPinned, MaxQualityDrop: 0.05, RoutingMode: ModeEnforce, OnUnmet: OnUnmetBestEffort,
+		Cache: defaultCache,
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("built-in effective (-want +got):\n%s", diff)
@@ -402,6 +406,7 @@ func TestRuleOverrides(t *testing.T) {
 		Allow:       []string{"m@*"}, Deny: []string{"m@b"}, Prefer: []string{"m@a"},
 		Substitution: SubstitutionPinned, MaxQualityDrop: 0.05, RoutingMode: ModeEnforce,
 		BaselineModel: "m", MaxCostPerRequestNano: 500_000_000, OnUnmet: OnUnmetBestEffort,
+		Cache: defaultCache,
 	}
 	tests := []struct {
 		name string

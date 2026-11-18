@@ -50,6 +50,8 @@ func TestParseFlags(t *testing.T) {
 		{[]string{"-concurrency", "0"}, false, false},
 		{[]string{"-duration", "0s"}, false, false},
 		{[]string{"extra"}, false, false},
+		{[]string{"-cache", "miss"}, true, false},
+		{[]string{"-cache", "always"}, false, false},
 	}
 	for _, tc := range tests {
 		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
@@ -62,6 +64,13 @@ func TestParseFlags(t *testing.T) {
 	o, _ := parseFlags(nil, io.Discard)
 	if o.concurrency != 100 || o.maxP99Overhead != 5*time.Millisecond {
 		t.Errorf("defaults %+v, want concurrency 100 and max-p99-overhead 5ms", o)
+	}
+}
+
+func TestUniqueBody(t *testing.T) {
+	a, b := uniqueBody(requestBody(false), 1), uniqueBody(requestBody(true), 2)
+	if !bytes.Contains(a, []byte(`short. 1"`)) || !bytes.Contains(b, []byte(`short. 2"`)) || !bytes.Contains(b, []byte(`"stream":true`)) {
+		t.Errorf("uniqueBody: %s, %s", a, b)
 	}
 }
 

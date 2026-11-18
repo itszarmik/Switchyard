@@ -4,8 +4,6 @@ import (
 	"math/rand/v2"
 	"sync"
 	"testing"
-
-	"switchyard/internal/judge"
 )
 
 // TestGateUnderConcurrency admits and settles from many goroutines and
@@ -32,7 +30,7 @@ func TestGateUnderConcurrency(t *testing.T) {
 					mu.Unlock()
 				}
 				g.mu.Unlock()
-				actual, _ := nanoMoney(int64(rng.IntN(int(judge.NanoCeil(est)) + 1)))
+				actual, _ := nanoMoney(int64(rng.IntN(int(est.NanoUSDCeil()) + 1)))
 				g.settle(est, actual)
 			}
 		})

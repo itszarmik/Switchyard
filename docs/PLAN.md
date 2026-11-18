@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P5 complete** and committed on `main`; **P8 complete** (done ahead of P6/P7 at the user's request). Next: P6 (caching). CI, the live smoke tests and a live judge-quality check have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P6 and P8 complete** (P8 was done ahead of P6/P7 at the user's request). Next: P7 (production hardening and v0.1). CI, the live smoke tests, a live judge-quality check and a live semantic-cache check (`make semantic-eval`) have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -328,13 +328,69 @@ All nine criteria pass.
 
 **Acceptance**
 
-- [ ] Key tests: identical requests get the same key, and every output-affecting field changes it, while `stream` and `user` don't. Different tenants never share entries.
-- [ ] An exact hit takes ≤ 5 ms at p99 with local Redis, and the ledger shows a cost of 0 with full baseline savings.
-- [ ] A streaming client receives a replay that the `openai-go` SDK parses into the same final message as the original response.
+- [x] Key tests: identical requests get the same key, and every output-affecting field changes it, while `stream` and `user` don't. Different tenants never share entries.
+- [x] An exact hit takes ≤ 5 ms at p99 with local Redis, and the ledger shows a cost of 0 with full baseline savings.
+- [x] A streaming client receives a replay that the `openai-go` SDK parses into the same final message as the original response.
 - [ ] Semantic cache: a committed paraphrase set hits at the default threshold with the default embedding model, and a committed near-miss set (the same question about different entities) doesn't.
-- [ ] With Redis stopped, requests still succeed, cache errors are counted, and the added latency is at most the lookup timeout.
-- [ ] 100 identical concurrent non-streaming requests make exactly 1 upstream call.
-- [ ] Purging removes all of one tenant's entries (by bumping the namespace version) without touching other tenants.
+- [x] With Redis stopped, requests still succeed, cache errors are counted, and the added latency is at most the lookup timeout.
+- [x] 100 identical concurrent non-streaming requests make exactly 1 upstream call.
+- [x] Purging removes all of one tenant's entries (by bumping the namespace version) without touching other tenants.
+
+**P6 outcome.**
+
+Six of the seven criteria pass. The semantic criterion passes offline but has not yet run against a real embedding model.
+
+**Keys.**
+- Identical requests share a key, and each of 27 output-affecting fields changes it; `stream`, `user`, `metadata`, `store` and `service_tier` don't.
+- Tenants, keys and users are isolated end to end through the binary.
+- On every hit (exact, semantic or coalesced), the entry's deployment must also pass the requesting key's own policy before it is served.
+
+**Exact hits** (`make bench-cache`, the real Redis 8 cache instance through Colima, 20,000 hits per level, 3 runs):
+
+| Concurrency | p99 |
+|---|---|
+| 1 (the gate) | 1.65–2.67 ms |
+| 8 | 1.8–4.5 ms |
+
+- The ledger records a hit at cost 0 with its full baseline cost as cache savings, and memory and Postgres agree.
+
+**Streaming replay.** The openai-go SDK reassembles a replayed stream into the original message, both for content and for parallel tool calls, after either a streamed or a non-streamed miss.
+
+**Semantic cache.**
+- The committed sets hold 48 paraphrase pairs and 48 near-miss pairs.
+- With scripted embeddings, every paraphrase hits and no near miss does, both offline and through the binary.
+- The real-model check is `make semantic-eval`. It needs an embedding deployment, either an OpenAI key or a local Ollama or TEI model, and hasn't been run.
+
+**Redis down.**
+- With a hung cache Redis, requests succeed, adding about the 25 ms lookup timeout, and the errors are counted.
+- With the Redis container stopped mid-run, every request succeeds as a counted miss, and caching resumes after a restart.
+
+**Coalescing.** 100 identical concurrent requests make 1 upstream call.
+
+**Purge.** Purging a tenant removes its exact and semantic entries and leaves other tenants' entries in place, in both memory and Redis.
+
+**Review fixes.** Independent security and correctness reviews found no cross-tenant leak, no cached errors and no logged content. Every finding listed here is fixed with a regression test.
+- **Policy check on hits.** Hits bypassed the requesting key's policy; now every hit is checked against it (allow, deny, `require_tags`, pinned model).
+- **Dropped parameters.** Hits now replay the dropped-parameters header.
+- **Embeddings.**
+  - They obey policy filters, both at validation and at runtime.
+  - They count against budgets, and the semantic layer is skipped while a budget is exhausted.
+- **Cache keys.**
+  - Budget-downgraded answers aren't cached.
+  - `auto` keys include the quality, TTFT and cost constraints set by headers.
+- **Robustness.**
+  - Stream aggregation is bounded in raw bytes.
+  - The in-memory semantic index honours its timeout and no longer serializes lookups.
+  - The database-0 check can't be bypassed with `?db=`.
+  - Redis socket timeouts no longer cap the configured lookup timeouts.
+  - In-memory caches are bounded at 256 MiB.
+
+**Overhead.**
+- With caching off, the miss path is within noise of the previous build.
+- With the exact cache on and every request missing, it adds about 0.15 ms p50.
+- The 5 ms p99 gateway gate (`make bench-overhead`) still fails on this machine for every build. That's the access-log write, which P7 addresses.
+
+---
 
 ## P7: Production hardening and v0.1
 

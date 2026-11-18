@@ -42,6 +42,12 @@ type Config struct {
 	QualityOverrides []QualityOverride `yaml:"quality_overrides"`
 	// Evaluation configures the judge and shadow sampling (Phase 8).
 	Evaluation Evaluation `yaml:"evaluation"`
+	// Cache holds gateway-wide response-cache limits (DESIGN §11). Whether
+	// a request is cached is set per policy (Policy.Cache).
+	Cache CacheConfig `yaml:"cache"`
+	// SemanticCache configures the embedding model and lookup budget of
+	// the semantic cache (DESIGN §11.3).
+	SemanticCache SemanticCacheConfig `yaml:"semantic_cache"`
 }
 
 // Server configures the public and admin HTTP listeners.
@@ -482,6 +488,79 @@ type Policy struct {
 	// Shadow configures shadow sampling for this policy's traffic (Phase 8).
 	// It is off unless SampleRate > 0.
 	Shadow ShadowPolicy `yaml:"shadow"`
+	// Cache configures the response caches for this policy's chat
+	// requests (DESIGN §11). Both caches are off unless enabled.
+	Cache CachePolicy `yaml:"cache"`
+}
+
+// CachePolicy configures the exact and semantic response caches for a
+// policy's traffic.
+type CachePolicy struct {
+	Exact    ExactCachePolicy    `yaml:"exact"`
+	Semantic SemanticCachePolicy `yaml:"semantic"`
+}
+
+// Exact-cache scopes: which callers share entries. Every scope is within
+// one tenant; tenants never share entries.
+const (
+	CacheScopeTenant = "tenant"
+	CacheScopeKey    = "key"
+	CacheScopeUser   = "user"
+)
+
+// ExactCachePolicy configures the exact cache (DESIGN §11.2).
+type ExactCachePolicy struct {
+	// Enabled turns the exact cache on. Default false.
+	Enabled bool `yaml:"enabled"`
+	// TTL is how long an entry is served. Default 24h.
+	TTL Duration `yaml:"ttl"`
+	// Scope is tenant (default), key or user: who shares entries. user
+	// scopes by the request's user field, within the tenant; a request
+	// without one is scoped by its key.
+	Scope string `yaml:"scope"`
+	// DeterministicOnly restricts caching to requests with temperature 0
+	// or a seed, so that sampled requests always get a fresh answer.
+	DeterministicOnly bool `yaml:"deterministic_only"`
+}
+
+// SemanticCachePolicy configures the semantic cache (DESIGN §11.3). It
+// shares the exact cache's scope.
+type SemanticCachePolicy struct {
+	// Enabled turns the semantic cache on. Default false. It requires
+	// semantic_cache.embedding_model.
+	Enabled bool `yaml:"enabled"`
+	// MinSimilarity is the cosine similarity a match needs, in (0, 1].
+	// Default 0.95.
+	MinSimilarity float64 `yaml:"min_similarity"`
+	// TTL is how long an entry is served. Default 72h.
+	TTL Duration `yaml:"ttl"`
+	// MaxChars is the longest last user message eligible, in characters.
+	// Default 2000.
+	MaxChars int `yaml:"max_chars"`
+}
+
+// CacheConfig holds gateway-wide response-cache limits.
+type CacheConfig struct {
+	// LookupTimeout bounds an exact-cache lookup (namespace version and
+	// entry); a lookup that takes longer is a miss. Default 25ms.
+	LookupTimeout Duration `yaml:"lookup_timeout"`
+	// MaxEntryBytes caps a cached response body; larger responses are not
+	// cached. Default 1MiB.
+	MaxEntryBytes int `yaml:"max_entry_bytes"`
+	// MemoryMaxEntries caps each in-memory cache (storage.mode memory),
+	// which evicts the least recently used entry. Default 10000.
+	MemoryMaxEntries int `yaml:"memory_max_entries"`
+}
+
+// SemanticCacheConfig configures the semantic cache's embeddings.
+type SemanticCacheConfig struct {
+	// EmbeddingModel is the catalog embedding model, or model@provider,
+	// that embeds last user messages. Required when any policy enables the
+	// semantic cache. The message is sent to that deployment.
+	EmbeddingModel string `yaml:"embedding_model"`
+	// LookupTimeout bounds the embedding and the vector search together; a
+	// lookup that takes longer is a miss. Default 150ms.
+	LookupTimeout Duration `yaml:"lookup_timeout"`
 }
 
 // ShadowPolicy opts a policy's traffic into shadow sampling: a fraction of
@@ -553,6 +632,9 @@ type PolicyOverride struct {
 	RoutingMode          string       `yaml:"routing_mode"`
 	MaxCostPerRequestUSD Price        `yaml:"max_cost_per_request_usd"`
 	OnUnmet              string       `yaml:"on_unmet"`
+	// Cache, when set, replaces the policy's whole cache block (with the
+	// same defaults). Only governance rules may set it.
+	Cache *CachePolicy `yaml:"cache"`
 }
 
 // QualityOverride is a measured quality prior for one model and category.

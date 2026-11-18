@@ -51,6 +51,8 @@ type compiled struct {
 	capNano                          int64
 	onUnmet                          string
 	sampleRate                       float64
+	// cache is the policy's cache block with defaults applied.
+	cache config.CachePolicy
 	// governance and quality are the policy's rules of each layer, in
 	// order (see config.IsQualityRule).
 	governance, quality []rule
@@ -65,6 +67,9 @@ type rule struct {
 	// capNano is the rule's max_cost_per_request_usd in nano-USD, or 0
 	// when the rule keeps the policy's cap.
 	capNano int64
+	// cache is the rule's set.cache with defaults applied, or nil when the
+	// rule keeps the policy's cache block.
+	cache *config.CachePolicy
 }
 
 // New builds an engine from a configuration. A loaded configuration has
@@ -102,6 +107,7 @@ func New(cfg *config.Config) (*Engine, error) {
 		maxQualityDrop: config.DefaultMaxQualityDrop,
 		routingMode:    ModeEnforce,
 		onUnmet:        OnUnmetBestEffort,
+		cache:          config.CachePolicyWithDefaults(config.CachePolicy{}),
 	}
 	e.builtin.maxSelectableQuality = e.maxQuality(e.allowed(e.builtin))
 	for i := range cfg.Policies {
@@ -142,6 +148,7 @@ func (e *Engine) compile(p *config.Policy) (*compiled, error) {
 		capNano:         priceNano(p.MaxCostPerRequestUSD),
 		onUnmet:         cmpOr(p.OnUnmet, OnUnmetBestEffort),
 		sampleRate:      p.Shadow.SampleRate,
+		cache:           config.CachePolicyWithDefaults(p.Cache),
 	}
 	if p.Substitution.Mode == "" && p.Substitution.MaxQualityDrop == 0 {
 		// Not loaded through config.Load, which always sets the mode.
@@ -153,6 +160,10 @@ func (e *Engine) compile(p *config.Policy) (*compiled, error) {
 	}
 	for i := range p.Rules {
 		r := rule{Rule: &p.Rules[i], capNano: priceNano(p.Rules[i].Set.MaxCostPerRequestUSD)}
+		if s := p.Rules[i].Set.Cache; s != nil {
+			c := config.CachePolicyWithDefaults(*s)
+			r.cache = &c
+		}
 		refs = append(refs, struct{ what, name string }{"rule " + r.Name + " profile", r.Set.Profile})
 		if !config.IsQualityRule(&r.Match) {
 			c.governance = append(c.governance, r)
@@ -160,7 +171,7 @@ func (e *Engine) compile(p *config.Policy) (*compiled, error) {
 		}
 		s := &r.Set
 		if s.Profile != "" || s.Allow != nil || s.Deny != nil || s.RequireTags != nil || s.Substitution != (config.Substitution{}) ||
-			s.RoutingMode != "" || r.capNano != 0 || s.OnUnmet != "" {
+			s.RoutingMode != "" || r.capNano != 0 || s.OnUnmet != "" || s.Cache != nil {
 			return nil, fmt.Errorf("policy %q: rule %s matches on task, difficulty or input size, so it may only set min_quality and prefer", p.ID, r.Name)
 		}
 		c.quality = append(c.quality, r)
@@ -364,6 +375,7 @@ func (e *Engine) resolve(tenant config.Tenant, keyID string, r Request, soft str
 		MaxCostPerRequestNano: pol.capNano,
 		OnUnmet:               pol.onUnmet,
 		ShadowSampleRate:      pol.sampleRate,
+		Cache:                 pol.cache,
 	}
 	if gov != nil {
 		applyOverride(&eff, gov)
@@ -446,6 +458,9 @@ func applyOverride(eff *Effective, g *rule) {
 	}
 	if s.OnUnmet != "" {
 		eff.OnUnmet = s.OnUnmet
+	}
+	if g.cache != nil {
+		eff.Cache = *g.cache
 	}
 }
 

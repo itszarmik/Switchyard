@@ -125,6 +125,7 @@ func (st *loadState) validate(c *Config) {
 	st.validatePolicyRefs(c.Tenants, refs)
 	st.validateEvaluation(c, models)
 	st.validateShadow(c, models)
+	st.validateCache(c, models)
 	st.checkLiteralSecrets(c)
 }
 

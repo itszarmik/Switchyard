@@ -58,9 +58,9 @@ func handEvents(t testing.TB) []*Event {
 			Cost: m("5"), CostKnown: true, BaselineModel: "gpt", BaselineCost: m("6"),
 			Tags: map[string]string{"team": "search"},
 		},
-		{ // e6: a cache hit.
+		{ // e6: an exact cache hit.
 			ID: "e6", Time: day0.Add(26 * time.Hour), Tenant: "acme", KeyID: "k2", Endpoint: "/v1/chat/completions",
-			RequestedModel: "gpt", Status: 200, CacheStatus: CacheStatusHit, Tokens: Tokens{Input: 10, Output: 20},
+			RequestedModel: "gpt", Status: 200, CacheStatus: CacheStatusExact, Tokens: Tokens{Input: 10, Output: 20},
 			UsageKnown: true, CostKnown: true, BaselineModel: "gpt", BaselineCost: m("0.002"),
 			Profile: "cheap", RoutingMode: RoutingModeEnforce,
 		},
@@ -151,7 +151,7 @@ func TestMemoryLedgerEveryGroupBy(t *testing.T) {
 		{GroupByKey, map[string]int64{"k1": 3, "k2": 2}},
 		{GroupByEndpoint, map[string]int64{"/v1/chat/completions": 4, "/v1/embeddings": 1}},
 		{GroupByStatusClass, map[string]int64{"2xx": 4, "5xx": 1}},
-		{GroupByCacheStatus, map[string]int64{"miss": 4, "hit": 1}},
+		{GroupByCacheStatus, map[string]int64{"miss": 4, "exact": 1}},
 		{GroupByProfile, map[string]int64{"balanced": 1, "cheap": 1, "": 3}},
 		{GroupByRoutingMode, map[string]int64{"enforce": 2, "observe": 1, "": 2}},
 		{"tag:team", map[string]int64{"search": 1, "ads": 1, "": 3}},
@@ -487,7 +487,7 @@ func randomEvents(t testing.TB, seed uint64, n int) []*Event {
 			Stream:         rng.IntN(2) == 0,
 			Status:         []int{200, 200, 200, 400, 429, 499, 500, 502, 0}[rng.IntN(9)],
 			Attempts:       rng.IntN(4),
-			CacheStatus:    pick(CacheStatusMiss, CacheStatusMiss, CacheStatusHit),
+			CacheStatus:    pick(CacheStatusMiss, CacheStatusMiss, CacheStatusExact, CacheStatusSemantic),
 			Tokens: Tokens{
 				Input: rng.Int64N(100_000), CachedInput: rng.Int64N(1000), CacheWrite: rng.Int64N(100), Output: rng.Int64N(10_000),
 			},
@@ -564,21 +564,36 @@ func checkTotalsAgainstEvents(t *testing.T, q Query, r *Report, events []*Event,
 			shadowCost[rowKey{s.Tenant, s.RequestID}] = s.Cost
 		}
 	}
-	var n int64
-	var cost, baseline, overhead, projected Money
+	var n, hits int64
+	var cost, baseline, overhead, projected, routing, cache Money
 	for _, ev := range events {
 		if (q.Tenant != "" && ev.Tenant != q.Tenant) || ev.Time.Before(q.From) || !ev.Time.Before(q.To) {
 			continue
 		}
 		n++
+		hit := ev.CacheStatus == CacheStatusExact || ev.CacheStatus == CacheStatusSemantic
+		if hit {
+			hits++
+		}
 		overhead = overhead.Add(ev.OverheadCost).Add(shadowCost[rowKey{ev.Tenant, ev.ID}])
 		if ev.CostKnown {
 			cost = cost.Add(ev.Cost)
 			baseline = baseline.Add(ev.BaselineCost)
+			if hit {
+				cache = cache.Add(ev.BaselineCost)
+			} else {
+				routing = routing.Add(ev.BaselineCost).Sub(ev.Cost)
+			}
 			if ev.RoutingMode == RoutingModeObserve && ev.ShadowCostKnown {
 				projected = projected.Add(ev.BaselineCost).Sub(ev.ShadowCost)
 			}
 		}
+	}
+	if !r.Totals.SavingsUSD.Cache.Equal(cache) || !r.Totals.SavingsUSD.Routing.Equal(routing) {
+		t.Errorf("savings: cache %s, routing %s; Go sums are %s, %s", r.Totals.SavingsUSD.Cache, r.Totals.SavingsUSD.Routing, cache, routing)
+	}
+	if n > 0 && r.Totals.CacheHitRate != float64(hits)/float64(n) {
+		t.Errorf("cache hit rate = %v, Go %d/%d", r.Totals.CacheHitRate, hits, n)
 	}
 	if !r.Totals.ProjectedSavingsUSD.Equal(projected) {
 		t.Errorf("projected savings = %s, Go sum %s", r.Totals.ProjectedSavingsUSD, projected)

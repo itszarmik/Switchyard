@@ -105,7 +105,7 @@ func newQualityFixture(t *testing.T) qualityFixture {
 	e2 := ev("e2", "acme", "coding", RoutingModeObserve, "3", "3")
 	e2.ShadowDeployment, e2.ShadowCost, e2.ShadowCostKnown = "mini@openai", m("1"), true
 	e4 := ev("e4", "acme", "coding", RoutingModeEnforce, "0", "3")
-	e4.CacheStatus = CacheStatusHit
+	e4.CacheStatus = CacheStatusSemantic
 	f := qualityFixture{events: []*Event{
 		ev("e1", "acme", "coding", RoutingModeEnforce, "1", "3"),
 		e2,

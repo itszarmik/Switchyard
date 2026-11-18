@@ -137,6 +137,31 @@ func TestMoneyMicroUSDCeil(t *testing.T) {
 	}
 }
 
+func TestMoneyNanoUSDCeil(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int64
+	}{
+		{"0", 0},
+		{"0.000000001", 1},
+		{"0.000000000000001", 1},
+		{"0.000000001000001", 2},
+		{"1", 1_000_000_000},
+		{"0.00000008", 80},
+		{"-0.0000000015", -1},
+		{"-0.000000000000001", 0},
+		{"10000000000", math.MaxInt64},
+		{"-10000000000", math.MinInt64},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := mustMoney(t, tt.in).NanoUSDCeil(); got != tt.want {
+				t.Errorf("NanoUSDCeil(%s) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMoneyFloat64(t *testing.T) {
 	for _, tt := range []struct {
 		in   string

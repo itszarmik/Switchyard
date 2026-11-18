@@ -52,7 +52,24 @@ type metrics struct {
 	routeRelaxations *prometheus.CounterVec
 	routeDowngrades  *prometheus.CounterVec
 	projectedSavings prometheus.Gauge
+
+	// Response caches (DESIGN §11, §15.2).
+	savingsCache       prometheus.Gauge
+	cacheLookups       *prometheus.CounterVec
+	cacheWrites        *prometheus.CounterVec
+	cacheSimilarity    *prometheus.HistogramVec
+	cacheLookupSeconds *prometheus.HistogramVec
+	cacheCoalesced     prometheus.Counter
+	overheadUncharged  prometheus.Counter
 }
+
+// similarityBuckets resolve the semantic similarities around the default
+// threshold (0.95), where tuning happens.
+var similarityBuckets = []float64{0.5, 0.6, 0.7, 0.8, 0.85, 0.88, 0.9, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995, 1}
+
+// lookupBuckets cover an exact lookup (well under a millisecond on a local
+// Redis) up to a semantic lookup at its timeout.
+var lookupBuckets = []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.25, 0.5, 1}
 
 var _ health.Observer = (*metrics)(nil)
 
@@ -123,9 +140,36 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 	}, []string{"provider", "model", "class"})
 	m.savings = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "switchyard_savings_usd_total",
-		Help: "Cumulative savings in USD against the baseline, by source (routing). Routing savings are negative when a fallback costs more than the baseline, so this running total can decrease.",
+		Help: "Cumulative savings in USD against the baseline, by source (routing, cache). Routing savings are negative when a fallback costs more than the baseline, so this running total can decrease.",
 	}, []string{"source"})
 	m.savingsRouting = m.savings.WithLabelValues("routing")
+	m.savingsCache = m.savings.WithLabelValues("cache")
+	m.cacheLookups = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_cache_lookups_total",
+		Help: "Response cache lookups of chat requests whose policy enables the layer, by layer (exact, semantic) and result (hit, miss, error, skipped, policy, budget). error is a failure or timeout, served as a miss; skipped is a request not eligible for the layer; policy is an entry, or for semantic the embedding deployment, that the request's policy does not permit, served as a miss; budget is a semantic lookup skipped because a blocking budget had no room for the embedding.",
+	}, []string{"layer", "result"})
+	m.cacheWrites = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "switchyard_cache_writes_total",
+		Help: "Response cache writes after a miss, by layer (exact, semantic) and result (ok, error, dropped when the write pool was full, too_large, not_cacheable).",
+	}, []string{"layer", "result"})
+	m.cacheSimilarity = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "switchyard_cache_similarity",
+		Help:    "Similarity of the nearest semantic cache entry, by outcome (hit, miss against min_similarity), for tuning the threshold.",
+		Buckets: similarityBuckets,
+	}, []string{"outcome"})
+	m.cacheLookupSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "switchyard_cache_lookup_seconds",
+		Help:    "Duration of response cache lookups, by layer: the namespace version and entry read for exact, the embedding and vector search for semantic.",
+		Buckets: lookupBuckets,
+	}, []string{"layer"})
+	m.cacheCoalesced = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "switchyard_cache_coalesced_total",
+		Help: "Identical concurrent non-streaming misses served from another request's upstream call (in-process coalescing).",
+	})
+	m.overheadUncharged = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "switchyard_cache_overhead_uncharged_total",
+		Help: "Semantic cache embedding costs that could not be charged to the request's budgets, because the budget store failed or a blocking budget was already over its limit. The usage ledger still records them as overhead.",
+	})
 	m.budgetRejections = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "switchyard_budget_rejections_total",
 		Help: "Requests answered 429 budget_exceeded because a blocking budget had no room for their estimated cost.",
@@ -167,6 +211,7 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 		m.retries, m.fallbacks, m.transitions, m.cooldowns, m.saturated, m.budgetExhausted,
 		m.cost, m.tokens, m.savings, m.budgetRejections, m.budgetFallbackSkips, m.budgetStoreErrors, m.budgetNotices,
 		m.routeDecisions, m.routeRelaxations, m.routeDowngrades, m.projectedSavings,
+		m.cacheLookups, m.cacheWrites, m.cacheSimilarity, m.cacheLookupSeconds, m.cacheCoalesced, m.overheadUncharged,
 	}
 	if err := registerAll(reg, collectors); err != nil {
 		return nil, err
@@ -190,10 +235,14 @@ func registerAll(reg prometheus.Registerer, collectors []prometheus.Collector) e
 }
 
 // registerHealth registers the gauges read at scrape time: from the health
-// tracker, and the budgets' utilization from g. If it fails, the other
-// metrics are removed again.
+// tracker, the budgets' utilization from g, and the requests waiting on a
+// coalesced call. If it fails, the other metrics are removed again.
 func (m *metrics) registerHealth(reg prometheus.Registerer, t *health.Tracker, g *Gateway) error {
-	if err := registerAll(reg, []prometheus.Collector{healthCollector{t: t}, budgetCollector{g: g}}); err != nil {
+	waiting := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "switchyard_cache_coalesce_waiting",
+		Help: "Requests waiting on another identical request's upstream call (in-process coalescing), at scrape time.",
+	}, func() float64 { return float64(g.cache.coalescer.Followers()) })
+	if err := registerAll(reg, []prometheus.Collector{healthCollector{t: t}, budgetCollector{g: g}, waiting}); err != nil {
 		for _, c := range m.registeredCounters {
 			reg.Unregister(c)
 		}

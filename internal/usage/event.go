@@ -8,13 +8,25 @@ import (
 	"switchyard/internal/config"
 )
 
-// Cache statuses recorded in Event.CacheStatus. Until Phase 6 adds the
-// caches, every event is a miss. Reports count CacheStatusHit as a cache
-// hit; any other value is not.
+// Cache statuses recorded in Event.CacheStatus, the same values as the
+// X-Switchyard-Cache response header (internal/cache). Reports count both
+// CacheStatusExact and CacheStatusSemantic as cache hits (see IsCacheHit);
+// any other value is not one.
 const (
+	// CacheStatusMiss: the response came from an upstream, or the request
+	// was not looked up.
 	CacheStatusMiss = "miss"
-	CacheStatusHit  = "hit"
+	// CacheStatusExact: served from the exact cache.
+	CacheStatusExact = "exact"
+	// CacheStatusSemantic: served from the semantic cache.
+	CacheStatusSemantic = "semantic"
 )
+
+// IsCacheHit reports whether status is a cache hit: CacheStatusExact or
+// CacheStatusSemantic.
+func IsCacheHit(status string) bool {
+	return status == CacheStatusExact || status == CacheStatusSemantic
+}
 
 // Event is the ledger record of one gateway request (DESIGN §12.2),
 // written once when the request completes, whatever its outcome.
@@ -50,7 +62,10 @@ type Event struct {
 	// or "" if the request did not fall back. RouteReason explains the
 	// routing decision.
 	FallbackReason, RouteReason string
-	// CacheStatus is CacheStatusMiss until Phase 6.
+	// CacheStatus is CacheStatusMiss, CacheStatusExact or
+	// CacheStatusSemantic. A hit costs 0, and its baseline cost, the hit's
+	// tokens at the baseline model's price, counts as cache savings
+	// (DESIGN §12.4).
 	CacheStatus string
 
 	// Tokens are the billed token counts. UsageKnown reports whether the

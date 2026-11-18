@@ -4,7 +4,11 @@
 // The result is a plain value the router consumes.
 package policy
 
-import "time"
+import (
+	"time"
+
+	"switchyard/internal/config"
+)
 
 // Routing modes.
 const (
@@ -110,6 +114,12 @@ type Effective struct {
 	// fraction of its requests sampled for shadow evaluation (DESIGN
 	// §10.7); 0 turns sampling off. Rules do not change it.
 	ShadowSampleRate float64
+	// Cache is the cache configuration in force, with defaults applied:
+	// the base policy's cache block, replaced whole by the governance
+	// rule's set.cache when the rule in force sets one. Quality rules and
+	// headers do not change it (the X-Switchyard-Cache header only
+	// narrows it, in the gateway).
+	Cache config.CachePolicy
 	// Warnings explain header values that were ignored because they would
 	// have loosened the policy. The gateway returns them in the
 	// X-Switchyard-Policy-Warning response header.

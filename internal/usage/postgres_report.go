@@ -63,13 +63,19 @@ func (l *reportLimiter) release(tenant string) {
 	}
 }
 
+// cacheHitSQL is the condition of a cache hit, as IsCacheHit decides it:
+// cache_status is one of the hit statuses. They are constants, safe to
+// splice; cache_status is NOT NULL, so NOT cacheHitSQL is the miss
+// condition.
+const cacheHitSQL = "cache_status IN ('" + CacheStatusExact + "', '" + CacheStatusSemantic + "')"
+
 // aggregateSQL selects the sums an accumulator needs, in scanAccumulator's
 // order, from fromSQL. Money sums are exact NUMERIC values, read as text.
 var aggregateSQL = strings.Join(append(append([]string{
 	"count(*)",
 	"count(*) FILTER (WHERE status >= 400)",
 	"count(*) FILTER (WHERE NOT cost_known)",
-	"count(*) FILTER (WHERE cache_status = '" + CacheStatusHit + "')",
+	"count(*) FILTER (WHERE " + cacheHitSQL + ")",
 	"count(*) FILTER (WHERE fallback_reason <> '')",
 	"COALESCE(sum(input_tokens), 0)::bigint",
 	"COALESCE(sum(cached_input_tokens), 0)::bigint",
@@ -78,8 +84,8 @@ var aggregateSQL = strings.Join(append(append([]string{
 	"COALESCE(sum(cost_usd) FILTER (WHERE cost_known), 0)::text",
 	"COALESCE(sum(baseline_cost_usd) FILTER (WHERE cost_known), 0)::text",
 	"COALESCE(sum(overhead_cost_usd), 0)::text",
-	"COALESCE(sum(baseline_cost_usd - cost_usd) FILTER (WHERE cost_known AND cache_status <> '" + CacheStatusHit + "'), 0)::text",
-	"COALESCE(sum(baseline_cost_usd) FILTER (WHERE cost_known AND cache_status = '" + CacheStatusHit + "'), 0)::text",
+	"COALESCE(sum(baseline_cost_usd - cost_usd) FILTER (WHERE cost_known AND NOT " + cacheHitSQL + "), 0)::text",
+	"COALESCE(sum(baseline_cost_usd) FILTER (WHERE cost_known AND " + cacheHitSQL + "), 0)::text",
 	"COALESCE(sum(baseline_cost_usd - shadow_cost_usd) FILTER (WHERE cost_known AND shadow_cost_known AND routing_mode = '" + RoutingModeObserve + "'), 0)::text",
 }, qualitySQL()...),
 	// The sort key: known cost plus overhead, shadow cost included, as
@@ -122,7 +128,7 @@ func qualitySQL() []string {
 			"count(*) FILTER (WHERE "+cat+" AND s_request_id IS NOT NULL AND s_error_kind = '' AND s_acceptable)",
 			"count(*) FILTER (WHERE "+cat+" AND s_request_id IS NOT NULL AND s_error_kind <> '')",
 			"COALESCE(sum("+
-				"CASE WHEN cache_status <> '"+CacheStatusHit+"' THEN baseline_cost_usd - cost_usd ELSE 0 END + "+
+				"CASE WHEN NOT "+cacheHitSQL+" THEN baseline_cost_usd - cost_usd ELSE 0 END + "+
 				"CASE WHEN routing_mode = '"+RoutingModeObserve+"' AND shadow_cost_known THEN baseline_cost_usd - shadow_cost_usd ELSE 0 END"+
 				") FILTER (WHERE "+cat+" AND cost_known), 0)::text",
 		)

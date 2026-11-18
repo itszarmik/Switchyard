@@ -8,7 +8,11 @@
 //
 //	go run ./test/load [-concurrency 200] [-duration 10s] [-warmup 2s]
 //	                   [-mode non-stream|stream] [-max-p99-overhead 5ms]
-//	                   [-bin PATH] [-gateway-log-level info]
+//	                   [-cache off|miss] [-bin PATH] [-gateway-log-level info]
+//
+// With -cache miss, the gateway's policy turns the exact cache on (in
+// memory) and every request is unique, so each one is a lookup that
+// misses and a write: the cost of the lookup on the miss path.
 //
 // Each of the -concurrency workers sends one request at a time, in a closed
 // loop, for -warmup plus -duration; only the requests that start after the
@@ -31,6 +35,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -57,6 +62,8 @@ type options struct {
 	maxP99Overhead time.Duration
 	bin            string
 	logLevel       string
+	// cacheMiss turns the exact cache on and makes every request unique.
+	cacheMiss bool
 }
 
 func main() {
@@ -89,6 +96,7 @@ func parseFlags(args []string, stderr io.Writer) (options, bool) {
 	fs.DurationVar(&o.maxP99Overhead, "max-p99-overhead", 5*time.Millisecond, "fail if the added p99 latency exceeds this")
 	fs.StringVar(&o.bin, "bin", "", "prebuilt switchyard binary (default: go build switchyard/cmd/switchyard)")
 	fs.StringVar(&o.logLevel, "gateway-log-level", "info", "the gateway's log level")
+	cacheMode := fs.String("cache", "off", "off, or miss: the exact cache on, and every request a miss")
 	if err := fs.Parse(args); err != nil {
 		return o, false
 	}
@@ -97,12 +105,15 @@ func parseFlags(args []string, stderr io.Writer) (options, bool) {
 		fmt.Fprintf(stderr, "error: unexpected argument %q\n", fs.Arg(0))
 	case *mode != "non-stream" && *mode != "stream":
 		fmt.Fprintf(stderr, "error: -mode must be non-stream or stream, not %q\n", *mode)
+	case *cacheMode != "off" && *cacheMode != "miss":
+		fmt.Fprintf(stderr, "error: -cache must be off or miss, not %q\n", *cacheMode)
 	case o.concurrency < 1:
 		fmt.Fprintln(stderr, "error: -concurrency must be at least 1")
 	case o.duration <= 0 || o.warmup < 0:
 		fmt.Fprintln(stderr, "error: -duration must be positive and -warmup not negative")
 	default:
 		o.stream = *mode == "stream"
+		o.cacheMiss = *cacheMode == "miss"
 		return o, true
 	}
 	return o, false
@@ -138,7 +149,12 @@ func bench(ctx context.Context, o options, stdout, stderr io.Writer) error {
 		return err
 	}
 	cfgPath := filepath.Join(dir, "switchyard.yaml")
+	var policies []map[string]any
+	if o.cacheMiss {
+		policies = []map[string]any{{"id": "default", "cache": map[string]any{"exact": map[string]any{"enabled": true}}}}
+	}
 	if err := harness.WriteConfig(cfgPath, harness.Config{
+		Policies:        policies,
 		ProviderBaseURL: upstream.BaseURL(),
 		ProviderAPIKey:  "sk-load-test",
 		Models:          []harness.Model{{ID: model, UpstreamModel: model, Capabilities: []string{"streaming", "stream_usage"}}},
@@ -174,6 +190,12 @@ func requestBody(stream bool) []byte {
 		b += `,"stream":true`
 	}
 	return []byte(b + "}")
+}
+
+// uniqueBody returns body, a requestBody, with n appended to its message,
+// so that no two requests share an exact-cache key.
+func uniqueBody(body []byte, n int64) []byte {
+	return bytes.Replace(body, []byte(`short."`), fmt.Appendf(nil, `short. %d"`, n), 1)
 }
 
 // stats are the results of one measurement.
@@ -223,6 +245,7 @@ func measure(ctx context.Context, o options, url, key string, body []byte) (stat
 	}
 	results := make([]workerResult, o.concurrency)
 	var wg sync.WaitGroup
+	var seq atomic.Int64
 	for w := range o.concurrency {
 		wg.Go(func() {
 			r := &results[w]
@@ -231,7 +254,11 @@ func measure(ctx context.Context, o options, url, key string, body []byte) (stat
 				if !began.Before(end) || runCtx.Err() != nil {
 					return
 				}
-				err := send(runCtx, client, url, key, body, o.stream)
+				b := body
+				if o.cacheMiss {
+					b = uniqueBody(body, seq.Add(1))
+				}
+				err := send(runCtx, client, url, key, b, o.stream)
 				latency := time.Since(began)
 				if began.Before(measureFrom) {
 					continue
@@ -300,8 +327,12 @@ func report(w io.Writer, o options, direct, via stats) error {
 	if o.stream {
 		mode = "stream"
 	}
-	fmt.Fprintf(w, "Switchyard overhead: mode %s, concurrency %d, %s measured after a %s warmup, zero-latency fake upstream\n\n",
-		mode, o.concurrency, o.duration, o.warmup)
+	cacheNote := ""
+	if o.cacheMiss {
+		cacheNote = ", exact cache on and every request a miss"
+	}
+	fmt.Fprintf(w, "Switchyard overhead: mode %s, concurrency %d, %s measured after a %s warmup, zero-latency fake upstream%s\n\n",
+		mode, o.concurrency, o.duration, o.warmup, cacheNote)
 	fmt.Fprintln(w, "| target | requests | errors | req/s | p50 | p90 | p99 |")
 	fmt.Fprintln(w, "|---|---:|---:|---:|---:|---:|---:|")
 	row := func(name string, s stats) {
