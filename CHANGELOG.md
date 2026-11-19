@@ -121,7 +121,6 @@ the plan.
 
 - No live provider check has run yet: the smoke test, fixture recording,
   a live judge-quality check and `make semantic-eval` need provider keys.
-- The CI and release workflows had not run when v0.1.0 was tagged.
 - The semantic cache and the shadow runner keep the provider adapters they
   started with until a restart; a deployment removed by a reload stays
   listed in `/admin/v1/providers`.
