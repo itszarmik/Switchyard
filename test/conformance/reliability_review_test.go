@@ -123,9 +123,6 @@ func slowRead(t *testing.T, e *relEnv, pause time.Duration) (status, rest string
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if err := c.(*net.TCPConn).SetReadBuffer(4096); err != nil {
-		t.Fatal(err)
-	}
 	if err := c.SetDeadline(time.Now().Add(callTimeout)); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +146,10 @@ func slowRead(t *testing.T, e *relEnv, pause time.Duration) (status, rest string
 // opens the deployment's breaker for everyone else.
 func TestReliabilitySlowReader(t *testing.T) {
 	const pause = 3 * time.Second
-	// 1000 events of 32 KiB, far more than the socket buffers hold.
+	// 1000 events of 32 KiB, far more than the socket buffers hold, so the
+	// gateway's writes block while the client pauses. The receive buffer
+	// is left at its default: shrinking it caps the TCP window on Linux so
+	// tightly that the client can't read 32 MiB within callTimeout.
 	u := newBulkUpstream(t, 1000, 32<<10, 0)
 	tests := []struct {
 		name   string
@@ -176,8 +176,14 @@ func TestReliabilitySlowReader(t *testing.T) {
 			if strings.Contains(rest, "idle timeout") {
 				t.Errorf("the stream hit the idle timeout while the client was slow")
 			}
-			if chain := e.waitRequestLines(t, 1)[0]["attempt_chain"]; chain != tt.chain {
+			line := e.waitRequestLines(t, 1)[0]
+			if chain := line["attempt_chain"]; chain != tt.chain {
 				t.Errorf("attempt_chain %v, want %s", chain, tt.chain)
+			}
+			// Proves the writes blocked for longer than idle (1s): a stream
+			// the socket buffers absorbed would end before the pause did.
+			if ms, _ := line["duration_ms"].(float64); ms < 1000 {
+				t.Errorf("request took %.0f ms, want > 1000: the writes never blocked", ms)
 			}
 			if got := e.breakerState(t, "m@p"); got != "closed" {
 				t.Errorf("breaker %q after a slow reader, want closed", got)
