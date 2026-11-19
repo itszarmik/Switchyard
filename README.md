@@ -1010,7 +1010,7 @@ The certificate and key are PEM files, read at startup (TLS is restart-only), an
 - [docs/runbook.md](docs/runbook.md): symptom, signal, impact and fix for every degraded mode and alert, and what to do when a key leaks.
 - [deploy/](deploy/): `compose.yaml` (gateway, both Redis instances and Postgres; profiles `observability` with Prometheus, Grafana and Jaeger, and `tei`), `init.sh`, the Prometheus alert rules with their unit tests, and the Grafana dashboard.
 - [test/load/RESULTS.md](test/load/RESULTS.md): the overhead benchmarks, the 1,000 req/s SLO run and the soak, with the hardware they ran on.
-- Releases: `make release-snapshot` builds the archives, checksums and SBOMs locally; a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml), which is written but has never run. Replace `OWNER` in `.goreleaser.yaml`, the image labels and the alert `runbook_url`s with your GitHub owner or registry namespace first.
+- Releases: `make release-snapshot` builds the archives, checksums and SBOMs locally; a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml), which is written but has never run. Images go to `ghcr.io/itszarmik/switchyard`; a fork changes the owner in `.goreleaser.yaml`, the image labels and the alert `runbook_url`s.
 
 ## Docker
 

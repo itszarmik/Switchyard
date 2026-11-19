@@ -35,7 +35,7 @@ tests:
             exp_annotations:
               summary: "Provider openai: 10% of upstream attempts fail"
               description: "More than 5% of attempts to openai have failed for 5 minutes. Requests fall back to other deployments while any remain; see switchyard_upstream_requests_total by outcome."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#provider-outage-and-open-breakers"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#provider-outage-and-open-breakers"
       - eval_time: 15m
         alertname: SwitchyardUpstreamAuthFailures
 
@@ -64,7 +64,7 @@ tests:
             exp_annotations:
               summary: "Circuit breaker for gpt-6-luna@openai keeps opening"
               description: "The deployment gpt-6-luna@openai has been open (routed around) at least once in every 3 minutes for 5 minutes: its half-open probes keep failing. Its traffic goes to the next deployment in each plan. A breaker that tripped and then saw no traffic shows half-open and does not alert."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#provider-outage-and-open-breakers"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#provider-outage-and-open-breakers"
       - eval_time: 20m
         alertname: SwitchyardCircuitBreakerOpen
         exp_alerts:
@@ -74,7 +74,7 @@ tests:
             exp_annotations:
               summary: "Circuit breaker for gpt-6-luna@openai keeps opening"
               description: "The deployment gpt-6-luna@openai has been open (routed around) at least once in every 3 minutes for 5 minutes: its half-open probes keep failing. Its traffic goes to the next deployment in each plan. A breaker that tripped and then saw no traffic shows half-open and does not alert."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#provider-outage-and-open-breakers"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#provider-outage-and-open-breakers"
 
   # Budgets, dropped usage events and a failed reload fire at once.
   - interval: 1m
@@ -99,7 +99,7 @@ tests:
             exp_annotations:
               summary: "Budget default/month is at 91%"
               description: "A blocking budget rejects requests with 429 budget_exceeded once its limit is reached; a notify budget keeps serving."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#budget-exhausted"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#budget-exhausted"
       - eval_time: 3m
         alertname: SwitchyardUsageEventsDropped
         exp_alerts:
@@ -108,7 +108,7 @@ tests:
             exp_annotations:
               summary: "12 usage events dropped in 5 minutes"
               description: "The usage queue overflowed and dropped its oldest events: the ledger, usage reports and savings are missing those requests. Budgets are unaffected (they are counted in Redis)."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#usage-events-dropped"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#usage-events-dropped"
       - eval_time: 3m
         alertname: SwitchyardConfigReloadFailed
         exp_alerts:
@@ -120,7 +120,7 @@ tests:
             exp_annotations:
               summary: "A config reload failed on gw:9090"
               description: "The new config was rejected and the previous one is still serving. The gateway log line for the reload says why."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#config-reload-failed"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#config-reload-failed"
 
   # Overhead p99 at about 50 ms for 15 minutes.
   - interval: 1m
@@ -144,7 +144,7 @@ tests:
             exp_annotations:
               summary: "Gateway overhead p99 is 46ms"
               description: "The time requests spend in the gateway itself, excluding the upstream, has had a p99 above 25 ms for 10 minutes."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#gateway-overhead-high"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#gateway-overhead-high"
 
   # The state Redis fails: the alert fires from the rate-limit store's
   # errors alone, without any budget-store series.
@@ -167,7 +167,7 @@ tests:
             exp_annotations:
               summary: "The state Redis is failing: budgets and rate limits are in fail mode"
               description: "With fail_mode open, requests are served without budget or rate-limit enforcement (per-request cost caps still apply); with closed, they get 503."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#state-redis-down-budgets-and-rate-limits"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#state-redis-down-budgets-and-rate-limits"
       - eval_time: 16m
         alertname: SwitchyardCacheErrorRateHigh
         exp_alerts:
@@ -177,7 +177,7 @@ tests:
             exp_annotations:
               summary: "exact cache: 30% of lookups fail"
               description: "Failed or timed-out cache lookups are served as misses. For the exact layer, check the cache Redis; for semantic, also the embedding deployment."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#cache-redis-down"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#cache-redis-down"
 
   - interval: 1m
     input_series:
@@ -196,7 +196,7 @@ tests:
             exp_annotations:
               summary: "Prometheus cannot scrape gateway:9090"
               description: "The gateway's admin listener has not answered for 2 minutes: the process is down, restarting, or unreachable."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#gateway-down"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#gateway-down"
 
   # The collector refused one export of 40 spans.
   - interval: 1m
@@ -214,4 +214,4 @@ tests:
             exp_annotations:
               summary: "40 trace spans dropped in 15 minutes"
               description: "The trace exporter could not deliver spans to the collector (telemetry.tracing.endpoint), or its queue was full. Requests are unaffected; traces are incomplete."
-              runbook_url: "https://github.com/OWNER/switchyard/blob/main/docs/runbook.md#trace-spans-dropped"
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#trace-spans-dropped"

@@ -13,7 +13,7 @@ ARG TARGETPLATFORM
 
 LABEL org.opencontainers.image.title="switchyard" \
       org.opencontainers.image.description="Cost-aware, OpenAI-compatible LLM inference gateway" \
-      org.opencontainers.image.source="https://github.com/OWNER/switchyard"
+      org.opencontainers.image.source="https://github.com/itszarmik/Switchyard"
 
 COPY ${TARGETPLATFORM}/switchyard /usr/local/bin/switchyard
 COPY configs/quickstart.yaml /etc/switchyard/switchyard.yaml

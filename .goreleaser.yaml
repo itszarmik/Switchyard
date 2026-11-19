@@ -14,9 +14,10 @@
 # on a runner with Docker Buildx and QEMU set up (docker/setup-qemu-action
 # and docker/setup-buildx-action), logged in to ghcr.io
 # (docker/login-action with GITHUB_TOKEN and packages: write), and with
-# GITHUB_TOKEN for the GitHub release. OWNER below is a placeholder:
-# replace it with the GitHub owner of the repository (it is also in the
-# image labels of deploy/Dockerfile and the alerts' runbook URLs).
+# GITHUB_TOKEN for the GitHub release. The repository is
+# github.com/itszarmik/Switchyard; a fork changes the owner here, in the
+# image labels of deploy/Dockerfile and in the alerts' runbook URLs. Image
+# names on ghcr.io must be lowercase.
 version: 2
 
 project_name: switchyard
@@ -96,7 +97,7 @@ dockers_v2:
     ids: [switchyard]
     dockerfile: deploy/Dockerfile.release
     images:
-      - ghcr.io/OWNER/switchyard
+      - ghcr.io/itszarmik/switchyard
     tags:
       - "v{{ .Version }}"
       - "{{ if not .Prerelease }}v{{ .Major }}.{{ .Minor }}{{ end }}"
@@ -111,7 +112,7 @@ dockers_v2:
       org.opencontainers.image.version: "v{{ .Version }}"
       org.opencontainers.image.revision: "{{ .FullCommit }}"
       org.opencontainers.image.created: "{{ .CommitDate }}"
-      org.opencontainers.image.source: https://github.com/OWNER/switchyard
+      org.opencontainers.image.source: https://github.com/itszarmik/Switchyard
     sbom: true
 
 snapshot:
@@ -127,8 +128,8 @@ changelog:
 
 release:
   github:
-    owner: OWNER
-    name: switchyard
+    owner: itszarmik
+    name: Switchyard
   draft: true
   prerelease: auto
   name_template: "v{{ .Version }}"

@@ -4,7 +4,7 @@ All notable changes to Switchyard. Versions follow [Semantic
 Versioning](https://semver.org/); before 1.0, a minor version may change
 the configuration or the API.
 
-## v0.1.0 (unreleased)
+## v0.1.0 (2026-11-19)
 
 The first release: a cost-aware, OpenAI-compatible LLM gateway you can run
 in production and self-host (milestone M4 of [docs/PLAN.md](docs/PLAN.md)).
@@ -121,9 +121,7 @@ the plan.
 
 - No live provider check has run yet: the smoke test, fixture recording,
   a live judge-quality check and `make semantic-eval` need provider keys.
-- The CI and release workflows have not run yet. `OWNER` in
-  `.goreleaser.yaml`, the image labels and the alert runbook URLs is a
-  placeholder for your GitHub owner or registry.
+- The CI and release workflows had not run when v0.1.0 was tagged.
 - The semantic cache and the shadow runner keep the provider adapters they
   started with until a restart; a deployment removed by a reload stays
   listed in `/admin/v1/providers`.

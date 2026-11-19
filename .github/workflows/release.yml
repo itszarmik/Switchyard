@@ -1,9 +1,7 @@
 # Release: on a v* tag, run every pre-merge check, then GoReleaser
 # (.goreleaser.yaml): binaries, archives, checksums, CycloneDX SBOMs, a
 # draft GitHub release, and multi-arch images on ghcr.io built with Buildx
-# and QEMU. Written for v0.1.0 but never run yet. Before the first tag,
-# replace OWNER in .goreleaser.yaml (and the image labels and alert
-# runbook URLs) with the repository's GitHub owner.
+# and QEMU, published as ghcr.io/itszarmik/switchyard. Written for v0.1.0.
 #
 # Supply chain: every action is pinned by its full commit SHA, with the
 # release tag it was resolved from in the comment, so a moved tag cannot

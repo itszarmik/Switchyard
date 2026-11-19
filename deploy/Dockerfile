@@ -55,7 +55,7 @@ ARG COMMIT=
 
 LABEL org.opencontainers.image.title="switchyard" \
       org.opencontainers.image.description="Cost-aware, OpenAI-compatible LLM inference gateway" \
-      org.opencontainers.image.source="https://github.com/OWNER/switchyard" \
+      org.opencontainers.image.source="https://github.com/itszarmik/Switchyard" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}"
 
