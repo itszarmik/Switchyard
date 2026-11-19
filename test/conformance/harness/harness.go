@@ -99,6 +99,12 @@ type Config struct {
 	// Policies, when set, is written as the policies section, for example
 	// [{"id": "default", "cache": {"exact": {"enabled": true}}}].
 	Policies []map[string]any
+	// KeyRateLimit, when set, is written as the key's rate_limit, for
+	// example {"requests_per_minute": 600000, "max_concurrent_streams": 100}.
+	KeyRateLimit map[string]any
+	// Telemetry, when set, is written as the telemetry section, for
+	// example {"tracing": {"enabled": true, "endpoint": "http://…"}}.
+	Telemetry map[string]any
 }
 
 // YAML renders c as a switchyard config file. Both listeners bind
@@ -129,8 +135,9 @@ func (c Config) YAML() ([]byte, error) {
 			Deployments  []deployment `yaml:"deployments"`
 		}
 		key struct {
-			ID   string `yaml:"id"`
-			Hash string `yaml:"hash"`
+			ID        string         `yaml:"id"`
+			Hash      string         `yaml:"hash"`
+			RateLimit map[string]any `yaml:"rate_limit,omitempty"`
 		}
 		tenant struct {
 			ID   string `yaml:"id"`
@@ -145,6 +152,7 @@ func (c Config) YAML() ([]byte, error) {
 			Tenants []tenant          `yaml:"tenants,omitempty"`
 			Routing map[string]any    `yaml:"routing,omitempty"`
 			Pols    []map[string]any  `yaml:"policies,omitempty"`
+			Tele    map[string]any    `yaml:"telemetry,omitempty"`
 		}
 	)
 	dur := func(d time.Duration) string {
@@ -181,13 +189,14 @@ func (c Config) YAML() ([]byte, error) {
 		Provs:   []provider{p},
 		Routing: c.Routing,
 		Pols:    c.Policies,
+		Tele:    c.Telemetry,
 	}
 	for _, m := range c.Models {
 		f.Models = append(f.Models, model{ID: m.ID, Capabilities: m.Capabilities,
 			Deployments: []deployment{{Provider: ProviderID, UpstreamModel: m.UpstreamModel}}})
 	}
 	if c.KeyHash != "" {
-		f.Tenants = []tenant{{ID: TenantID, Keys: []key{{ID: KeyID, Hash: c.KeyHash}}}}
+		f.Tenants = []tenant{{ID: TenantID, Keys: []key{{ID: KeyID, Hash: c.KeyHash, RateLimit: c.KeyRateLimit}}}}
 	}
 	b, err := yaml.Marshal(f)
 	if err != nil {

@@ -30,6 +30,15 @@ type Adapter interface {
 	ChatStream(ctx context.Context, req *Request) (Stream, error)
 }
 
+// Options are an adapter's settings that do not come from its provider's
+// config.
+type Options struct {
+	// PropagateTrace sends the W3C traceparent of the request context's
+	// span upstream (telemetry.tracing.propagate_upstream; see
+	// tracing.Transport). Off, the adapter adds no trace headers.
+	PropagateTrace bool
+}
+
 // Request is one upstream call.
 type Request struct {
 	// Chat is the client's request.

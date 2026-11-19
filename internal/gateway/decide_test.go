@@ -89,7 +89,7 @@ func newTierEnv(t *testing.T, edit func(*config.Config), opts func(*Options)) *t
 		t.Fatal(err)
 	}
 	e.g = g
-	g.adapters["ps"], g.adapters["pm"], g.adapters["pl"], g.adapters["pe"] = e.s, e.m, e.l, e.e
+	g.current().adapters["ps"], g.current().adapters["pm"], g.current().adapters["pl"], g.current().adapters["pe"] = e.s, e.m, e.l, e.e
 	return e
 }
 
@@ -421,7 +421,7 @@ func TestSoftBudgetDowngrade(t *testing.T) {
 	if r := e.do(EndpointChatCompletions, hiBody, HeaderDifficulty, "0.6"); r.info.Model != "medium" || r.info.RouteReason != reasonCheapest {
 		t.Fatalf("before the threshold: %+v", r.info)
 	}
-	scope := e.g.scopes[principal{"t1", "k1"}][0]
+	scope := e.g.current().scopes[principal{"t1", "k1"}][0]
 	if _, err := e.store.Admit(context.Background(), []budget.Scope{scope}, 600_000, e.now); err != nil {
 		t.Fatal(err)
 	}

@@ -231,8 +231,8 @@ func TestCacheDroppedParamsOnHit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			g.adapters["cheap"], g.adapters["rich"] = &fullAdapter{chatAdapter{name: "cheap"}}, &fullAdapter{chatAdapter{name: "rich"}}
-			g.adapters["claude"] = &chatAdapter{name: "claude"}
+			g.current().adapters["cheap"], g.current().adapters["rich"] = &fullAdapter{chatAdapter{name: "cheap"}}, &fullAdapter{chatAdapter{name: "rich"}}
+			g.current().adapters["claude"] = &chatAdapter{name: "claude"}
 			do := func(body string) exchangeResult {
 				ctx, ann := annotated(logs)
 				x := &recExchange{body: []byte(body)}
@@ -311,7 +311,7 @@ func TestCacheSemanticBudget(t *testing.T) {
 	}
 	spent := func(t *testing.T, e *cacheEnv) int64 {
 		t.Helper()
-		n, err := e.g.budgets.Spent(context.Background(), e.g.scopes[principal{"t1", "k1"}][0], e.now)
+		n, err := e.g.budgets.Spent(context.Background(), e.g.current().scopes[principal{"t1", "k1"}][0], e.now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -348,7 +348,7 @@ func TestCacheSemanticBudget(t *testing.T) {
 		e.do(EndpointChatCompletions, franceQ, nil)
 		e.wait()
 		// Spend the rest of the budget.
-		scope := e.g.scopes[principal{"t1", "k1"}][0]
+		scope := e.g.current().scopes[principal{"t1", "k1"}][0]
 		if _, err := e.g.budgets.Admit(context.Background(), []budget.Scope{scope}, scope.LimitMicro-spent(t, e), e.now); err != nil {
 			t.Fatal(err)
 		}
@@ -458,7 +458,7 @@ func TestCacheDowngradedNotWritten(t *testing.T) {
 			SoftAt: 0.5, SoftProfile: "cheap", OnExhausted: config.BudgetBlock,
 		}}
 	}, nil)
-	scope := e.g.scopes[principal{"t1", "k1"}][0]
+	scope := e.g.current().scopes[principal{"t1", "k1"}][0]
 	if _, err := e.store.Admit(context.Background(), []budget.Scope{scope}, 600_000, e.now); err != nil {
 		t.Fatal(err)
 	}

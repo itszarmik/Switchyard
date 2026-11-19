@@ -16,7 +16,7 @@ import (
 // a policy without a baseline_model allows none. The caller is the
 // principal the auth middleware stored in ctx, or the default policy's
 // caller without one.
-func (g *Gateway) ListModels(ctx context.Context) []Model {
+func (g *snapshot) ListModels(ctx context.Context) []Model {
 	models := g.catalog.Models()
 	aliases := g.catalog.Aliases()
 	var virtual []string

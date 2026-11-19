@@ -1,19 +1,112 @@
-# Development dependencies for Switchyard: two Redis instances and Postgres.
-# This file does not run the gateway itself.
+# Switchyard with its dependencies: the "small production" tier of DESIGN
+# §18.1. See docs/quickstart.md.
 #
-#   make dev-up     start and wait until every service is healthy
-#   make dev-down   stop (add -v to the compose command to delete the data)
+#   ./init.sh                      once: writes .env (keys and secrets)
+#   docker compose up -d --wait    gateway, redis-cache, redis-state, postgres
+#   docker compose --profile observability up -d --wait
+#                                  plus Prometheus, Grafana and Jaeger (set
+#                                  SWITCHYARD_TRACING_ENABLED=true in .env)
+#   docker compose --profile tei up -d --wait
+#                                  plus a local embedding model (a large
+#                                  image; see the tei service)
+#   docker compose down            stop; add -v to delete the data
 #
-# DEV ONLY. Nothing here is hardened: Redis has no password, and Postgres
-# uses throwaway credentials. Ports bind to 127.0.0.1 so they are not
-# reachable from other machines.
-name: switchyard-dev
+# From the repository root, `make compose-up` and `make compose-down` do the
+# same. `make dev-up` and `make test-integration` start only the three
+# dependencies from this file.
+#
+# Every published port binds to 127.0.0.1 by default. The dependencies are
+# published only for development and the integration tests; the gateway
+# reaches them over the compose network. Redis has no password and Postgres
+# uses the throwaway password "switchyard" unless POSTGRES_PASSWORD is set
+# before the first start: keep them on a private network (DESIGN §17).
+#
+# Images are pinned to a version and the digest of its multi-arch index, so
+# a re-pushed tag cannot change what runs (tei, a large optional profile,
+# to its version only). To bump one, resolve the new tag's digest with
+# `docker buildx imagetools inspect <image>:<tag>` (the "Digest:" line) and
+# replace tag and digest together. A Postgres major upgrade needs a dump
+# and restore of the postgres-data volume; a minor one does not.
+name: switchyard
+
+x-healthcheck: &healthcheck
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 5s
 
 services:
+  gateway:
+    image: ${SWITCHYARD_IMAGE:-switchyard:dev}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["serve", "--config", "/etc/switchyard/config/switchyard.yaml"]
+    # Hardened: a read-only root filesystem (nothing is written at runtime),
+    # the image's non-root user, no capabilities and no privilege escalation.
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # The config directory, not the file, so an edit saved by rename (most
+    # editors, sed -i) is seen by a reload; see config/switchyard.yaml.
+    volumes:
+      - ./config:/etc/switchyard/config:ro
+      - ../configs/catalog:/etc/switchyard/catalog:ro
+    # Only these variables reach the container; values come from .env or
+    # the shell. A variable that is unset is not passed at all.
+    environment:
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      - GEMINI_API_KEY
+      - TOGETHER_API_KEY
+      - SWITCHYARD_OPENAI_BASE_URL
+      - SWITCHYARD_ANTHROPIC_BASE_URL
+      - SWITCHYARD_ALLOW
+      - SWITCHYARD_ADMIN_TOKEN
+      - SWITCHYARD_API_KEY_HASH
+      - SWITCHYARD_LOG_LEVEL
+      - SWITCHYARD_MONTHLY_BUDGET_USD
+      - SWITCHYARD_TRACING_ENABLED
+      - SWITCHYARD_TRACING_ENDPOINT
+      - SWITCHYARD_TRACING_SAMPLE_RATIO
+      - SWITCHYARD_SEMANTIC_CACHE
+      - SWITCHYARD_EMBEDDING_MODEL
+      # Managed Redis and Postgres: set these in .env. Unset, the Redis URLs
+      # default (in config/switchyard.yaml) to the services below, and the
+      # DSN to the postgres service.
+      - REDIS_CACHE_URL
+      - REDIS_STATE_URL
+      - DATABASE_URL=${DATABASE_URL:-postgres://switchyard:${POSTGRES_PASSWORD:-switchyard}@postgres:5432/switchyard?sslmode=disable}
+    ports:
+      - "${SWITCHYARD_BIND:-127.0.0.1}:${SWITCHYARD_PORT:-8080}:8080"
+      # The admin listener (/metrics, /admin/v1/*): loopback only, always.
+      - "127.0.0.1:${SWITCHYARD_ADMIN_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/switchyard", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+      redis-state:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # The gateway exits within shutdown_delay + shutdown_grace + 15s of
+    # SIGTERM (the 15s: shadow and cache writes, the usage flush, the span
+    # flush and the log drain): 0s + 60s + 15s with config/switchyard.yaml's
+    # values. Raise it with either setting.
+    stop_grace_period: 75s
+    restart: unless-stopped
+
   # Evictable cache (DESIGN §11.5): bounded memory, least-recently-used keys
-  # are evicted, and nothing is persisted.
+  # are evicted, and nothing is persisted. Every failure is a cache miss.
   redis-cache:
-    image: redis:8
+    image: redis:8.10@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
     command:
       - redis-server
       - --maxmemory
@@ -25,18 +118,17 @@ services:
       - --appendonly
       - "no"
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${SWITCHYARD_REDIS_CACHE_PORT:-6379}:6379"
     healthcheck:
+      <<: *healthcheck
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+    restart: unless-stopped
 
-  # Non-evictable state (budgets, limits): writes fail rather than evict, and
-  # the append-only file survives restarts.
+  # Non-evictable state (budgets, rate limits, cache namespace versions):
+  # writes fail rather than evict, and the append-only file survives
+  # restarts.
   redis-state:
-    image: redis:8
+    image: redis:8.10@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
     command:
       - redis-server
       - --maxmemory-policy
@@ -44,36 +136,113 @@ services:
       - --appendonly
       - "yes"
     ports:
-      - "127.0.0.1:6380:6379"
+      - "127.0.0.1:${SWITCHYARD_REDIS_STATE_PORT:-6380}:6379"
     volumes:
       - redis-state-data:/data
     healthcheck:
+      <<: *healthcheck
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+    restart: unless-stopped
 
   # Usage ledger. Host port 5433, because 5432 is often taken by a local
   # (for example Homebrew) Postgres.
   postgres:
-    image: postgres:17
+    image: postgres:17.11@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
     environment:
-      # DEV ONLY: throwaway credentials for a local database. Never reuse them.
       POSTGRES_USER: switchyard
-      POSTGRES_PASSWORD: switchyard
+      # Throwaway unless set in .env before the first start: the password
+      # is fixed when the volume is initialized. The integration tests
+      # (make test-integration) expect the default.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-switchyard}
       POSTGRES_DB: switchyard
     ports:
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:${SWITCHYARD_POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
+      <<: *healthcheck
       test: ["CMD-SHELL", "pg_isready -U switchyard -d switchyard"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
       start_period: 10s
+    restart: unless-stopped
+
+  # ---- profile observability --------------------------------------------
+
+  # Scrapes the gateway's admin listener and evaluates the alert rules
+  # (prometheus/alerts.yml). There is no Alertmanager here: firing alerts
+  # show at http://127.0.0.1:9091/alerts; point alerting.alertmanagers at
+  # yours to route them.
+  prometheus:
+    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${SWITCHYARD_PROMETHEUS_PORT:-9091}:9090"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+    depends_on: [gateway]
+    restart: unless-stopped
+
+  # The Switchyard dashboard and the Prometheus and Jaeger datasources are
+  # provisioned. Log in at http://127.0.0.1:3000 as admin with
+  # GRAFANA_ADMIN_PASSWORD (default admin; Grafana asks to change it).
+  grafana:
+    image: grafana/grafana:13.2.6@sha256:b21409d7951ddcfd63a4b49083e4ef2cc35bc1437d071813bf82bfb238b00bca
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/switchyard.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${SWITCHYARD_GRAFANA_PORT:-3000}:3000"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      start_period: 30s
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+  # Receives the gateway's traces over OTLP/HTTP on 4318 (the gateway's
+  # telemetry.tracing.endpoint default, http://jaeger:4318) and keeps them
+  # in memory. UI: http://127.0.0.1:16686.
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0@sha256:3823829974ccfc2485d2e48b165579091f32295022ae80ca49704e2f4834116e
+    profiles: [observability]
+    ports:
+      - "127.0.0.1:${SWITCHYARD_JAEGER_UI_PORT:-16686}:16686"
+    restart: unless-stopped
+
+  # ---- profile tei -------------------------------------------------------
+
+  # Hugging Face Text Embeddings Inference (CPU), for a self-hosted semantic
+  # cache: set SWITCHYARD_SEMANTIC_CACHE=true and
+  # SWITCHYARD_EMBEDDING_MODEL=bge-small-en-v1.5 in .env. The image is large
+  # (over 1 GB) and downloads the model on first start into the tei-data
+  # volume. Use the image tag for your hardware: cpu-* here, a CUDA tag for
+  # GPUs.
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.3
+    profiles: [tei]
+    command: ["--model-id", "BAAI/bge-small-en-v1.5", "--port", "80"]
+    volumes:
+      - tei-data:/data
+    restart: unless-stopped
 
 volumes:
   redis-state-data:
   postgres-data:
+  prometheus-data:
+  grafana-data:
+  tei-data:

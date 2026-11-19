@@ -93,32 +93,59 @@ func fakeEnv(key string) (string, bool) {
 }
 
 // logBuffer is a concurrency-safe log sink that signals when the server
-// logs its bound addresses.
+// logs its bound addresses. The app writes to it through its asynchronous
+// log writer; once attached to the app, String flushes that writer first,
+// so it returns every line logged before the call.
 type logBuffer struct {
 	mu        sync.Mutex
 	buf       bytes.Buffer
 	listening chan string // receives the "listening" line
+	flush     func()
 }
 
 func newLogBuffer() *logBuffer { return &logBuffer{listening: make(chan string, 1)} }
 
+// Write records p, which the asynchronous writer may batch: several whole
+// lines.
 func (b *logBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// slog handlers write one whole line per call.
-	if bytes.Contains(p, []byte(`"msg":"listening"`)) {
-		select {
-		case b.listening <- string(p):
-		default:
+	for line := range bytes.Lines(p) {
+		if bytes.Contains(line, []byte(`"msg":"listening"`)) {
+			select {
+			case b.listening <- string(line):
+			default:
+			}
 		}
 	}
 	return b.buf.Write(p)
 }
 
+// attach makes String flush a's log writer first.
+func (b *logBuffer) attach(a *App) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.flush = func() { flushLogs(a) }
+}
+
 func (b *logBuffer) String() string {
+	b.mu.Lock()
+	flush := b.flush
+	b.mu.Unlock()
+	if flush != nil {
+		flush()
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// flushLogs waits until a's log writer has written every line queued so
+// far.
+func flushLogs(a *App) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = a.logWriter.Flush(ctx)
 }
 
 func loadSnapshot(t *testing.T, yaml string) *config.Snapshot {
@@ -162,6 +189,7 @@ func startApp(t *testing.T, snap *config.Snapshot, logs *logBuffer) *running {
 // once it is listening.
 func startBuilt(t *testing.T, a *App, logs *logBuffer) *running {
 	t.Helper()
+	logs.attach(a)
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &running{cancel: cancel, runErr: make(chan error, 1)}
 	go func() { r.runErr <- a.Run(ctx, context.Background()) }()
@@ -307,14 +335,16 @@ func TestNew(t *testing.T) {
 	t.Run("startup logs", func(t *testing.T) {
 		restoreDefaultLogger(t)
 		// Binding every interface for the admin listener is a warning.
-		snap := loadSnapshot(t, strings.Replace(secretConfig, "admin_listen: 127.0.0.1:0", "admin_listen: :0", 1))
+		snap := loadSnapshot(t, strings.Replace(secretConfig, "admin_listen: 127.0.0.1:0", "admin_listen: :0\n  admin_token: test.admin.token.value.for.app.tests", 1))
 		if len(snap.Warnings()) == 0 {
 			t.Fatal("the test config has no warnings")
 		}
 		var buf bytes.Buffer
-		if _, err := testNew(snap, &buf); err != nil {
+		a, err := testNew(snap, &buf)
+		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
+		flushLogs(a)
 		lines := map[string]map[string]any{}
 		for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
 			var m map[string]any
@@ -346,9 +376,11 @@ func TestNew(t *testing.T) {
 		restoreDefaultLogger(t)
 		snap := loadSnapshot(t, strings.Replace(secretConfig, "level: debug", "level: info", 1))
 		var buf bytes.Buffer
-		if _, err := testNew(snap, &buf); err != nil {
+		a, err := testNew(snap, &buf)
+		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
+		flushLogs(a)
 		if strings.Contains(buf.String(), "effective config") {
 			t.Errorf("the config was dumped at info level:\n%s", buf.String())
 		}
@@ -498,8 +530,13 @@ func TestAPIRequestsCounted(t *testing.T) {
 
 // testNew is New with a memory ledger and memory budgets whatever the
 // config says, so that the tests need no Postgres or Redis.
+// When logOutput is a *logBuffer, it is attached to the app.
 func testNew(snap *config.Snapshot, logOutput io.Writer) (*App, error) {
-	return newApp(snap, logOutput, func(*config.Config, prometheus.Registerer, *slog.Logger) (storage, error) {
+	a, err := newApp(snap, logOutput, func(*config.Config, prometheus.Registerer, *slog.Logger) (storage, error) {
 		return storage{ledger: usage.NewMemoryLedger(), budgets: budget.NewMemoryStore()}, nil
 	})
+	if lb, ok := logOutput.(*logBuffer); ok && err == nil {
+		lb.attach(a)
+	}
+	return a, err
 }

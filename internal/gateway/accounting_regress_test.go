@@ -33,7 +33,7 @@ func tenantDayBudget(t *testing.T, micro int64) []config.Budget {
 // spent returns what t1's first budget has spent today.
 func (e *acctEnv) spent(t *testing.T) int64 {
 	t.Helper()
-	n, err := e.store.Spent(context.Background(), e.g.scopes[principal{"t1", "k1"}][0], e.now)
+	n, err := e.store.Spent(context.Background(), e.g.current().scopes[principal{"t1", "k1"}][0], e.now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestUnpricedRefusedByExhaustedBudget(t *testing.T) {
 	body := `{"model":"m","max_tokens":100000,"messages":[{"role":"user","content":"hi"}]}`
 
 	e := newAcctEnv(t, tenantDayBudget(t, 100), nil, unpriced)
-	if _, err := e.store.Admit(context.Background(), []budget.Scope{e.g.scopes[principal{"t1", "k1"}][0]}, 100, e.now); err != nil {
+	if _, err := e.store.Admit(context.Background(), []budget.Scope{e.g.current().scopes[principal{"t1", "k1"}][0]}, 100, e.now); err != nil {
 		t.Fatal(err)
 	}
 	for i := range 3 {
@@ -221,7 +221,7 @@ func TestBrokenStreamUsageEstimated(t *testing.T) {
 // recorded with the 500 its client gets, and still settled.
 func TestPanicEventStatus(t *testing.T) {
 	e := newAcctEnv(t, tenantDayBudget(t, 1_000_000), nil, nil)
-	e.g.adapters["a"] = panicky{e.a}
+	e.g.current().adapters["a"] = panicky{e.a}
 	func() {
 		defer func() {
 			if recover() == nil {

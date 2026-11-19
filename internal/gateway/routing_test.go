@@ -194,7 +194,7 @@ func newRoutingEnv(t *testing.T, drop bool) *routingEnv {
 		t.Fatal(err)
 	}
 	e := &routingEnv{g: g, cheap: &fullAdapter{chatAdapter{name: "cheap"}}, rich: &fullAdapter{chatAdapter{name: "rich"}}, claude: &chatAdapter{name: "claude"}, logs: logs}
-	g.adapters["cheap"], g.adapters["rich"], g.adapters["claude"] = e.cheap, e.rich, e.claude
+	g.current().adapters["cheap"], g.current().adapters["rich"], g.current().adapters["claude"] = e.cheap, e.rich, e.claude
 	return e
 }
 

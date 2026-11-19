@@ -72,9 +72,9 @@ func newShadowEnv(t *testing.T, mode string, rate float64, edits ...func(*config
 		t.Fatal(err)
 	}
 	e := &shadowEnv{g: g, cheap: &chatAdapter{name: "cheap"}, rich: &chatAdapter{name: "rich"}, sink: sink, sh: &captureShadow{}, logs: logs}
-	g.adapters["cheap"], g.adapters["rich"] = e.cheap, e.rich
-	if _, ok := g.adapters["mid"]; ok {
-		g.adapters["mid"] = &chatAdapter{name: "mid"}
+	g.current().adapters["cheap"], g.current().adapters["rich"] = e.cheap, e.rich
+	if _, ok := g.current().adapters["mid"]; ok {
+		g.current().adapters["mid"] = &chatAdapter{name: "mid"}
 	}
 	g.SetShadow(e.sh)
 	return e

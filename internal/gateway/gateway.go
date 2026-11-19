@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -42,6 +43,7 @@ import (
 	"switchyard/internal/providers/anthropic"
 	"switchyard/internal/providers/openai"
 	"switchyard/internal/quality"
+	"switchyard/internal/ratelimit"
 	"switchyard/internal/router"
 	"switchyard/internal/usage"
 )
@@ -87,6 +89,15 @@ type Options struct {
 	// Cache holds the response caches (DESIGN §11). Its zero value keeps
 	// them in memory.
 	Cache CacheOptions
+	// Streams, when set, caps each key's concurrent streams: a streaming
+	// chat or legacy completion request takes a slot once it is decoded,
+	// a cached replay included, and holds it until its response ends. Nil
+	// caps nothing.
+	Streams StreamLimiter
+	// PropagateTrace makes the adapters send the W3C traceparent upstream
+	// (telemetry.tracing.propagate_upstream). Like the rest of
+	// telemetry, it is read once, by New, and kept across reloads.
+	PropagateTrace bool
 	// Offline makes a gateway for explaining routing decisions without
 	// live state (switchyard route explain): every deployment counts as
 	// healthy, latency estimates come from the catalog's hints, and every
@@ -98,54 +109,98 @@ type Options struct {
 
 // Gateway serves the OpenAI-compatible endpoints. It is safe for concurrent
 // use.
+//
+// Its state comes in two parts. The long-lived part (shared) is built once,
+// by New: the metrics, the health tracker, whose breaker, cooldown and
+// latency state is keyed by deployment ID, the budget store, the ledger,
+// the response caches with their coalescer and write pool, and the shadow
+// runner. The config-derived part (snapshot) is immutable and is replaced
+// as a whole by Reload: the catalog, the adapters, the policy engine, the
+// router, the routing settings and the budget scopes. Each request loads
+// the current snapshot once, when it starts, and uses it to the end, so a
+// reload never changes a request in flight.
 type Gateway struct {
+	*shared
+	cur atomic.Pointer[snapshot]
+}
+
+// shared is the gateway's long-lived state, which survives reloads.
+type shared struct {
+	metrics *metrics
+	// health is the replica's breaker, cooldown, budget and concurrency
+	// state. Its settings (trackerConfig) are those of the configuration
+	// New was given.
+	health *health.Tracker
+	// jitter returns a random duration in [0, d], for the backoff.
+	jitter func(d time.Duration) time.Duration
+	log    *slog.Logger
+
+	// ledger receives the usage events, if set.
+	ledger usage.Sink
+	// budgets holds the budget counters.
+	budgets     budget.Store
+	budgetCheck func(ctx context.Context) error
+	now         func() time.Time
+	// offline is Options.Offline.
+	offline bool
+
+	// shadow takes the shadow samples, or is nil (see SetShadow).
+	shadow Shadow
+	// streams caps concurrent streams, or is nil; propagate is
+	// Options.PropagateTrace.
+	streams   StreamLimiter
+	propagate bool
+	// cache is the response caches.
+	cache *cacheLayer
+}
+
+// snapshot is the gateway's state derived from one configuration. It is
+// never modified once built (tests excepted), and every method that serves
+// a request runs on the one snapshot the request started with.
+type snapshot struct {
+	*shared
+
 	catalog *catalog.Catalog
 	// adapters holds one adapter per provider, by provider id.
 	adapters map[string]providers.Adapter
 	// drop is routing.drop_unsupported_params.
-	drop    bool
+	drop bool
+	// created is when the configuration was loaded, for the model list.
 	created int64
-	metrics *metrics
 	// routing holds the routing settings, with defaults for zero values.
 	routing config.Routing
-	// health is the replica's breaker, cooldown, budget and concurrency
-	// state; deps and provs are its handles, by deployment and provider
-	// id.
-	health *health.Tracker
-	deps   map[string]*health.Deployment
-	provs  map[string]*health.Provider
-	// jitter returns a random duration in [0, d], for the backoff.
-	jitter func(d time.Duration) time.Duration
+	// deps and provs are the health tracker's handles, by deployment and
+	// provider id, of the deployments and providers of this configuration.
+	deps  map[string]*health.Deployment
+	provs map[string]*health.Provider
+	// batch holds the tracker changes this snapshot makes, applied when
+	// it is put in force.
+	batch *health.Batch
+	// keys holds every tenant and key of the configuration, so that a
+	// request authenticated against another configuration's keys is
+	// refused (see knownCaller).
+	keys map[principal]struct{}
 
-	// ledger receives the usage events, if set.
-	ledger usage.Sink
-	// budgets holds the budget counters; scopes maps each tenant and key
-	// to the budgets that apply to its requests, and allScopes lists every
-	// budget scope once, for the utilization gauge. failClosed is
-	// budgets.fail_mode closed.
-	budgets       budget.Store
+	// scopes maps each tenant and key to the budgets that apply to its
+	// requests, and allScopes lists every budget scope once, for the
+	// utilization gauge. failClosed is budgets.fail_mode closed.
 	scopes        map[principal][]budget.Scope
 	allScopes     []budget.Scope
 	failClosed    bool
 	failMode      string
-	budgetCheck   func(ctx context.Context) error
-	now           func() time.Time
 	configVersion string
 
 	// policy resolves each request's effective policy; assessor rates its
 	// difficulty; router plans it. tenants maps each tenant id to its
-	// config, for the policy. offline is Options.Offline.
+	// config, for the policy.
 	policy   *policy.Engine
 	assessor quality.Assessor
 	router   *router.Router
 	tenants  map[string]config.Tenant
-	offline  bool
-
-	// shadow takes the shadow samples, or is nil (see SetShadow).
-	shadow Shadow
-	// cache is the response caches.
-	cache *cacheLayer
 }
+
+// current returns the snapshot in force.
+func (g *Gateway) current() *snapshot { return g.cur.Load() }
 
 // Model is one entry of the model list.
 type Model struct {
@@ -155,8 +210,9 @@ type Model struct {
 	Created int64
 }
 
-// New builds the gateway: the catalog, and one adapter, with its own HTTP
-// client, per provider. It registers the metrics on opts.Registry.
+// New builds the gateway: the long-lived state, and the snapshot of
+// opts.Config, with the catalog and one adapter, with its own HTTP client,
+// per provider. It registers the metrics on opts.Registry.
 func New(opts Options) (*Gateway, error) {
 	switch {
 	case opts.Config == nil:
@@ -168,15 +224,58 @@ func New(opts Options) (*Gateway, error) {
 	}
 	cfg := opts.Config
 
+	sh := &shared{
+		jitter:      fullJitter,
+		log:         opts.Logger,
+		ledger:      opts.Ledger,
+		budgets:     opts.Budgets,
+		budgetCheck: opts.BudgetStoreCheck,
+		now:         opts.Clock,
+		offline:     opts.Offline,
+		streams:     opts.Streams,
+		propagate:   opts.PropagateTrace,
+	}
+	if sh.budgets == nil {
+		sh.budgets = budget.NewMemoryStore()
+	}
+	if sh.now == nil {
+		sh.now = time.Now
+	}
+	sh.cache = newCacheLayer(cfg.Cache, opts.Cache, sh.now)
+	met, err := newMetrics(opts.Registry)
+	if err != nil {
+		return nil, err
+	}
+	sh.metrics = met
+	sh.health = health.New(health.Options{Config: trackerConfig(withRoutingDefaults(cfg.Routing)), Observer: met, Now: opts.Clock})
+
+	g := &Gateway{shared: sh}
+	s, err := g.build(cfg, opts.ConfigVersion)
+	if err != nil {
+		met.unregister(opts.Registry)
+		return nil, err
+	}
+	s.batch.Apply()
+	g.cur.Store(s)
+	if err := met.registerHealth(opts.Registry, g.health, g); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// build returns the snapshot of cfg over g's long-lived state.
+func (g *Gateway) build(cfg *config.Config, configVersion string) (*snapshot, error) {
 	cat, err := catalog.New(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}
-	g := &Gateway{
-		catalog:  cat,
-		adapters: make(map[string]providers.Adapter, len(cfg.Providers)),
-		drop:     cfg.Routing.DropUnsupportedParams,
-		created:  time.Now().Unix(),
+	s := &snapshot{
+		shared:        g.shared,
+		catalog:       cat,
+		adapters:      make(map[string]providers.Adapter, len(cfg.Providers)),
+		drop:          cfg.Routing.DropUnsupportedParams,
+		created:       time.Now().Unix(),
+		configVersion: configVersion,
 	}
 	for _, p := range cfg.Providers {
 		var (
@@ -185,82 +284,72 @@ func New(opts Options) (*Gateway, error) {
 		)
 		switch p.Type {
 		case "openai":
-			a, err = openai.New(p)
+			a, err = openai.New(p, providers.Options{PropagateTrace: g.propagate})
 		case "anthropic":
-			a, err = anthropic.New(p)
+			a, err = anthropic.New(p, providers.Options{PropagateTrace: g.propagate})
 		default:
 			// Validation rejects other types; their deployments are
 			// excluded from every request.
-			opts.Logger.Warn("provider type not supported; its deployments are never chosen",
+			g.log.Warn("provider type not supported; its deployments are never chosen",
 				"provider", p.ID, "type", p.Type)
 			continue
 		}
 		if err != nil {
 			return nil, fmt.Errorf("gateway: %w", err)
 		}
-		g.adapters[p.ID] = a
+		s.adapters[p.ID] = a
 	}
 
-	if g.policy, err = policy.New(cfg); err != nil {
+	if s.policy, err = policy.New(cfg); err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}
 	h, err := quality.NewHeuristic(cfg.Routing.Assessor.Weights)
 	if err != nil {
 		return nil, fmt.Errorf("gateway: routing.assessor: %w", err)
 	}
-	g.assessor = h
-	g.routing = withRoutingDefaults(cfg.Routing)
-	g.jitter = fullJitter
-	g.ledger = opts.Ledger
-	g.budgets = opts.Budgets
-	if g.budgets == nil {
-		g.budgets = budget.NewMemoryStore()
+	s.assessor = h
+	s.routing = withRoutingDefaults(cfg.Routing)
+	s.failClosed = cfg.Budgets.FailMode == config.BudgetFailClosed
+	s.failMode = config.BudgetFailOpen
+	if s.failClosed {
+		s.failMode = config.BudgetFailClosed
 	}
-	g.failClosed = cfg.Budgets.FailMode == config.BudgetFailClosed
-	g.failMode = config.BudgetFailOpen
-	if g.failClosed {
-		g.failMode = config.BudgetFailClosed
+	s.scopes, s.allScopes = budgetScopes(cfg.Tenants)
+	s.keys = make(map[principal]struct{})
+	for _, t := range cfg.Tenants {
+		for _, k := range t.Keys {
+			s.keys[principal{t.ID, k.ID}] = struct{}{}
+		}
 	}
-	g.budgetCheck = opts.BudgetStoreCheck
-	g.now = opts.Clock
-	if g.now == nil {
-		g.now = time.Now
-	}
-	g.configVersion = opts.ConfigVersion
-	g.cache = newCacheLayer(cfg.Cache, opts.Cache, g.now)
-	g.scopes, g.allScopes = budgetScopes(cfg.Tenants)
-	met, err := newMetrics(opts.Registry)
-	if err != nil {
-		return nil, err
-	}
-	g.metrics = met
-	g.health = health.New(health.Options{Config: trackerConfig(g.routing), Observer: met, Now: opts.Clock})
-	g.deps = make(map[string]*health.Deployment)
-	g.provs = make(map[string]*health.Provider, len(cfg.Providers))
+	// The batch returns the existing handle of every deployment and
+	// provider the tracker knows, so their state carries over. It
+	// registers new ones, and applies the new settings (max_concurrency,
+	// a deployment's provider and latency hint), only when the snapshot
+	// is put in force (see Staged.Commit), so building one has no effect
+	// on the snapshot in force.
+	s.batch = g.health.Batch()
+	s.deps = make(map[string]*health.Deployment)
+	s.provs = make(map[string]*health.Provider, len(cfg.Providers))
 	for _, p := range cfg.Providers {
-		g.provs[p.ID] = g.health.Provider(p.ID, p.MaxConcurrency)
+		s.provs[p.ID] = s.batch.Provider(p.ID, p.MaxConcurrency)
 	}
 	for _, m := range cat.Models() {
 		for _, d := range m.Deployments {
-			g.deps[d.ID] = g.health.Deployment(d.ID, d.Provider,
+			s.deps[d.ID] = s.batch.Deployment(d.ID, d.Provider,
 				health.LatencyHint{TTFT: d.LatencyHint.TTFT, TokensPerSec: d.LatencyHint.TokensPerSec})
 		}
 	}
-	if err := met.registerHealth(opts.Registry, g.health, g); err != nil {
-		return nil, err
-	}
 
-	g.offline = opts.Offline
-	tracker := g.health
+	var tracker health.Registry = s.batch
 	if g.offline {
 		tracker = nil
 	}
-	g.router = router.New(cat, tracker, g.routing)
-	g.tenants = make(map[string]config.Tenant, len(cfg.Tenants))
+	s.router = router.New(cat, tracker, s.routing)
+	s.tenants = make(map[string]config.Tenant, len(cfg.Tenants))
 	for _, t := range cfg.Tenants {
-		g.tenants[t.ID] = t
+		s.tenants[t.ID] = t
 	}
-	return g, nil
+	return s, nil
 }
 
 // withRoutingDefaults fills the routing fields whose zero value is
@@ -376,6 +465,34 @@ type Info struct {
 	// chat request the cache layer saw, or "". A hit (exact or semantic)
 	// made no upstream attempt.
 	Cache string
+}
+
+// StreamLimiter caps concurrent streams per key; *ratelimit.Enforcer
+// implements it.
+type StreamLimiter interface {
+	// AcquireStream takes a stream slot for the request of ctx. It returns
+	// the function that gives it back, never nil, or the rejection to
+	// answer with.
+	AcquireStream(ctx context.Context) (release func(), rej *ratelimit.Rejection)
+}
+
+// acquireStream takes a stream slot for a streaming request, when a
+// StreamLimiter is set. When the key has its maximum of streams open, or
+// the limiter failed under rate_limits.fail_mode closed, it answers the
+// client and returns false. Otherwise the caller must call release once
+// the response has ended.
+func (g *snapshot) acquireStream(ctx context.Context, ex Exchange, rec *record) (release func(), ok bool) {
+	if g.streams == nil {
+		return func() {}, true
+	}
+	release, rej := g.streams.AcquireStream(ctx)
+	if rej != nil {
+		rec.respondError(ex, Info{}, &Error{
+			Status: rej.Status, Type: rej.Type, Code: rej.Code, Message: rej.Message, RetryAfter: rej.RetryAfter,
+		})
+		return nil, false
+	}
+	return release, true
 }
 
 // Error is a failed request, ready to be sent in the OpenAI error

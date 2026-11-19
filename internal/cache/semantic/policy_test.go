@@ -109,7 +109,7 @@ tenants:
 	}
 	adapters := map[string]providers.Adapter{}
 	for _, p := range cfg.Providers {
-		a, err := openai.New(p)
+		a, err := openai.New(p, providers.Options{})
 		if err != nil {
 			t.Fatal(err)
 		}

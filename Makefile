@@ -59,6 +59,111 @@ cover: ## Write coverage.out and print a per-function summary.
 bench-overhead: ## Measure the gateway's added latency (pass flags with BENCH_FLAGS="-mode stream").
 	$(GO) run ./test/load $(BENCH_FLAGS)
 
+# --- perf (P7): SLO bench and soak ---
+#
+# bench-slo is the P7 overhead SLO: an open loop at 1,000 req/s for 60 s
+# (80% non-streaming, 20% streaming, caching off; a key rate limit and
+# stream cap never reached, and tracing of every request to an in-process
+# collector) through the gateway binary in front of a fake upstream with
+# 20 ms latency, and directly
+# against the same fake. It fails if the gateway's added latency, measured
+# per request as the client's latency minus the upstream's own time,
+# exceeds 2 ms at p50 or 10 ms at p99. Pass flags with BENCH_SLO_FLAGS, for
+# example "-rate 2000 -out slo.md"; see test/load's package doc.
+#
+# Target load is 1,000 req/s, the SLO rate: the soak's default rate.
+#
+# soak runs the gateway for DURATION at the target load with 2% injected
+# upstream 500s, retries off, a per-key rate limit and stream cap it never
+# reaches, and tracing of every request to an in-process collector. It
+# checks that goroutines and memory stay flat, that the client's errors
+# are exactly the injected ones, and that no span, log line or request was
+# dropped or rate limited. The report goes to SOAK_OUT; pass other flags
+# with SOAK_FLAGS (see test/soak's package doc), for example
+# SOAK_FLAGS="-redis-url redis://127.0.0.1:6380/0" for storage.mode redis
+# against the test-integration project's redis-state. The warm-up is a
+# third of the run, at least until the memory usage ledger is full (110 s
+# at 1,000 req/s), so `make soak DURATION=10m` works at the default rate.
+BENCH_SLO_FLAGS ?=
+DURATION        ?= 1h
+SOAK_OUT        ?= bin/soak-report.md
+SOAK_FLAGS      ?=
+
+.PHONY: bench-slo soak
+bench-slo: ## Check the overhead SLO at 1,000 req/s open loop (p50 <= 2 ms, p99 <= 10 ms added; BENCH_SLO_FLAGS).
+	$(GO) run ./test/load slo $(BENCH_SLO_FLAGS)
+
+soak: ## Soak the gateway for DURATION (default 1h) at the 1,000 req/s target load: flat memory and goroutines, errors = injected (SOAK_OUT, SOAK_FLAGS).
+	@mkdir -p $(dir $(SOAK_OUT))
+	$(GO) run ./test/soak -duration $(DURATION) -out $(SOAK_OUT) $(SOAK_FLAGS)
+# --- end perf ---
+
+# --- ops (P7): compose stack, release, config reference, deploy checks ---
+#
+# compose-up starts the whole stack in deploy/compose.yaml: the gateway,
+# both Redis instances and Postgres, plus the optional PROFILES
+# (observability, tei). On the first run it writes deploy/.env with
+# deploy/init.sh, taking provider keys from the environment. With the
+# observability profile, deploy/observability.env turns tracing on. The
+# image is built by the docker target, so DOCKER="colima ssh -- docker"
+# works here too. compose-down stops the stack and keeps its volumes; add
+# COMPOSE_DOWN_FLAGS=-v to delete them.
+#
+# release-snapshot is a local GoReleaser dry run (.goreleaser.yaml):
+# binaries, archives, checksums and SBOMs in dist/, without images (they
+# need Buildx; CI builds them on a tag) and without publishing.
+#
+# docs-config regenerates docs/configuration.md from internal/config/
+# types.go; the tools/configdoc test fails while it is stale.
+#
+# check-deploy validates deploy/: the Prometheus config and alert rules
+# and their unit tests (promtool, in the Prometheus image), the Grafana
+# dashboard's JSON (jq), that every metric they query exists in the code,
+# the compose file with every profile, deploy/config/switchyard.yaml (config
+# validate, with placeholder secrets) and deploy/init.sh (sh -n).
+PROFILES           ?=
+COMPOSE_DOWN_FLAGS ?=
+GORELEASER_VERSION := v2.20.2
+PROMETHEUS_IMAGE   := prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+DEPLOY_COMPOSE     = $(COMPOSE) -f $(CURDIR)/$(COMPOSE_FILE) $(foreach p,$(subst $(comma), ,$(PROFILES)),--profile $(p))
+comma              := ,
+
+.PHONY: compose-up compose-down release-snapshot docs-config check-deploy
+compose-up: build docker ## Start the full stack in deploy/compose.yaml (PROFILES="observability tei"); writes deploy/.env on first run.
+	@if [ ! -e deploy/.env ]; then SWITCHYARD_BIN=$(CURDIR)/$(BINARY) deploy/init.sh || exit 1; fi
+	$(DEPLOY_COMPOSE) --env-file $(CURDIR)/deploy/.env \
+		$(if $(filter observability,$(subst $(comma), ,$(PROFILES))),--env-file $(CURDIR)/deploy/observability.env) \
+		up -d --wait
+
+compose-down: ## Stop the stack from compose-up, every profile included (COMPOSE_DOWN_FLAGS=-v deletes the data).
+	$(COMPOSE) -f $(CURDIR)/$(COMPOSE_FILE) --profile observability --profile tei down $(COMPOSE_DOWN_FLAGS)
+
+release-snapshot: ## Build a local GoReleaser snapshot in dist/: binaries, archives, checksums, SBOMs (no images, no publishing).
+	$(GO) run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION) release --snapshot --clean --skip=docker,publish
+
+docs-config: ## Regenerate docs/configuration.md from internal/config/types.go.
+	$(GO) run ./tools/configdoc
+
+check-deploy: ## Validate deploy/: alert rules and their tests, dashboard, metric names, compose file, compose config, init.sh.
+	$(DOCKER) run --rm -v $(CURDIR)/deploy/prometheus:/etc/prometheus:ro --entrypoint promtool \
+		$(PROMETHEUS_IMAGE) check config /etc/prometheus/prometheus.yml
+	$(DOCKER) run --rm -v $(CURDIR)/deploy/prometheus:/etc/prometheus:ro -w /etc/prometheus --entrypoint promtool \
+		$(PROMETHEUS_IMAGE) test rules alerts_test.yml
+	jq -e '(.panels | length > 0) and ([.panels[] | select(.type != "row") | .targets | length > 0] | all) and .uid == "switchyard"' \
+		deploy/grafana/dashboards/switchyard.json >/dev/null
+	@echo "dashboard: OK"
+	sh deploy/check-metrics.sh
+	$(COMPOSE) -f $(CURDIR)/$(COMPOSE_FILE) --profile observability --profile tei --env-file /dev/null config --quiet
+	@echo "compose: OK"
+	@tmp=$$(mktemp -d) || exit 1; trap 'rm -rf "$$tmp"' EXIT; \
+	mkdir "$$tmp/config" && cp deploy/config/switchyard.yaml "$$tmp/config/" && ln -s $(CURDIR)/configs/catalog "$$tmp/catalog" && \
+	SWITCHYARD_ADMIN_TOKEN=placeholder-admin-token-for-config-validate SWITCHYARD_API_KEY_HASH=sha256:$$(printf '%064d' 0) \
+	DATABASE_URL=postgres://placeholder@postgres/switchyard OPENAI_API_KEY=placeholder \
+		$(GO) run ./cmd/switchyard config validate -c "$$tmp/config/switchyard.yaml"
+	sh -n deploy/init.sh && sh -n deploy/check-metrics.sh
+	@echo "check-deploy: OK"
+# --- end ops ---
+
 .PHONY: demo-routing
 demo-routing: ## Run the mixed-workload routing demo against fake upstreams (pass flags with DEMO_FLAGS).
 	$(GO) run ./test/demo $(DEMO_FLAGS)
@@ -99,7 +204,7 @@ eval-live: build ## Run eval against real providers (needs EVAL_CONFIG, EVAL_CAN
 # tests in test/integration stop and restart the test project's Postgres
 # and cache Redis through SWITCHYARD_TEST_COMPOSE.
 TEST_COMPOSE_PROJECT ?= switchyard-test
-INTEGRATION_PKGS     ?= ./internal/usage/... ./internal/budget/... ./internal/cache/... ./test/integration/...
+INTEGRATION_PKGS     ?= ./internal/usage/... ./internal/budget/... ./internal/cache/... ./internal/ratelimit/... ./test/integration/...
 INTEGRATION_FLAGS    ?= -race -count=1 -p 1 -timeout 20m
 TEST_POSTGRES_DSN    := postgres://switchyard:switchyard@127.0.0.1:5433/switchyard?sslmode=disable
 TEST_REDIS_URL       := redis://127.0.0.1:6380/0
@@ -184,10 +289,20 @@ docker: ## Build the container image switchyard:dev.
 		--build-arg DATE=$(DATE) \
 		.
 
-docker-check: docker ## Build the image, then check it is <= 40 MB and runs as UID 65532.
-	@size=$$($(DOCKER) image inspect --format '{{.Size}}' $(IMAGE)) || exit 1; \
+# docker-check measures the image's uncompressed size: the sum of its
+# layers' sizes as `docker history` reports them, which is the same with
+# the classic and the containerd image store (`docker image inspect`
+# .Size is the compressed content size under containerd, and the
+# unpacked size under the classic store). It then runs the image hardened,
+# as compose and Kubernetes should (read-only root filesystem, no
+# capabilities, no privilege escalation), with the quickstart config baked
+# into the image, and waits up to 30 s for /healthz and /readyz to answer
+# 200, probed inside the container by `switchyard healthcheck`.
+docker-check: docker ## Build the image, check it is <= 40 MB uncompressed and runs as UID 65532, then run it read-only and probe /healthz.
+	@size=$$($(DOCKER) history --human=false --format '{{.Size}}' $(IMAGE) | awk '{ s += $$1 } END { printf "%d", s }') || exit 1; \
+	[ -n "$$size" ] && [ "$$size" -gt 0 ] || { echo "FAIL: could not measure the image size" >&2; exit 1; }; \
 	user=$$($(DOCKER) image inspect --format '{{.Config.User}}' $(IMAGE)) || exit 1; \
-	echo "$(IMAGE): size $$size bytes (limit $(IMAGE_MAX_BYTES)), user '$$user'"; \
+	echo "$(IMAGE): uncompressed size $$size bytes (limit $(IMAGE_MAX_BYTES)), user '$$user'"; \
 	status=0; \
 	if [ "$$size" -gt $(IMAGE_MAX_BYTES) ]; then \
 		echo "FAIL: image is larger than $(IMAGE_MAX_BYTES) bytes" >&2; status=1; \
@@ -197,12 +312,28 @@ docker-check: docker ## Build the image, then check it is <= 40 MB and runs as U
 	fi; \
 	if [ $$status -eq 0 ]; then echo "OK: size and user checks passed"; fi; \
 	exit $$status
+	@cid=$$($(DOCKER) run -d --read-only --cap-drop=ALL --security-opt=no-new-privileges $(IMAGE)) || exit 1; \
+	trap '$(DOCKER) rm -f '"$$cid"' >/dev/null' EXIT; \
+	ok=0; i=0; \
+	while [ $$i -lt 60 ]; do \
+		if $(DOCKER) exec $$cid /usr/local/bin/switchyard healthcheck --url http://127.0.0.1:8080/healthz 2>/dev/null && \
+			$(DOCKER) exec $$cid /usr/local/bin/switchyard healthcheck --url http://127.0.0.1:8080/readyz 2>/dev/null; then ok=1; break; fi; \
+		if [ "$$($(DOCKER) inspect --format '{{.State.Running}}' $$cid)" != true ]; then break; fi; \
+		sleep 0.5; i=$$((i + 1)); \
+	done; \
+	if [ $$ok -ne 1 ]; then \
+		echo "FAIL: the image did not serve /healthz and /readyz with --read-only --cap-drop=ALL --security-opt=no-new-privileges" >&2; \
+		$(DOCKER) logs $$cid >&2; exit 1; \
+	fi; \
+	echo "OK: runs with --read-only --cap-drop=ALL --security-opt=no-new-privileges; /healthz and /readyz answer 200"
 
 dev-up: ## Start the dev dependencies (Redis x2, Postgres) and wait until healthy.
-	$(COMPOSE) -f $(COMPOSE_FILE) up -d --wait
+	$(COMPOSE) -f $(COMPOSE_FILE) up -d --wait redis-cache redis-state postgres
 
-dev-down: ## Stop the dev dependencies (keeps their volumes).
-	$(COMPOSE) -f $(COMPOSE_FILE) down
+# dev-down stops and removes only the services dev-up starts: the compose
+# project is the full stack's too, and `down` would remove its gateway.
+dev-down: ## Stop the dev dependencies (keeps their volumes and any running gateway).
+	$(COMPOSE) -f $(COMPOSE_FILE) rm --stop --force redis-cache redis-state postgres
 
 dev-logs: ## Follow the dev dependency logs.
 	$(COMPOSE) -f $(COMPOSE_FILE) logs -f

@@ -17,7 +17,11 @@ import (
 	"math"
 	"time"
 
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"switchyard/internal/cache"
+	"switchyard/internal/tracing"
 )
 
 // ErrTimeout is wrapped by a Result's Err when the lookup timeout ran out,
@@ -75,7 +79,8 @@ type Result struct {
 
 // Lookup embeds text and searches partition for its nearest entry, all
 // within the lookup timeout. It is a hit when the similarity is at least
-// minSimilarity.
+// minSimilarity. The embedding and the search are traced as
+// tracing.SpanEmbed and tracing.SpanSearch spans, children of ctx's span.
 func (c *Cache) Lookup(ctx context.Context, partition, text string, minSimilarity float64) Result {
 	res := Result{Similarity: math.NaN()}
 	lctx := ctx
@@ -94,13 +99,17 @@ func (c *Cache) Lookup(ctx context.Context, partition, text string, minSimilarit
 		return res
 	}
 
-	emb, err := c.emb.Embed(lctx, text)
+	ectx, span := tracing.Start(lctx, tracing.SpanEmbed)
+	emb, err := c.emb.Embed(ectx, text)
+	endSpan(span, err)
 	res.EmbedCostNano = emb.CostNano
 	if err != nil {
 		return fail("embedding", err)
 	}
 	res.Vector = emb.Vector
-	m, err := c.idx.Search(lctx, partition, emb.Vector)
+	sctx, span := tracing.Start(lctx, tracing.SpanSearch)
+	m, err := c.idx.Search(sctx, partition, emb.Vector)
+	endSpan(span, err)
 	if err != nil {
 		return fail("search", err)
 	}
@@ -134,4 +143,13 @@ func (c *Cache) Store(ctx context.Context, partition string, vec []float32, e *c
 		return fmt.Errorf("semantic cache: store: %w", err)
 	}
 	return nil
+}
+
+// endSpan ends span, with an error status when err is set. The error's
+// text is not recorded: a span holds no content.
+func endSpan(span trace.Span, err error) {
+	if err != nil {
+		span.SetStatus(codes.Error, "failed")
+	}
+	span.End()
 }

@@ -11,11 +11,14 @@ import (
 	"switchyard/internal/policy"
 	"switchyard/internal/providers"
 	"switchyard/internal/schema"
+	"switchyard/internal/tracing"
 )
 
 // ChatCompletions serves one POST /v1/chat/completions request:
 //
-//  1. read and validate the body (413, 400) and the deadline header;
+//  1. read and validate the body (413, 400); a stream takes a slot of
+//     its key's concurrent-stream cap (429, see Options.Streams), held
+//     until the response ends; read the deadline header;
 //  2. resolve the model field (404 for an unknown model, 400
 //     model_not_supported for a non-chat model, or for auto the policy
 //     does not allow), assess it with the client's hints and resolve its
@@ -46,10 +49,10 @@ import (
 //
 // Canceling ctx, which net/http does when the client disconnects, cancels
 // the upstream request.
-func (g *Gateway) ChatCompletions(ctx context.Context, ex Exchange) {
+func (g *snapshot) ChatCompletions(ctx context.Context, ex Exchange) {
 	rec := g.newRecord(ctx, EndpointChatCompletions)
 	defer rec.done()
-	if !g.readTags(ex, rec) {
+	if !g.knownCaller(ex, rec) || !g.readTags(ex, rec) {
 		return
 	}
 
@@ -66,6 +69,13 @@ func (g *Gateway) ChatCompletions(ctx context.Context, ex Exchange) {
 	rec.requestedModel = req.Model()
 	rec.stream = req.Stream()
 	markStream(ctx, req.Stream())
+	if req.Stream() {
+		release, ok := g.acquireStream(ctx, ex, rec)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	ctx, cancel, ok := g.withDeadline(ctx, ex, rec)
 	defer cancel()
 	if !ok {
@@ -73,7 +83,9 @@ func (g *Gateway) ChatCompletions(ctx context.Context, ex Exchange) {
 	}
 
 	rr := chatRoute(ex, rec, req, len(body))
+	_, span := tracing.Start(ctx, tracing.SpanPolicy)
 	rt, preq, e := g.routePolicy(rec.endpoint, &rr, &rec.rt)
+	span.End()
 	if e == nil {
 		e = g.lookupCache(ctx, ex, rec, req, rt)
 	}
@@ -98,7 +110,7 @@ func (g *Gateway) ChatCompletions(ctx context.Context, ex Exchange) {
 // its client goes away, each executes on its own. So does one whose own
 // policy forbids the deployment that answered the first (see
 // entryAllowed), as for any cached answer.
-func (g *Gateway) serveMiss(ctx context.Context, ex Exchange, rec *record, req *schema.ChatRequest, rr *routeRequest, rt *routed, preq policy.Request) {
+func (g *snapshot) serveMiss(ctx context.Context, ex Exchange, rec *record, req *schema.ChatRequest, rr *routeRequest, rt *routed, preq policy.Request) {
 	run := func(ctx context.Context) {
 		rt, e := g.routeDecide(ctx, rr, rt, preq)
 		if e != nil {
@@ -149,7 +161,7 @@ func chatRoute(ex Exchange, rec *record, req *schema.ChatRequest, size int) rout
 // chatTry returns the attempt function of a chat request. conv, when set,
 // translates the response for the client (the completions shim); it is
 // nil for chat completions, which are forwarded as is.
-func (g *Gateway) chatTry(ex Exchange, rec *record, req *schema.ChatRequest, conv converter) tryFunc {
+func (g *snapshot) chatTry(ex Exchange, rec *record, req *schema.ChatRequest, conv converter) tryFunc {
 	return func(ctx context.Context, e *planEntry, info *Info) attempt {
 		d := e.d
 		info.Provider = d.Provider

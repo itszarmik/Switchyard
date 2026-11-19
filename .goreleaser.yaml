@@ -1,0 +1,134 @@
+# GoReleaser configuration (v2 schema), pinned to GoReleaser v2.20.2: the
+# version `make release-snapshot` runs with `go run`, so it never enters
+# go.mod.
+#
+#   make release-snapshot   local dry run: binaries, archives, checksums and
+#                           SBOMs in dist/, no images, nothing published
+#
+# A release is cut from a tag (git tag v0.1.0) by CI
+# (.github/workflows/release.yml, written but never run yet), which runs
+# make check and then
+#
+#   go run github.com/goreleaser/goreleaser/v2@v2.20.2 release --clean
+#
+# on a runner with Docker Buildx and QEMU set up (docker/setup-qemu-action
+# and docker/setup-buildx-action), logged in to ghcr.io
+# (docker/login-action with GITHUB_TOKEN and packages: write), and with
+# GITHUB_TOKEN for the GitHub release. OWNER below is a placeholder:
+# replace it with the GitHub owner of the repository (it is also in the
+# image labels of deploy/Dockerfile and the alerts' runbook URLs).
+version: 2
+
+project_name: switchyard
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  # The gateway: static, reproducible (trimmed paths, commit timestamp) and
+  # with the same version metadata as `make build`.
+  - id: switchyard
+    main: ./cmd/switchyard
+    binary: switchyard
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X switchyard/internal/version.Version=v{{ .Version }}
+      - -X switchyard/internal/version.Commit={{ .ShortCommit }}
+      - -X switchyard/internal/version.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: switchyard
+    ids: [switchyard]
+    formats: [tar.gz]
+    # switchyard_0.1.0_linux_amd64.tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - CHANGELOG.md
+      - docs/quickstart.md
+      - docs/configuration.md
+      - docs/runbook.md
+      - configs/quickstart.yaml
+      - configs/switchyard.example.yaml
+      - configs/catalog/*
+
+# One CycloneDX SBOM per archive, generated from the Go build information
+# embedded in the archive's binary (cyclonedx-gomod bin), so it lists
+# exactly the modules linked in. cyclonedx-gomod runs with `go run` at a
+# pinned version, like GoReleaser itself; GoReleaser runs it in dist/.
+sboms:
+  - id: switchyard
+    artifacts: binary
+    ids: [switchyard]
+    documents:
+      - "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}.cdx.json"
+    cmd: go
+    args:
+      - run
+      - github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
+      - bin
+      - -json
+      - -std
+      - -version
+      - "v{{ .Version }}"
+      - -output
+      - "$document"
+      - "$artifact"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# Multi-arch images on ghcr.io, built with Buildx from the binaries above
+# (deploy/Dockerfile.release), with an SBOM and provenance attestation.
+# `make release-snapshot` skips them (--skip=docker) because they need
+# Buildx; CI builds and pushes them on a tag.
+dockers_v2:
+  - id: switchyard
+    ids: [switchyard]
+    dockerfile: deploy/Dockerfile.release
+    images:
+      - ghcr.io/OWNER/switchyard
+    tags:
+      - "v{{ .Version }}"
+      - "{{ if not .Prerelease }}v{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    extra_files:
+      - configs/quickstart.yaml
+    labels:
+      org.opencontainers.image.title: switchyard
+      org.opencontainers.image.version: "v{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+      org.opencontainers.image.source: https://github.com/OWNER/switchyard
+    sbom: true
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  use: git
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  github:
+    owner: OWNER
+    name: switchyard
+  draft: true
+  prerelease: auto
+  name_template: "v{{ .Version }}"

@@ -1,0 +1,14 @@
+# Loads the dashboards in /var/lib/grafana/dashboards (deploy/grafana/
+# dashboards, mounted read-only) into the Switchyard folder.
+apiVersion: 1
+
+providers:
+  - name: switchyard
+    folder: Switchyard
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 60
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

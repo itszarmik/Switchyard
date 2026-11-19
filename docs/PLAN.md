@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P6 and P8 complete** (P8 was done ahead of P6/P7 at the user's request). Next: P7 (production hardening and v0.1). CI, the live smoke tests, a live judge-quality check and a live semantic-cache check (`make semantic-eval`) have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P8 complete** (P8 was done ahead of P6/P7 at the user's request). The v0.1.0 tag waits for the user's approval. CI and the release workflow, the live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -412,13 +412,91 @@ Six of the seven criteria pass. The semantic criterion passes offline but has no
 **Acceptance**
 
 - [ ] On a fresh machine, following the README, `docker compose up` plus one provider key gives a working gateway in under 5 minutes.
-- [ ] A single trace shows the auth, cache, route, upstream-attempt and usage spans for a request.
-- [ ] An invalid reload is rejected and the old config keeps serving. A valid reload takes effect without dropping in-flight streams.
-- [ ] Over a 1-hour soak at target load, memory and goroutine counts stay flat, and the error rate matches the injected upstream error rate.
-- [ ] The overhead SLO holds at 1,000 requests/s on documented hardware: p50 ≤ 2 ms and p99 ≤ 10 ms.
-- [ ] Rate limits are enforced across two replicas that share Redis.
-- [ ] `govulncheck` is clean, the image runs as non-root with a read-only root filesystem, and an automated test confirms no secrets appear in logs.
-- [ ] The v0.1.0 release artifacts are tagged.
+- [x] A single trace shows the auth, cache, route, upstream-attempt and usage spans for a request.
+- [x] An invalid reload is rejected and the old config keeps serving. A valid reload takes effect without dropping in-flight streams.
+- [x] Over a 1-hour soak at target load, memory and goroutine counts stay flat, and the error rate matches the injected upstream error rate.
+- [x] The overhead SLO holds at 1,000 requests/s on documented hardware: p50 ≤ 2 ms and p99 ≤ 10 ms.
+- [x] Rate limits are enforced across two replicas that share Redis.
+- [x] `govulncheck` is clean, the image runs as non-root with a read-only root filesystem, and an automated test confirms no secrets appear in logs.
+- [ ] The v0.1.0 release artifacts are tagged. *The artifacts build (`make release-snapshot`); the tag waits for the user's approval.*
+
+**Outcome (2026-11-19)**
+
+**Fresh machine.** The working tree was copied without `.git`, binaries or `.env`, then the README was followed literally: `init.sh` with a fake OpenAI key, then `docker compose up`, with a test-only override pointing the provider at a containerised fake upstream. The first successful `/v1/chat/completions` came 13 s after `up` with the image layers cached, and 37 s with `docker compose build --no-cache`. Base images and the Go module cache were cached. A cold pull of about 540 MB plus a cold compile is estimated at 2–3 minutes but wasn't measured, and a real provider key wasn't used, so the box above stays unticked.
+
+**Tracing.** `TestTraceSpanTree` runs the binary against a fake OTLP/HTTP collector that decodes the protobuf. One chat request, with the exact cache, a rate limit and a budget, gives one trace whose root has the children `auth`, `ratelimit`, `policy`, `cache.exact`, `route`, `budget.admit`, `upstream.attempt` and `usage.record`, with GenAI and `switchyard.*` attributes and no content. A semantic request adds `cache.semantic` with `embed` and `search`. The same tree showed in Jaeger 2.23 through `make compose-up PROFILES=observability`.
+
+**Reload.** Conformance and app tests cover:
+- a stream in flight across a reload;
+- invalid reloads, by SIGHUP and through the admin endpoint;
+- key rotation and the `restart_required` report;
+- admin-token changes;
+- rate-limit changes that apply at once;
+- a reload rejected after staging, which leaves nothing behind;
+- a reload between authentication and the gateway, which refuses a revoked key.
+
+**Soak.** 1 hour at 1,000 req/s, in Redis mode. The key rate limit and stream cap were set but never reached, and tracing was on at `sample_ratio: 1`. Workload: 3.6 M requests, 10% cacheable repeats, 20% of the rest streaming, 2% injected upstream 500s.
+- Goroutines: median 237 → 238.
+- RSS peak: 230 → 244 MiB (+6.2%).
+- GC goal: median 205 → 210 MiB (+2.4%), rising to 223 MiB in the last 10 minutes as the machine's load average climbed past 8.
+- Errors seen by clients: exactly the 64,727 injected.
+- Spans: 31.3 M exported, 0 dropped.
+- Log lines dropped: 0.
+- Rate-limit store errors: 18, served under `fail_mode: open` (16 requests, 2 streams). Refusals: 0.
+
+A 10-minute memory-mode smoke also passed.
+
+**SLO.** `make bench-slo` ran 1,000 req/s open loop on an Apple M5 (10 cores, 16 GiB, macOS 26.4.1, recorded in test/load/RESULTS.md), with the rate limit, stream cap and full tracing on.
+- Three runs: added p50 0.26–0.29 ms, p99 1.0–4.5 ms, zero errors.
+- Before the tracing and rate limits were added to the hot path: p50 about 0.3 ms, p99 0.9–1.9 ms, with one run flagged as a machine stall.
+
+The closed-loop `make bench-overhead` 5 ms gate still fails on this shared machine for every build, HEAD included. The machine saturates at about 50 k req/s.
+
+**Two replicas.** `test/integration/ratelimit_test.go` runs two binaries on one real Redis.
+- **Shared request rate:** requests alternating between the replicas are limited in total, not per replica, with the expected `Retry-After`.
+- **Shared stream cap:** a stream held on one replica makes the other answer 429.
+
+**Security.**
+- **govulncheck:** clean.
+- **Image (`make docker-check`):** 24.4 MB uncompressed, UID 65532, healthy with `--read-only --cap-drop=ALL --security-opt=no-new-privileges`.
+- **Secret scan:** `TestNoSecretsLeak` covers logs, the access log, audit lines, CLI output, metrics, reload responses and the exported spans, including after key and admin-token rotation.
+- **Headers:** a conformance test checks that only allow-listed client headers reach upstreams and that the client's `Authorization` never does.
+
+**Release.** `make release-snapshot` builds 4 archives (linux and darwin, amd64 and arm64), checksums and CycloneDX SBOMs. The CI and release workflows are written and pinned by SHA, but have never run. `OWNER` in `.goreleaser.yaml` is a documented placeholder.
+
+**Review fixes.** Independent security and correctness reviews found:
+- **critical:** 1, a rejected reload changing the live health tracker;
+- **high:** 3, including a reload window in which a request that authenticated on the old keyring could run with no budget on the new snapshot, and a soak that didn't exercise P7's machinery;
+- **medium:** 13;
+- **low:** 12.
+
+Each is fixed, with a regression test where it was code.
+- **Reload.**
+  - Staging has no side effects.
+  - The gateway refuses callers its snapshot doesn't know.
+- **Admin.**
+  - `admin_token` must be at least 32 characters with no whitespace.
+  - Admin failures are rate limited.
+  - The admin listener serves health routes.
+- **Auth-failure guard:** atomic per address.
+- **Tracing.**
+  - Our own span processor counts queue-full drops.
+  - Only `traceparent` goes upstream.
+- **Logging and shutdown.**
+  - Audit lines are never dropped.
+  - The ledger is flushed before tracing, within one shutdown bound.
+- **Supply chain.**
+  - Actions are pinned by SHA, and images by digest.
+  - The release runs in split jobs.
+- **Self-hosting.**
+  - The compose config moved to a directory mount (`deploy/config/`).
+  - The managed Redis and Postgres URLs now reach the container.
+  - The TEI setup validates.
+  - The breaker alert clears.
+  - The runbook commands work as written.
+- **Tests.**
+  - The soak and the SLO now run with a production-shaped config.
+  - The soak's error gate is exact.
 
 ## P8: Quality feedback loop (the first post-MVP phase)
 

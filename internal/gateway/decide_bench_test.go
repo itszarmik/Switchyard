@@ -84,12 +84,12 @@ func BenchmarkRoute200(b *testing.B) {
 	g := routeBenchGateway(b)
 	rr, _ := routeBenchRequest(b)
 	ctx := context.Background()
-	if rt, e := g.route(ctx, EndpointChatCompletions, rr, &routed{}); e != nil || len(rt.served.Plan) == 0 {
+	if rt, e := g.current().route(ctx, EndpointChatCompletions, rr, &routed{}); e != nil || len(rt.served.Plan) == 0 {
 		b.Fatalf("route: %+v", e)
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, e := g.route(ctx, EndpointChatCompletions, rr, &routed{}); e != nil {
+		if _, e := g.current().route(ctx, EndpointChatCompletions, rr, &routed{}); e != nil {
 			b.Fatal(e)
 		}
 	}
@@ -110,7 +110,7 @@ func TestRouteLatencyP99(t *testing.T) {
 	rr, _ := routeBenchRequest(t)
 	ctx := context.Background()
 	for range 100 {
-		if _, e := g.route(ctx, EndpointChatCompletions, rr, &routed{}); e != nil {
+		if _, e := g.current().route(ctx, EndpointChatCompletions, rr, &routed{}); e != nil {
 			t.Fatal(e)
 		}
 	}
@@ -118,7 +118,7 @@ func TestRouteLatencyP99(t *testing.T) {
 	times := make([]time.Duration, runs)
 	for i := range times {
 		start := time.Now()
-		_, e := g.route(ctx, EndpointChatCompletions, rr, &routed{})
+		_, e := g.current().route(ctx, EndpointChatCompletions, rr, &routed{})
 		times[i] = time.Since(start)
 		if e != nil {
 			t.Fatal(e)

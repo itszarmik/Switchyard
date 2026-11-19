@@ -5,9 +5,12 @@ import (
 	"net/http"
 	"strings"
 
+	"go.opentelemetry.io/otel/codes"
+
 	"switchyard/internal/apierror"
 	"switchyard/internal/reqctx"
 	"switchyard/internal/server"
+	"switchyard/internal/tracing"
 )
 
 const (
@@ -24,30 +27,60 @@ const (
 	reasonUnknown   = "unknown_key"
 )
 
-// Middleware returns middleware that authenticates every request against s.
+// Options configures Middleware.
+type Options struct {
+	// Guard, when set, is called with every request once its key has been
+	// checked, before anything is written, with whether it authenticated.
+	// When it returns false it has answered the request itself (the app's
+	// per-address limit on failed authentications answers 429:
+	// ratelimit.AuthFailures.Check), and the middleware writes nothing
+	// more and logs nothing.
+	Guard func(w http.ResponseWriter, r *http.Request, authenticated bool) bool
+}
+
+// Middleware returns middleware that authenticates every request against
+// a, a *Store or, to follow config reloads, a *Keyring.
 //
 // It reads "Authorization: Bearer <key>", with the scheme matched
-// case-insensitively. A missing, repeated or malformed header, or a key s
+// case-insensitively. A missing, repeated or malformed header, or a key a
 // does not know, gets 401 with WWW-Authenticate: Bearer and the error
 // {"type":"invalid_request_error","code":"invalid_api_key"}; the failure is
 // logged at DEBUG with a reason, never with the key.
 //
 // On success the request context carries the Principal (see FromContext),
 // its request logger gains tenant and key_id attributes, and so does the
-// request's access-log line (see reqctx.Annotate).
-func Middleware(s *Store) func(http.Handler) http.Handler {
+// request's access-log line (see reqctx.Annotate). The check is traced as
+// a tracing.SpanAuth span, a child of the request's span that ends before
+// next runs; it records the tenant and the key's ID, never the key.
+func Middleware(a Authenticator, o Options) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, span := tracing.Start(r.Context(), tracing.SpanAuth)
 			key, reason := bearerToken(r.Header)
+			var (
+				p  Principal
+				ok bool
+			)
+			if reason == "" {
+				if p, ok = a.Authenticate(key); !ok {
+					reason = reasonUnknown
+				}
+			}
+			if o.Guard != nil && !o.Guard(w, r, reason == "") {
+				span.SetStatus(codes.Error, "auth_failures_limited")
+				span.End()
+				return
+			}
 			if reason != "" {
+				span.SetStatus(codes.Error, reason)
+				span.End()
 				reject(w, r, reason)
 				return
 			}
-			p, ok := s.Authenticate(key)
-			if !ok {
-				reject(w, r, reasonUnknown)
-				return
+			if span.IsRecording() {
+				span.SetAttributes(tracing.AttrTenant.String(p.TenantID), tracing.AttrKeyID.String(p.KeyID))
 			}
+			span.End()
 			ctx := newContext(r.Context(), p)
 			ctx = reqctx.WithLogger(ctx, reqctx.Logger(ctx).With("tenant", p.TenantID, "key_id", p.KeyID))
 			// The server's access-log line is logged outside this

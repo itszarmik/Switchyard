@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"runtime/debug"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 
 	"switchyard/internal/apierror"
 	"switchyard/internal/reqctx"
+	"switchyard/internal/tracing"
 )
 
 const (
@@ -29,16 +29,36 @@ const (
 	unmatchedRoute = "unmatched"
 )
 
-// chain wraps mux in the middleware, outermost first: request ID, access log
-// and metrics, panic recovery, body limit.
+// chain wraps mux in the middleware, outermost first: the root trace span
+// (with Options.Tracing), request ID, access log and metrics, panic
+// recovery, body limit.
 func (s *Server) chain(listener string, mux *http.ServeMux) http.Handler {
-	return s.withRequestID(s.withAccessLog(listener, mux, s.withRecover(s.withBodyLimit(mux))))
+	h := s.withRequestID(s.withAccessLog(listener, mux, s.withRecover(s.withBodyLimit(mux))))
+	if s.opts.Tracing != nil {
+		h = s.opts.Tracing.Middleware(listener, muxRoute(mux))(h)
+	}
+	return h
+}
+
+// muxRoute returns the route function of the tracing middleware: the
+// ServeMux pattern r matches, or "" when only the catch-all does.
+func muxRoute(mux *http.ServeMux) func(r *http.Request) string {
+	return func(r *http.Request) string {
+		_, pattern := mux.Handler(r)
+		if pattern == catchAllPattern {
+			return ""
+		}
+		return pattern
+	}
 }
 
 // withRequestID assigns every request a fresh UUIDv7, returns it in the
 // X-Request-Id header and stores it, with a logger that carries it, in the
 // request context. A client's own X-Request-Id is never adopted; when it is
-// well-formed it is logged as client_request_id.
+// well-formed it is logged as client_request_id. When the context holds a
+// valid trace context (put there by the tracing middleware, which must run
+// outside this one), the logger also carries trace_id and span_id, so every
+// line of the request, the access log included, joins its trace.
 func (s *Server) withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uid, err := uuid.NewV7()
@@ -52,12 +72,15 @@ func (s *Server) withRequestID(next http.Handler) http.Handler {
 		id := uid.String()
 		w.Header().Set(requestIDHeader, id)
 
-		var logger *slog.Logger
+		attrs := make([]any, 0, 4)
+		attrs = append(attrs, slog.String("request_id", id))
 		if cid := r.Header.Get(requestIDHeader); validClientRequestID(cid) {
-			logger = s.log.With("request_id", id, "client_request_id", cid)
-		} else {
-			logger = s.log.With("request_id", id)
+			attrs = append(attrs, slog.String("client_request_id", cid))
 		}
+		if traceID, spanID, ok := tracing.IDs(r.Context()); ok {
+			attrs = append(attrs, slog.String("trace_id", traceID), slog.String("span_id", spanID))
+		}
+		logger := s.log.With(attrs...)
 		ctx := reqctx.WithLogger(reqctx.WithRequestID(r.Context(), id), logger)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -143,7 +166,7 @@ func logAccess(r *http.Request, listener, route string, status int, bytes int64,
 		slog.Int("status", status),
 		slog.Int64("bytes", bytes),
 		slog.Float64("duration_ms", float64(elapsed)/float64(time.Millisecond)),
-		slog.String("remote_ip", remoteIP(r.RemoteAddr)),
+		slog.String("remote_ip", RemoteIP(r)),
 		slog.String("user_agent", truncate(r.UserAgent(), maxUserAgentLen)),
 		slog.String("listener", listener),
 	)
@@ -162,15 +185,6 @@ func isProbe(listener, route string) bool {
 		return route == metricsPattern
 	}
 	return false
-}
-
-// remoteIP returns the host part of a RemoteAddr. Forwarding headers are not
-// trusted.
-func remoteIP(addr string) string {
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		return host
-	}
-	return addr
 }
 
 // truncate returns s cut to at most n characters.

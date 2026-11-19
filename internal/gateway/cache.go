@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math"
 	"net/http"
 	"slices"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 
 	"switchyard/internal/apierror"
 	"switchyard/internal/cache"
@@ -22,6 +25,8 @@ import (
 	"switchyard/internal/reqctx"
 	"switchyard/internal/router"
 	"switchyard/internal/schema"
+	"switchyard/internal/server"
+	"switchyard/internal/tracing"
 	"switchyard/internal/usage"
 )
 
@@ -87,6 +92,8 @@ const (
 	purgeTimeout = 2 * time.Second
 	// maxPurgeBody bounds a purge request's body.
 	maxPurgeBody = 4 << 10
+	// auditPurge is the audit action of a purge.
+	auditPurge = "cache.purge"
 )
 
 // CacheOptions are the gateway's response caches.
@@ -247,7 +254,7 @@ func cacheTarget(rt *routed) string {
 // the filters permit will do, except that auto in observe mode is served
 // by the baseline model. Health and budgets are not checked: a hit is
 // served whatever they say.
-func (g *Gateway) entryAllowed(rt *routed, e *cache.Entry) bool {
+func (g *snapshot) entryAllowed(rt *routed, e *cache.Entry) bool {
 	res, err := g.catalog.Resolve(e.Deployment)
 	if err != nil || !res.Pinned || len(res.Candidates) != 1 || res.Candidates[0].ID != e.Deployment {
 		return false
@@ -288,8 +295,10 @@ func requestUser(req *schema.ChatRequest) string {
 // fails: a lookup error or timeout is a miss.
 //
 // Only an authenticated request is looked up, since every key starts with
-// its tenant.
-func (g *Gateway) lookupCache(ctx context.Context, ex Exchange, rec *record, req *schema.ChatRequest, rt *routed) *Error {
+// its tenant. Each layer looked up is traced: tracing.SpanCacheExact, and
+// tracing.SpanCacheSemantic with the semantic cache's embed and search
+// spans under it.
+func (g *snapshot) lookupCache(ctx context.Context, ex Exchange, rec *record, req *schema.ChatRequest, rt *routed) *Error {
 	mode, e := parseCacheHeader(ex.Header())
 	if e != nil {
 		return e
@@ -319,7 +328,11 @@ func (g *Gateway) lookupCache(ctx context.Context, ex Exchange, rec *record, req
 	// cache.lookup_timeout. The version is read even when only the
 	// semantic layer is on, since its partitions include it.
 	start := time.Now()
-	lctx, cancel := context.WithTimeout(ctx, c.lookupTimeout)
+	ectx, espan := ctx, trace.Span(nil)
+	if pol.Exact.Enabled {
+		ectx, espan = tracing.Start(ctx, tracing.SpanCacheExact)
+	}
+	lctx, cancel := context.WithTimeout(ectx, c.lookupTimeout)
 	nsver, err := c.ns.Version(lctx, rec.tenant)
 	nsOK, storeFailed := err == nil, false
 	switch {
@@ -332,11 +345,14 @@ func (g *Gateway) lookupCache(ctx context.Context, ex Exchange, rec *record, req
 		st.entry, storeFailed = g.lookupExact(ctx, lctx, rec, req, rt, target, scope, nsver)
 	}
 	cancel()
-	if pol.Exact.Enabled {
-		m.cacheLookupSeconds.WithLabelValues(cache.LayerExact).Observe(time.Since(start).Seconds())
-	}
 	if st.entry != nil {
 		st.status = cache.StatusExact
+	}
+	if pol.Exact.Enabled {
+		m.cacheLookupSeconds.WithLabelValues(cache.LayerExact).Observe(time.Since(start).Seconds())
+		endCacheSpan(espan, st.entry != nil)
+	}
+	if st.entry != nil {
 		return nil
 	}
 
@@ -370,8 +386,10 @@ func (g *Gateway) lookupCache(ctx context.Context, ex Exchange, rec *record, req
 		return nil
 	}
 	start = time.Now()
-	res := c.sem.Lookup(ctx, partition, text, pol.Semantic.MinSimilarity)
+	sctx, sspan := tracing.Start(ctx, tracing.SpanCacheSemantic)
+	res := c.sem.Lookup(sctx, partition, text, pol.Semantic.MinSimilarity)
 	m.cacheLookupSeconds.WithLabelValues(cache.LayerSemantic).Observe(time.Since(start).Seconds())
+	endCacheSpan(sspan, res.Entry != nil && res.Err == nil && g.entryAllowed(rt, res.Entry))
 	if res.EmbedCostNano > 0 {
 		st.overhead = usage.FromNanoUSD(res.EmbedCostNano)
 	}
@@ -400,11 +418,25 @@ func (g *Gateway) lookupCache(ctx context.Context, ex Exchange, rec *record, req
 	return nil
 }
 
+// endCacheSpan ends the span of a cache layer's lookup, with its result,
+// hit or miss, as switchyard.cache_status. It records nothing else: no
+// key, partition or content.
+func endCacheSpan(span trace.Span, hit bool) {
+	if span.IsRecording() {
+		status := cache.StatusMiss
+		if hit {
+			status = "hit"
+		}
+		span.SetAttributes(tracing.AttrCacheStatus.String(status))
+	}
+	span.End()
+}
+
 // lookupExact computes the request's exact key into rec.cache.key and
 // reads it within lctx, returning the entry of a hit, and whether the
 // store failed. A failure is counted and logged, and is a miss; so is an
 // entry the request's policy forbids (see entryAllowed), counted policy.
-func (g *Gateway) lookupExact(ctx, lctx context.Context, rec *record, req *schema.ChatRequest, rt *routed, target, scope string, nsver int64) (*cache.Entry, bool) {
+func (g *snapshot) lookupExact(ctx, lctx context.Context, rec *record, req *schema.ChatRequest, rt *routed, target, scope string, nsver int64) (*cache.Entry, bool) {
 	m := g.metrics
 	canonical, err := cache.Canonical(req, target)
 	if err != nil {
@@ -438,7 +470,7 @@ func (g *Gateway) lookupExact(ctx, lctx context.Context, rec *record, req *schem
 // would be spend the budget cannot take. Only a request that reaches the
 // semantic layer under a blocking budget reads the store; when the store
 // fails, the budgets are unknown and the lookup goes ahead.
-func (g *Gateway) budgetExhausted(ctx context.Context, rec *record) bool {
+func (g *snapshot) budgetExhausted(ctx context.Context, rec *record) bool {
 	if !blocks(g.scopes[principal{rec.tenant, rec.keyID}]) {
 		return false
 	}
@@ -449,7 +481,7 @@ func (g *Gateway) budgetExhausted(ctx context.Context, rec *record) bool {
 // cacheFailed logs a cache failure of layer at WARN, at most once per
 // cacheWarnEvery per layer. The error never holds content: the stores and
 // the embedder never put prompts or responses in their errors.
-func (g *Gateway) cacheFailed(ctx context.Context, layer, msg string, err error) {
+func (g *snapshot) cacheFailed(ctx context.Context, layer, msg string, err error) {
 	i := 0
 	if layer == cache.LayerSemantic {
 		i = 1
@@ -470,7 +502,7 @@ func (g *Gateway) cacheFailed(ctx context.Context, layer, msg string, err error)
 // request is not shadow sampled. It returns false, having answered
 // nothing, when a cached stream body cannot be replayed: the request is
 // then a miss.
-func (g *Gateway) serveHit(ex Exchange, rec *record, req *schema.ChatRequest, rt *routed) bool {
+func (g *snapshot) serveHit(ex Exchange, rec *record, req *schema.ChatRequest, rt *routed) bool {
 	st := &rec.cache
 	e := st.entry
 	var events [][]byte
@@ -575,7 +607,7 @@ func (st *cacheState) aggregate(c *schema.ChatChunk, maxBytes int) {
 // served, so there is nothing to count. An answer routed with a budget's
 // soft profile is not cacheable: its key names the profile before the
 // downgrade (see cacheTarget), which it does not answer for.
-func (g *Gateway) cacheEntry(rec *record) (*cache.Entry, string) {
+func (g *snapshot) cacheEntry(rec *record) (*cache.Entry, string) {
 	st := &rec.cache
 	if !rec.served || rec.deployment == nil {
 		return nil, ""
@@ -613,7 +645,7 @@ func (g *Gateway) cacheEntry(rec *record) (*cache.Entry, string) {
 // semantic TTL. A request with X-Switchyard-Cache: no-store is not
 // written. It never delays the response: a write that finds the pool full
 // is dropped and counted.
-func (g *Gateway) writeCache(rec *record) {
+func (g *snapshot) writeCache(rec *record) {
 	st := &rec.cache
 	if !st.eligible || st.noStore || st.entry != nil {
 		return
@@ -647,7 +679,7 @@ func (g *Gateway) writeCache(rec *record) {
 
 // submitWrite runs write in the write pool, within cacheWriteTimeout, and
 // counts its result; it counts dropped when the pool is full or closed.
-func (g *Gateway) submitWrite(layer string, write func(ctx context.Context) error) {
+func (g *snapshot) submitWrite(layer string, write func(ctx context.Context) error) {
 	ok := g.cache.writes.submit(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), CacheWriteTimeout)
 		defer cancel()
@@ -740,45 +772,38 @@ type purgeResponse struct {
 	NamespaceVersion int64  `json:"namespace_version"`
 }
 
-// CachePurgeHandler serves POST /admin/v1/cache/purge with the body
-// {"tenant":"<id>"}: it bumps the tenant's namespace version, which every
-// exact key and semantic partition of the tenant includes, so all of its
-// entries stop matching at once (they then expire with their TTLs or are
-// evicted) and other tenants are untouched. It answers 200 with
-// {"tenant", "namespace_version"}, 400 for a missing or unknown tenant or
-// a malformed body, and 503 when the namespace store fails. Errors never
-// echo the body. The gateway keeps no per-tenant cache state in process,
-// so nothing survives a purge on this replica. It belongs on the admin
-// listener.
-func (g *Gateway) CachePurgeHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req purgeRequest
-		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxPurgeBody))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil || dec.More() {
-			apierror.WriteParam(w, http.StatusBadRequest, apierror.TypeInvalidRequest, "invalid_request",
-				`The body must be a JSON object {"tenant": "<tenant id>"}.`, "")
-			return
-		}
-		if _, ok := g.tenants[req.Tenant]; !ok || req.Tenant == "" {
-			apierror.WriteParam(w, http.StatusBadRequest, apierror.TypeInvalidRequest, "unknown_tenant",
-				"The tenant is missing or is not configured.", "tenant")
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), purgeTimeout)
-		defer cancel()
-		v, err := g.cache.ns.Bump(ctx, req.Tenant)
-		if err != nil {
-			reqctx.Logger(r.Context()).WarnContext(r.Context(), "cache purge failed: the namespace store is unavailable", "error", err)
-			apierror.WriteParam(w, http.StatusServiceUnavailable, apierror.TypeServer, "cache_unavailable",
-				"The cache namespace store is unavailable; the tenant was not purged. Please retry.", "")
-			return
-		}
-		reqctx.Logger(r.Context()).InfoContext(r.Context(), "cache purged", "tenant", req.Tenant, "namespace_version", v)
-		data, _ := json.Marshal(purgeResponse{Tenant: req.Tenant, NamespaceVersion: v})
-		h := w.Header()
-		h.Set("Content-Type", "application/json")
-		h.Set("Cache-Control", "no-store")
-		_, _ = w.Write(data)
-	})
+// purge serves POST /admin/v1/cache/purge (see CachePurgeHandler).
+func (g *snapshot) purge(w http.ResponseWriter, r *http.Request) {
+	var req purgeRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxPurgeBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil || dec.More() {
+		apierror.WriteParam(w, http.StatusBadRequest, apierror.TypeInvalidRequest, "invalid_request",
+			`The body must be a JSON object {"tenant": "<tenant id>"}.`, "")
+		server.Audit(r, auditPurge, server.AuditRejected, slog.String("reason", "invalid_body"))
+		return
+	}
+	if _, ok := g.tenants[req.Tenant]; !ok || req.Tenant == "" {
+		apierror.WriteParam(w, http.StatusBadRequest, apierror.TypeInvalidRequest, "unknown_tenant",
+			"The tenant is missing or is not configured.", "tenant")
+		// An unknown tenant id is client input; it is not logged.
+		server.Audit(r, auditPurge, server.AuditRejected, slog.String("reason", "unknown_tenant"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), purgeTimeout)
+	defer cancel()
+	v, err := g.cache.ns.Bump(ctx, req.Tenant)
+	if err != nil {
+		reqctx.Logger(r.Context()).WarnContext(r.Context(), "cache purge failed: the namespace store is unavailable", "error", err)
+		apierror.WriteParam(w, http.StatusServiceUnavailable, apierror.TypeServer, "cache_unavailable",
+			"The cache namespace store is unavailable; the tenant was not purged. Please retry.", "")
+		server.Audit(r, auditPurge, server.AuditError, slog.String("tenant", req.Tenant), slog.String("reason", "namespace_store_unavailable"))
+		return
+	}
+	server.Audit(r, auditPurge, server.AuditOK, slog.String("tenant", req.Tenant), slog.Int64("namespace_version", v))
+	data, _ := json.Marshal(purgeResponse{Tenant: req.Tenant, NamespaceVersion: v})
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	h.Set("Cache-Control", "no-store")
+	_, _ = w.Write(data)
 }

@@ -62,9 +62,9 @@ models:
 	}
 	var a providers.Adapter
 	if typ == "anthropic" {
-		a, err = anthropic.New(cfg.Providers[0])
+		a, err = anthropic.New(cfg.Providers[0], providers.Options{})
 	} else {
-		a, err = openai.New(cfg.Providers[0])
+		a, err = openai.New(cfg.Providers[0], providers.Options{})
 	}
 	if err != nil {
 		t.Fatal(err)

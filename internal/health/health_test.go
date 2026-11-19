@@ -430,6 +430,64 @@ func TestStateSurvivesNewHandles(t *testing.T) {
 	}
 }
 
+// TestBatch: a Batch changes neither the Tracker nor its handles until
+// Apply, which registers its new handles and applies its settings; a
+// Batch never applied leaves no trace.
+func TestBatch(t *testing.T) {
+	tests := []struct {
+		name  string
+		apply bool
+		// want* are what the Tracker reports afterwards.
+		wantMax  int
+		wantTTFT float64
+		wantIDs  string
+	}{
+		{"not applied", false, 0, 0, "m@a"},
+		{"applied", true, 3, 750, "m@a,n@a"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr, _, _ := newTracker(testConfig())
+			p := tr.Provider("a", 0)
+			d := tr.Deployment("m@a", "a", LatencyHint{})
+			attempt(t, d, providers.KindServerError)
+
+			b := tr.Batch()
+			if b.Provider("a", 3) != p || b.Deployment("m@a", "a", LatencyHint{TTFT: 750 * time.Millisecond}) != d {
+				t.Fatal("the batch did not return the existing handles")
+			}
+			n := b.Deployment("n@a", "a", LatencyHint{})
+			if b.Deployment("n@a", "a", LatencyHint{}) != n {
+				t.Error("the batch returned two handles for one new id")
+			}
+			if p.Max() != 0 {
+				t.Errorf("max_concurrency %d before Apply, want 0", p.Max())
+			}
+			if tt.apply {
+				b.Apply()
+			}
+
+			s := tr.Snapshot()
+			if len(s.Providers) != 1 || s.Providers[0].MaxConcurrency != tt.wantMax {
+				t.Fatalf("providers %+v, want max_concurrency %d", s.Providers, tt.wantMax)
+			}
+			var ids []string
+			for _, ds := range s.Providers[0].Deployments {
+				ids = append(ids, ds.ID)
+				if ds.ID == "m@a" && (ds.Latency.TTFTMs != tt.wantTTFT || ds.Recent.Failures != 1) {
+					t.Errorf("m@a %+v, want ttft_ms %v and its failure kept", ds, tt.wantTTFT)
+				}
+			}
+			if got := strings.Join(ids, ","); got != tt.wantIDs {
+				t.Errorf("deployments %s, want %s", got, tt.wantIDs)
+			}
+			if tt.apply && tr.Deployment("n@a", "a", LatencyHint{}) != n {
+				t.Error("Apply did not register the new handle")
+			}
+		})
+	}
+}
+
 func TestSnapshot(t *testing.T) {
 	tr, clk, _ := newTracker(testConfig())
 	pb := tr.Provider("b", 4)

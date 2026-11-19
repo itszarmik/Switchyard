@@ -4,6 +4,7 @@ version: 1
 server:
   listen: "127.0.0.1:8080"
   admin_listen: ":9090"
+  admin_token: ${SWITCHYARD_ADMIN_TOKEN:-test.admin.token.for.the.cli.tests}
 
 logging:
   level: info

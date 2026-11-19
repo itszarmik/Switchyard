@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"switchyard/internal/config"
 )
@@ -46,6 +47,11 @@ type Principal struct {
 	// Tags are the key's tags from config. The slice is shared by every
 	// request made with the key; callers must not modify it.
 	Tags []string
+	// RateLimit is the key's effective rate limit: the key's own
+	// rate_limit when it sets one, else its tenant's. The zero value means
+	// no limit. It comes from the Store the request authenticated against,
+	// so a reload changes it for the requests that follow.
+	RateLimit config.RateLimit
 }
 
 // GenerateKey returns a new random gateway key and its hash. The key is
@@ -88,7 +94,11 @@ func NewStore(tenants []config.Tenant) *Store {
 			if _, dup := s.byHash[sum]; dup {
 				continue
 			}
-			s.byHash[sum] = Principal{TenantID: t.ID, KeyID: k.ID, Tags: slices.Clip(slices.Clone(k.Tags))}
+			lim := t.RateLimit
+			if k.RateLimit != nil {
+				lim = *k.RateLimit
+			}
+			s.byHash[sum] = Principal{TenantID: t.ID, KeyID: k.ID, Tags: slices.Clip(slices.Clone(k.Tags)), RateLimit: lim}
 		}
 	}
 	return s
@@ -131,6 +141,37 @@ func (s *Store) Len() int {
 	}
 	return len(s.byHash)
 }
+
+// Authenticator authenticates a presented gateway key. *Store and
+// *Keyring implement it.
+type Authenticator interface {
+	// Authenticate returns the Principal that owns key, or false.
+	Authenticate(key string) (Principal, bool)
+}
+
+// Keyring holds the Store in force and replaces it atomically, for config
+// reloads: each request authenticates against the Store in force when it
+// arrives, and a key removed by a reload stops authenticating at once. It
+// is safe for concurrent use.
+type Keyring struct {
+	cur atomic.Pointer[Store]
+}
+
+// NewKeyring returns a Keyring that holds s.
+func NewKeyring(s *Store) *Keyring {
+	k := &Keyring{}
+	k.cur.Store(s)
+	return k
+}
+
+// Swap makes s the Store in force.
+func (k *Keyring) Swap(s *Store) { k.cur.Store(s) }
+
+// Store returns the Store in force.
+func (k *Keyring) Store() *Store { return k.cur.Load() }
+
+// Authenticate authenticates key against the Store in force.
+func (k *Keyring) Authenticate(key string) (Principal, bool) { return k.cur.Load().Authenticate(key) }
 
 // principalKey is the context key for the authenticated Principal.
 type principalKey struct{}

@@ -59,7 +59,7 @@ func (e *cacheEnv) setSemantic(t *testing.T, emb cache.Embedder) { e.setSemantic
 // memory, on the deployment dep.
 func (e *cacheEnv) setSemanticOn(t *testing.T, emb cache.Embedder, dep string) {
 	t.Helper()
-	res, err := e.g.catalog.Resolve(dep)
+	res, err := e.g.current().catalog.Resolve(dep)
 	if err != nil {
 		t.Fatal(err)
 	}

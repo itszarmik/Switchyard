@@ -147,11 +147,11 @@ func TestNew(t *testing.T) {
 
 	t.Run("one adapter per provider, of its type", func(t *testing.T) {
 		g, _, _ := newTestGateway(t)
-		if _, ok := g.adapters["fake"].(*openai.Adapter); !ok {
-			t.Errorf("fake adapter = %T", g.adapters["fake"])
+		if _, ok := g.current().adapters["fake"].(*openai.Adapter); !ok {
+			t.Errorf("fake adapter = %T", g.current().adapters["fake"])
 		}
-		if _, ok := g.adapters["anth"].(*anthropic.Adapter); !ok {
-			t.Errorf("anth adapter = %T", g.adapters["anth"])
+		if _, ok := g.current().adapters["anth"].(*anthropic.Adapter); !ok {
+			t.Errorf("anth adapter = %T", g.current().adapters["anth"])
 		}
 	})
 }
@@ -539,7 +539,7 @@ func TestChatCompletionsPipeline(t *testing.T) {
 			var log []string
 			ad := tt.adapter
 			ad.log = &log
-			g.adapters["fake"] = &ad
+			g.current().adapters["fake"] = &ad
 			ex := &fakeExchange{body: []byte(tt.body), bodyErr: tt.bodyErr, header: http.Header{}, log: &log, failAt: tt.failAt}
 			ctx, ann := annotated(logs)
 
@@ -578,7 +578,7 @@ func annotations(a *reqctx.Annotations) map[string]any {
 func TestCompletionAnnotations(t *testing.T) {
 	g, logs, reg := newTestGateway(t)
 	var log []string
-	g.adapters["fake"] = &fakeAdapter{
+	g.current().adapters["fake"] = &fakeAdapter{
 		log: &log, chunks: []string{`{"choices":[{"index":0}]}`},
 		usage: &schema.Usage{PromptTokens: 11, CompletionTokens: 22},
 	}
@@ -713,7 +713,7 @@ func TestOverheadExcludesClientWrites(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g, logs, _ := newTestGateway(t)
 			var log []string
-			g.adapters["fake"] = &fakeAdapter{log: &log, chunks: tt.chunks}
+			g.current().adapters["fake"] = &fakeAdapter{log: &log, chunks: tt.chunks}
 			ctx, ann := annotated(logs)
 			g.ChatCompletions(ctx, &fakeExchange{body: []byte(tt.body), log: &log, header: http.Header{}, slow: slow})
 

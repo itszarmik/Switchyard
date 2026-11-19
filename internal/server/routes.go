@@ -62,7 +62,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Status        string `json:"status"`
 		ConfigVersion string `json:"config_version"`
-	}{Status: "ready", ConfigVersion: s.opts.ConfigVersion})
+	}{Status: "ready", ConfigVersion: s.ConfigVersion()})
 }
 
 // failedChecks runs the checks concurrently and returns the names of those

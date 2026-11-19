@@ -102,6 +102,8 @@ func TestLoadHappyPath(t *testing.T) {
 			MemoryMaxEntries: DefaultCacheMemoryMaxEntries,
 		},
 		SemanticCache: SemanticCacheConfig{LookupTimeout: Duration(DefaultSemanticLookupTimeout)},
+		RateLimits:    RateLimits{FailMode: DefaultRateLimitFailMode, AuthFailuresPerMinute: DefaultAuthFailuresPerMinute},
+		Telemetry:     Telemetry{Tracing: Tracing{SampleRatio: DefaultTracingSampleRatio, ServiceName: DefaultTracingServiceName}},
 	}
 	if diff := cmp.Diff(want, cfg, cmp.Comparer(func(a, b Secret) bool { return a.Value() == b.Value() })); diff != "" {
 		t.Errorf("Config mismatch (-want +got):\n%s", diff)
@@ -467,16 +469,17 @@ func TestValidationErrorSortedAndComplete(t *testing.T) {
 		// No tenants: a warning about a missing key sorts first, at line 0.
 		"cfg.yaml: warning: tenants: " + msgNoTenants,
 		`cfg.yaml:4: warning: server.admin_listen: ` + msgAdminExposed,
+		`cfg.yaml:4: error: server.admin_token: ` + msgAdminTokenRequired,
 		`cfg.yaml:6: error: logging.level: must be one of debug, info, warn, error, got "loud"`,
 		`z.yaml:2: error: providers[0].id: must match ^[a-z0-9][a-z0-9_-]{0,62}$, got "BAD"`,
 	}
 	if diff := cmp.Diff(wantOrder, got); diff != "" {
 		t.Errorf("problems (-want +got):\n%s", diff)
 	}
-	if len(ve.Errors()) != 2 {
-		t.Errorf("Errors() = %d, want 2", len(ve.Errors()))
+	if len(ve.Errors()) != 3 {
+		t.Errorf("Errors() = %d, want 3", len(ve.Errors()))
 	}
-	if !strings.HasSuffix(ve.Error(), "2 errors, 2 warnings") {
+	if !strings.HasSuffix(ve.Error(), "3 errors, 2 warnings") {
 		t.Errorf("Error() = %q", ve.Error())
 	}
 }

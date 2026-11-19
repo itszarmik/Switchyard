@@ -112,7 +112,7 @@ func TestLint(t *testing.T) {
 
 // Config warnings outside the catalog are not lint findings.
 func TestLintIgnoresOtherWarnings(t *testing.T) {
-	snap, _ := loadSnapshot(t, "version: 1\nserver: {admin_listen: ':9090'}\n")
+	snap, _ := loadSnapshot(t, "version: 1\nserver: {admin_listen: ':9090', admin_token: test.admin.token.for.the.lint.tests}\n")
 	if len(snap.Warnings()) != 2 {
 		t.Fatalf("warnings = %v, want the admin and no-tenants warnings", snap.Warnings())
 	}

@@ -35,36 +35,28 @@ type budgetStoreStatus struct {
 // budgetCheckTimeout bounds the budget store check of the provider report.
 const budgetCheckTimeout = time.Second
 
-// ProvidersHandler serves GET /admin/v1/providers: for every provider its
-// in-flight count and max_concurrency, and for each of its deployments the
-// breaker state and the time of its next transition, the rate-limit
-// cooldown, the recent request and failure counts, the retry budget and
-// the latency statistics. With Options.BudgetStoreCheck, it also reports
-// whether the budget store answers, and budgets.fail_mode. It shows no
-// secrets. It belongs on the admin listener.
-func (g *Gateway) ProvidersHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		report := providersReport{GeneratedAt: time.Now().UTC(), Providers: g.health.Snapshot().Providers}
-		if g.budgetCheck != nil {
-			ctx, cancel := context.WithTimeout(r.Context(), budgetCheckTimeout)
-			st := &budgetStoreStatus{Status: "ok", FailMode: g.failMode}
-			if g.budgetCheck(ctx) != nil {
-				st.Status = "unavailable"
-			}
-			cancel()
-			report.BudgetStore = st
+// serveProviders serves GET /admin/v1/providers (see ProvidersHandler).
+func (g *snapshot) serveProviders(w http.ResponseWriter, r *http.Request) {
+	report := providersReport{GeneratedAt: time.Now().UTC(), Providers: g.health.Snapshot().Providers}
+	if g.budgetCheck != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), budgetCheckTimeout)
+		st := &budgetStoreStatus{Status: "ok", FailMode: g.failMode}
+		if g.budgetCheck(ctx) != nil {
+			st.Status = "unavailable"
 		}
-		data, err := json.Marshal(report)
-		if err != nil {
-			ctx := r.Context()
-			reqctx.Logger(ctx).ErrorContext(ctx, "encode the provider report", "error", err)
-			apierror.Write(w, http.StatusInternalServerError, apierror.TypeServer, "internal_error", "Could not encode the provider report.")
-			return
-		}
-		h := w.Header()
-		h.Set("Content-Type", "application/json")
-		h.Set("Cache-Control", "no-store")
-		h.Set("Content-Length", strconv.Itoa(len(data)))
-		_, _ = w.Write(data)
-	})
+		cancel()
+		report.BudgetStore = st
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		ctx := r.Context()
+		reqctx.Logger(ctx).ErrorContext(ctx, "encode the provider report", "error", err)
+		apierror.Write(w, http.StatusInternalServerError, apierror.TypeServer, "internal_error", "Could not encode the provider report.")
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	h.Set("Cache-Control", "no-store")
+	h.Set("Content-Length", strconv.Itoa(len(data)))
+	_, _ = w.Write(data)
 }

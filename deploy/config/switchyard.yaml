@@ -1,0 +1,176 @@
+# Switchyard configuration for deploy/compose.yaml: the "small production"
+# tier of DESIGN §18.1. One gateway, Redis for cache and state, Postgres for
+# the usage ledger, and the curated model catalog.
+#
+# Every value that differs per installation comes from the environment,
+# which compose fills from deploy/.env (written by deploy/init.sh; see
+# docs/quickstart.md). Secrets are never written into this file. For every
+# key and its default, see docs/configuration.md.
+#
+# compose mounts this directory, deploy/config, read-only at
+# /etc/switchyard/config. The directory, not the file: editors and sed -i
+# save by writing a new file and renaming it, which a single-file bind mount
+# would never show the container, so a reload would read the old file.
+# After editing it, apply the change without a restart: `docker compose
+# kill -s HUP gateway`, or POST /admin/v1/reload on the admin listener.
+# Listener, storage, logging and telemetry changes need a restart
+# (`docker compose up -d --force-recreate gateway`).
+version: 1
+
+# The curated catalog (configs/catalog, mounted at /etc/switchyard/catalog,
+# beside this directory): models, deployments, prices and quality priors,
+# plus the measured priors that `switchyard eval fit` writes to
+# quality-overrides.yaml.
+include:
+  - ../catalog/*.yaml
+
+server:
+  listen: ":8080"
+  # All interfaces inside the container, so Prometheus can scrape /metrics
+  # over the compose network. compose.yaml publishes it on 127.0.0.1 only.
+  # Because it is not loopback, the admin token is required.
+  admin_listen: ":9090"
+  # Required on every /admin/v1/* request as "Authorization: Bearer <token>";
+  # /metrics stays open for Prometheus. init.sh generates it.
+  admin_token: ${SWITCHYARD_ADMIN_TOKEN}
+  # Streams can be long. The process exits within shutdown_delay +
+  # shutdown_grace + 15s of SIGTERM: compose's stop_grace_period (75s)
+  # matches; raise it with this.
+  shutdown_grace: 60s
+
+# SWITCHYARD_LOG_LEVEL in .env overrides the level without an edit.
+logging:
+  level: info
+  format: json
+
+storage:
+  mode: redis
+  redis:
+    # Evictable cache instance (allkeys-lru, no persistence).
+    cache_url: ${REDIS_CACHE_URL:-redis://redis-cache:6379/0}
+    # Budgets, rate limits and cache namespace versions (noeviction, AOF).
+    state_url: ${REDIS_STATE_URL:-redis://redis-state:6379/0}
+  ledger:
+    driver: postgres
+    # Built by compose.yaml from POSTGRES_PASSWORD.
+    dsn: ${DATABASE_URL}
+
+# Providers are listed for every deployment in the catalog. A key that is
+# not set is empty, and that provider's calls fail with 401: they fall
+# back to another provider and open its breakers, which the
+# SwitchyardUpstreamAuthFailures alert reports. To keep "auto" routing on
+# the providers you have keys for, init.sh sets SWITCHYARD_ALLOW (see the
+# default policy below).
+providers:
+  - id: openai
+    type: openai
+    base_url: ${SWITCHYARD_OPENAI_BASE_URL:-https://api.openai.com/v1}
+    api_key: ${OPENAI_API_KEY:-}
+  - id: anthropic
+    type: anthropic
+    base_url: ${SWITCHYARD_ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+    api_key: ${ANTHROPIC_API_KEY:-}
+    forward_headers: [anthropic-beta]
+  - id: google
+    type: openai
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key: ${GEMINI_API_KEY:-}
+  - id: together
+    type: openai
+    base_url: https://api.together.xyz/v1
+    api_key: ${TOGETHER_API_KEY:-}
+  # Text Embeddings Inference, started by `docker compose --profile tei`.
+  # It serves the OpenAI embeddings API; nothing calls it unless the
+  # semantic cache uses bge-small-en-v1.5 (below).
+  - id: tei
+    type: openai
+    base_url: http://tei:80/v1
+    tags: [self_hosted, zdr]
+    timeouts: { connect: 2s }
+
+models:
+  # A self-hosted embedding model for the semantic cache, served by the tei
+  # profile. Self-hosted, so its price is 0.
+  - id: bge-small-en-v1.5
+    type: embedding
+    context_window: 512
+    dimensions: 384
+    deployments:
+      - provider: tei
+        upstream_model: BAAI/bge-small-en-v1.5
+        pricing: { input: "0" }
+
+aliases:
+  fast: claude-haiku-5-5
+  smart: claude-opus-5-5
+
+routing:
+  default_profile: balanced
+
+semantic_cache:
+  # bge-small-en-v1.5 (with --profile tei) or text-embedding-3-small (with an
+  # OpenAI key). Required when SWITCHYARD_SEMANTIC_CACHE is true.
+  embedding_model: ${SWITCHYARD_EMBEDDING_MODEL:-}
+
+policies:
+  - id: default
+    profile: balanced
+    # "What you would have used without Switchyard": savings are measured
+    # against it.
+    baseline_model: claude-sonnet-5-5
+    # Deployments "auto" may route to (globs over model@provider). init.sh
+    # sets *@openai or *@anthropic when only that key is given, else *.
+    # The self-hosted embedding deployment is always permitted, so the tei
+    # profile's semantic cache works whatever SWITCHYARD_ALLOW is; "auto"
+    # never routes chat to an embedding model.
+    allow: ["${SWITCHYARD_ALLOW:-*}", "bge-small-en-v1.5@tei"]
+    # A hard cap per request, against runaway prompts.
+    max_cost_per_request_usd: "0.50"
+    cache:
+      exact:
+        enabled: true
+        ttl: 24h
+        scope: tenant
+      semantic:
+        enabled: ${SWITCHYARD_SEMANTIC_CACHE:-false}
+
+budgets:
+  # If redis-state is down, keep serving (per-request caps still apply) and
+  # alert. Set closed to reject with 503 instead.
+  fail_mode: open
+
+rate_limits:
+  fail_mode: open
+
+tenants:
+  - id: default
+    policy: default
+    # Per key: 600 requests a minute (bursts of 100) and 20 concurrent
+    # streams. Shared by every replica through redis-state.
+    rate_limit:
+      requests_per_minute: 600
+      max_concurrent_streams: 20
+    budgets:
+      # A monthly ceiling against surprises. At 80 % "auto" requests switch to
+      # the cheap profile; at 100 % requests get 429 budget_exceeded.
+      - scope: tenant
+        window: month
+        limit_usd: ${SWITCHYARD_MONTHLY_BUDGET_USD:-100}
+        soft_at: 0.8
+        soft_profile: cheap
+        on_exhausted: block
+    keys:
+      # The key init.sh generated; only its SHA-256 hash is stored. Add
+      # more keys with `switchyard keys generate` and reload.
+      - id: quickstart
+        hash: ${SWITCHYARD_API_KEY_HASH}
+
+telemetry:
+  tracing:
+    # On with the observability profile: init.sh's .env and
+    # `make compose-up PROFILES=observability` set it.
+    enabled: ${SWITCHYARD_TRACING_ENABLED:-false}
+    # Jaeger's OTLP/HTTP receiver in the observability profile.
+    endpoint: ${SWITCHYARD_TRACING_ENDPOINT:-http://jaeger:4318}
+    # Every new trace while you try it out; lower it for real traffic.
+    sample_ratio: ${SWITCHYARD_TRACING_SAMPLE_RATIO:-1}

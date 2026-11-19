@@ -17,6 +17,7 @@ import (
 	"switchyard/internal/quality"
 	"switchyard/internal/router"
 	"switchyard/internal/schema"
+	"switchyard/internal/tracing"
 	"switchyard/internal/usage"
 )
 
@@ -117,15 +118,17 @@ type routed struct {
 // observe reports whether the request runs in observe mode.
 func (rt *routed) observe() bool { return rt.eff.RoutingMode == policy.ModeObserve }
 
-// route routes rr (steps 1–9 of the pipeline): routePolicy, then
-// routeDecide.
+// route routes rr (steps 1–9 of the pipeline): routePolicy, traced as a
+// tracing.SpanPolicy span, then routeDecide.
 //
 // The outcome is written to rt, which route returns with any error, so
 // that the caller can send the headers known by then; it returns nil only
 // when the model field could not be resolved. rt is the caller's, usually
 // part of the request's record, to spare an allocation per request.
-func (g *Gateway) route(ctx context.Context, endpoint string, rr *routeRequest, rt *routed) (*routed, *Error) {
+func (g *snapshot) route(ctx context.Context, endpoint string, rr *routeRequest, rt *routed) (*routed, *Error) {
+	_, span := tracing.Start(ctx, tracing.SpanPolicy)
 	out, preq, e := g.routePolicy(endpoint, rr, rt)
+	span.End()
 	if e != nil {
 		return out, e
 	}
@@ -139,7 +142,7 @@ func (g *Gateway) route(ctx context.Context, endpoint string, rr *routeRequest, 
 // which needs the policy, can come before anything that depends on the
 // budgets or the deployments' health. Its results are written to rt, as
 // for route; it also returns the policy request, which routeDecide needs.
-func (g *Gateway) routePolicy(endpoint string, rr *routeRequest, rt *routed) (*routed, policy.Request, *Error) {
+func (g *snapshot) routePolicy(endpoint string, rr *routeRequest, rt *routed) (*routed, policy.Request, *Error) {
 	*rt = routed{}
 	rt.served = &rt.full
 	target, virtual := g.catalog.VirtualTarget(rr.model)
@@ -214,8 +217,10 @@ func (g *Gateway) routePolicy(endpoint string, rr *routeRequest, rt *routed) (*r
 // has filled rt and returned preq: it downgrades the profile of an auto request whose
 // budget's soft threshold has been crossed, and asks the router for a
 // decision, which in observe mode is the shadow decision next to the
-// pinned one that is served.
-func (g *Gateway) routeDecide(ctx context.Context, rr *routeRequest, rt *routed, preq policy.Request) (*routed, *Error) {
+// pinned one that is served. It is traced as a tracing.SpanRoute span.
+func (g *snapshot) routeDecide(ctx context.Context, rr *routeRequest, rt *routed, preq policy.Request) (*routed, *Error) {
+	ctx, span := tracing.Start(ctx, tracing.SpanRoute)
+	defer span.End()
 	tenant := g.tenants[rr.tenant]
 	remaining, soft := g.budgetState(ctx, rr.tenant, rr.keyID)
 	downgrade := ""
@@ -291,7 +296,7 @@ func (g *Gateway) routeDecide(ctx context.Context, rr *routeRequest, rt *routed,
 // candidate, it decides again without it, so that the budget admission
 // answers 429 budget_exceeded rather than 400 no_eligible_model: the
 // remaining budget only steers the choice toward what fits.
-func (g *Gateway) decide(in router.Input) (router.Decision, *Error) {
+func (g *snapshot) decide(in router.Input) (router.Decision, *Error) {
 	dec, err := g.router.Decide(in)
 	var ne *catalog.NoEligibleError
 	if errors.As(err, &ne) && in.BudgetRemainingMicro >= 0 {
@@ -313,7 +318,7 @@ func (g *Gateway) decide(in router.Input) (router.Decision, *Error) {
 
 // emptyProfile is the answer for "auto:" with no profile name: 400
 // model_not_supported, naming the profiles the caller may select.
-func (g *Gateway) emptyProfile(tenant config.Tenant, rr *routeRequest) *Error {
+func (g *snapshot) emptyProfile(tenant config.Tenant, rr *routeRequest) *Error {
 	msg := "the auto: prefix needs a profile name"
 	allowed, err := g.policy.SelectableProfiles(tenant, rr.keyID)
 	if err == nil && len(allowed) > 0 {
@@ -324,7 +329,7 @@ func (g *Gateway) emptyProfile(tenant config.Tenant, rr *routeRequest) *Error {
 
 // keeper returns the router's Keep filter: deployments without an
 // adapter, then those keep excludes.
-func (g *Gateway) keeper(keep func(*catalog.Deployment) string) func(*catalog.Deployment) string {
+func (g *snapshot) keeper(keep func(*catalog.Deployment) string) func(*catalog.Deployment) string {
 	return func(d *catalog.Deployment) string {
 		if g.adapters[d.Provider] == nil {
 			return "provider type " + d.ProviderType + " is not supported"
@@ -338,7 +343,7 @@ func (g *Gateway) keeper(keep func(*catalog.Deployment) string) func(*catalog.De
 
 // baselineModel returns the catalog model named by a policy's
 // baseline_model, which validation guarantees is a chat model.
-func (g *Gateway) baselineModel(id string) (*catalog.Model, *Error) {
+func (g *snapshot) baselineModel(id string) (*catalog.Model, *Error) {
 	res, err := g.catalog.Resolve(id)
 	if err != nil || res.Model.Type != chatType {
 		return nil, internalError("The policy's baseline model is not a chat model in the catalog.")
@@ -354,7 +359,7 @@ func (g *Gateway) baselineModel(id string) (*catalog.Model, *Error) {
 // downgraded. An offline gateway has no store: it treats every budget as
 // untouched, with its whole limit left and its soft threshold not
 // crossed, as a fresh gateway would find it.
-func (g *Gateway) budgetState(ctx context.Context, tenant, keyID string) (int64, *budget.Scope) {
+func (g *snapshot) budgetState(ctx context.Context, tenant, keyID string) (int64, *budget.Scope) {
 	scopes := g.scopes[principal{tenant, keyID}]
 	if len(scopes) == 0 {
 		return -1, nil
@@ -572,7 +577,7 @@ func parseCost(s string) (usage.Money, bool) {
 
 // usePlan makes the routed request's served decision rec's plan and sets
 // what the response headers, logs and usage event say about it.
-func (g *Gateway) usePlan(rec *record, rt *routed) {
+func (g *snapshot) usePlan(rec *record, rt *routed) {
 	rec.useRoute(rt)
 	rec.baseReason = rt.reason
 	p := &rec.plan
@@ -628,7 +633,7 @@ func routeInfo(rt *routed) Info {
 
 // failRoute answers a request that could not be routed, with the headers
 // known so far.
-func (g *Gateway) failRoute(ex Exchange, rec *record, rt *routed, e *Error) {
+func (g *snapshot) failRoute(ex Exchange, rec *record, rt *routed, e *Error) {
 	info := Info{}
 	if rt != nil {
 		rec.route = rt

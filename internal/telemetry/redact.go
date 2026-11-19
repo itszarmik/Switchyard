@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Redacted replaces every secret value the redacting handler removes.
@@ -141,6 +143,27 @@ func (h *redactingHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.next.Handle(ctx, nr)
 }
 
+// AddSecrets adds exact secret values to the set scrubbed by the redacting
+// handler behind l, and by every logger derived from it with With or
+// WithGroup, which share the set. Values already in the set stay in it:
+// lines about requests still running on an older configuration may carry
+// the values it held. It reports false, and does nothing, when l's handler
+// is not one made by NewRedactingHandler (or NewLogger). Values shorter
+// than 8 characters are ignored, as at construction. It is safe to call
+// while logging; a line being scrubbed concurrently uses the set as it was
+// when that line's scrubbing began.
+//
+// Attrs added with WithAttrs before the call were scrubbed against the old
+// set and are not scrubbed again.
+func AddSecrets(l *slog.Logger, values []string) bool {
+	h, ok := l.Handler().(*redactingHandler)
+	if !ok {
+		return false
+	}
+	h.r.add(values)
+	return true
+}
+
 // WithAttrs scrubs attrs once and passes them to the inner handler.
 func (h *redactingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
@@ -177,13 +200,34 @@ func (h *redactingHandler) scrubAttr(a slog.Attr) (slog.Attr, bool) {
 }
 
 // redactor holds the exact secret values and applies the redaction rules.
-// It is immutable after construction and safe for concurrent use.
+// It is safe for concurrent use. The secret set only grows, through add,
+// which publishes a new immutable slice; scrub reads it with one atomic
+// load.
 type redactor struct {
-	secrets []string
+	secrets atomic.Pointer[[]string]
+	mu      sync.Mutex // serializes add
 }
 
 func newRedactor(secrets []string) *redactor {
-	var kept []string
+	r := &redactor{}
+	kept := secretForms(nil, secrets)
+	r.secrets.Store(&kept)
+	return r
+}
+
+// add adds secrets to the set, keeping the ones it already has.
+func (r *redactor) add(secrets []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := secretForms(*r.secrets.Load(), secrets)
+	r.secrets.Store(&kept)
+}
+
+// secretForms returns a new slice holding have plus every secret at least
+// minSecretLen long and its JSON-escaped forms, without duplicates, longest
+// first.
+func secretForms(have, secrets []string) []string {
+	kept := slices.Clone(have)
 	for _, s := range secrets {
 		if len(s) < minSecretLen {
 			continue
@@ -200,7 +244,7 @@ func newRedactor(secrets []string) *redactor {
 	// Replace longer secrets first, so a secret that contains another is
 	// removed whole.
 	slices.SortFunc(kept, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
-	return &redactor{secrets: kept}
+	return kept
 }
 
 // jsonEscape returns s as it appears inside a JSON string, with or without
@@ -220,7 +264,7 @@ func jsonEscape(s string, escapeHTML bool) string {
 // anything was replaced. It does not allocate when there is nothing to do.
 func (r *redactor) scrub(s string) (string, bool) {
 	changed := false
-	for _, secret := range r.secrets {
+	for _, secret := range *r.secrets.Load() {
 		if strings.Contains(s, secret) {
 			s = strings.ReplaceAll(s, secret, Redacted)
 			changed = true

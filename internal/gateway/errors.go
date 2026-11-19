@@ -16,6 +16,7 @@ import (
 
 // Error codes the gateway itself sets.
 const (
+	codeInvalidAPIKey   = "invalid_api_key"
 	codeModelNotFound   = "model_not_found"
 	codeModelNotSupport = "model_not_supported"
 	codeNoEligible      = "no_eligible_model"
@@ -42,6 +43,15 @@ func invalidRequest(err error) *Error {
 	return &Error{
 		Status: http.StatusBadRequest, Type: apierror.TypeInvalidRequest,
 		Code: re.Code, Param: re.Param, Message: re.Message,
+	}
+}
+
+// unknownKey is the auth middleware's answer for a key it does not know
+// (see knownCaller).
+func unknownKey() *Error {
+	return &Error{
+		Status: http.StatusUnauthorized, Type: apierror.TypeInvalidRequest, Code: codeInvalidAPIKey,
+		Message: "Incorrect API key provided.",
 	}
 }
 

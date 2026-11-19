@@ -64,6 +64,22 @@ server:
   # How long in-flight requests may take to finish once the listeners have
   # closed. Default 60s.
   shutdown_grace: 60s
+  # Bearer token every /admin/v1/* route requires when set (compared in
+  # constant time; 401 invalid_admin_token otherwise). /metrics, /healthz
+  # and /readyz stay open. At least 32 characters, without whitespace
+  # (`openssl rand -base64 32`); failed tokens count against
+  # rate_limits.auth_failures_per_minute. Required when admin_listen is
+  # not a loopback address. Reloadable:
+  # rotate it with a ${file:...} reference and a reload. Empty here, so
+  # the loopback admin listener is open.
+  admin_token: ${SWITCHYARD_ADMIN_TOKEN:-}
+  # Serve the public listener over HTTPS with a PEM certificate chain and
+  # key, both required together; min_version is "1.2" (default) or "1.3".
+  # The admin listener is always plain HTTP. Restart-only.
+  # tls:
+  #   cert_file: /run/secrets/tls.crt
+  #   key_file: /run/secrets/tls.key
+  #   min_version: "1.3"
 
 logging:
   # debug | info | warn | error. Default info.
@@ -466,17 +482,26 @@ policies:
 # Deployments without prices can't be budget-controlled precisely: under a
 # block budget they are admitted and settled at 1 micro-USD. catalog lint
 # flags them.
-# To revoke a key, delete its entry and restart.
+# To revoke a key, delete its entry and reload (SIGHUP or POST
+# /admin/v1/reload): it gets 401 from then on.
 # The hashes below belong to keys nobody has: replace them with your own.
 tenants:
   - id: acme
     # The policy of this tenant's keys. Default: the policy with id
     # "default", else built-in defaults.
     policy: default
+    # Each key's limits (DESIGN §7 step 3): requests a minute (GCRA; 0 is
+    # unlimited), the burst on top of it (default a sixth of the rate, at
+    # least 1) and concurrent streams (0 is unlimited). Over a limit: 429
+    # rate_limit_exceeded with Retry-After. With storage.mode redis, every
+    # replica shares the counters. Cache hits count too. Reloadable.
+    rate_limit: {requests_per_minute: 600, burst: 100, max_concurrent_streams: 20}
     keys:
       - id: acme-backend
         hash: sha256:0f7d5a33e1ad68ae7b2a4b139d4c5bf17737e0db942bfbecc5792bb3436d3e59
         tags: [prod]
+        # A key's own rate_limit replaces the tenant's entirely.
+        rate_limit: {requests_per_minute: 1200, burst: 200, max_concurrent_streams: 50}
       - id: acme-ci
         hash: sha256:0eb9387d9e4b212cd42007efc1e129c69f55b64724268d2b9edbdc45fda4a0c2
         policy: observe
@@ -500,6 +525,39 @@ budgets:
   # budget_unavailable. After a failure, or no answer within 1s, the store
   # is skipped for 5s, then one request tries it again.
   fail_mode: open
+
+# Gateway-wide rate-limit settings; the limits themselves are per tenant
+# and key (tenants[].rate_limit). Reloadable.
+rate_limits:
+  # While the rate-limit store (the Redis state instance) is unavailable:
+  # open (default) serves requests unlimited and counts
+  # switchyard_ratelimit_decisions_total{result="error"}; closed answers
+  # 503 rate_limit_unavailable.
+  fail_mode: open
+  # Failed authentications a client address (IPv4, or the IPv6 /64) may
+  # make a minute before it gets 429 for every request until they age
+  # out. In each replica's memory. Forwarding headers are never trusted,
+  # so behind a reverse proxy set -1 (off). Default 30.
+  auth_failures_per_minute: 30
+
+# OpenTelemetry tracing (DESIGN §15.3). Restart-only.
+telemetry:
+  tracing:
+    # Default false. An incoming traceparent still reaches the logs.
+    enabled: false
+    # The collector's OTLP/HTTP base URL; spans are posted as protobuf to
+    # <endpoint>/v1/traces. A secret: it may hold user:password@ (sent as
+    # Basic auth). Required when enabled.
+    endpoint: ${OTEL_COLLECTOR_URL:-http://otel-collector:4318}
+    # Share of new traces sampled; a sampled parent is always followed.
+    # Default 0.05.
+    sample_ratio: 0.05
+    service_name: switchyard
+    # Send the traceparent of the gateway's own upstream span to providers
+    # (never tracestate, baggage or a client's own trace context; nothing
+    # with tracing disabled). Default false: provider calls leave the trust
+    # boundary.
+    propagate_upstream: false
 
 # Response cache limits for every policy (DESIGN §11).
 cache:

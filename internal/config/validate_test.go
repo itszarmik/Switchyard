@@ -66,11 +66,11 @@ func TestValidationRules(t *testing.T) {
 		{"same port different hosts", v1 + "server: {listen: '10.0.0.1:9090', admin_listen: '127.0.0.1:9090'}\n", nil},
 
 		// admin exposure warning
-		{"admin all interfaces", v1 + "server: {admin_listen: ':9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed)}},
-		{"admin 0.0.0.0", v1 + "server: {admin_listen: '0.0.0.0:9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed)}},
-		{"admin [::]", v1 + "server: {admin_listen: '[::]:9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed)}},
-		{"admin public ip", v1 + "server: {admin_listen: '10.1.2.3:9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed)}},
-		{"admin hostname", v1 + "server: {admin_listen: 'admin.internal:9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed)}},
+		{"admin all interfaces", v1 + "server: {admin_listen: ':9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed), errAt("server.admin_token", msgAdminTokenRequired)}},
+		{"admin 0.0.0.0", v1 + "server: {admin_listen: '0.0.0.0:9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed), errAt("server.admin_token", msgAdminTokenRequired)}},
+		{"admin [::]", v1 + "server: {admin_listen: '[::]:9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed), errAt("server.admin_token", msgAdminTokenRequired)}},
+		{"admin public ip", v1 + "server: {admin_listen: '10.1.2.3:9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed), errAt("server.admin_token", msgAdminTokenRequired)}},
+		{"admin hostname", v1 + "server: {admin_listen: 'admin.internal:9090'}\n", []want{warnAt("server.admin_listen", msgAdminExposed), errAt("server.admin_token", msgAdminTokenRequired)}},
 		{"admin 127.1.2.3", v1 + "server: {admin_listen: '127.1.2.3:9090'}\n", nil},
 		{"admin LOCALHOST", v1 + "server: {admin_listen: 'LOCALHOST:9090'}\n", nil},
 

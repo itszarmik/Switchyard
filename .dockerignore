@@ -9,8 +9,9 @@ test
 coverage.*
 *.out
 *.test
-.env
-.env.*
+# Secrets, at any depth: deploy/.env holds every key of the compose stack.
+**/.env
+**/.env.*
 **/.DS_Store
 .idea
 .vscode

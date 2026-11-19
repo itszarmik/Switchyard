@@ -48,15 +48,12 @@ func (g *Gateway) SetShadow(s Shadow) { g.shadow = s }
 
 // Adapter returns the adapter of the provider with the given id, or nil
 // when the provider's type is not supported.
-func (g *Gateway) Adapter(provider string) providers.Adapter {
+func (g *snapshot) Adapter(provider string) providers.Adapter {
 	if a, ok := g.adapters[provider]; ok {
 		return a
 	}
 	return nil
 }
-
-// Catalog returns the gateway's catalog.
-func (g *Gateway) Catalog() *catalog.Catalog { return g.catalog }
 
 // shadowState is what a sampled request collects for its sample.
 type shadowState struct {
@@ -85,7 +82,7 @@ type shadowState struct {
 // missing or the served model itself is not sampled, and neither is an
 // enforce-mode request pinned to a concrete model that every planned
 // deployment serves as is (see offerShadow).
-func (g *Gateway) decideShadow(rec *record, rt *routed) {
+func (g *snapshot) decideShadow(rec *record, rt *routed) {
 	rate := rt.eff.ShadowSampleRate
 	switch {
 	case g.shadow == nil || rec.dryRun || !rec.authenticated || !(rate > 0):
@@ -194,7 +191,7 @@ func (r *record) offerShadow() {
 // healthy, has known prices, has the capabilities the request needs (other
 // than streaming, since the comparison call is not streamed) and that the
 // policy permits. It returns nil when there is none.
-func (g *Gateway) baselineDeployment(rec *record, rt *routed) *catalog.Deployment {
+func (g *snapshot) baselineDeployment(rec *record, rt *routed) *catalog.Deployment {
 	if rt.baseline == nil {
 		return nil
 	}

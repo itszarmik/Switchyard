@@ -8,8 +8,19 @@
 // POST /switchyard/v1/feedback, behind the API key middleware.
 // The admin listener adds GET /admin/v1/providers, the deployments'
 // health, GET /admin/v1/usage, the usage report of any tenant, and
-// POST /admin/v1/cache/purge, which purges a tenant's cache entries, to
-// its built-in routes.
+// POST /admin/v1/cache/purge, which purges a tenant's cache entries, and
+// POST /admin/v1/reload, which reloads the configuration (see Reload), to
+// its built-in routes. With server.admin_token set, every /admin/v1/*
+// route requires it. Reloads and purges write an audit line.
+//
+// Every authenticated public route runs behind the per-address limit on
+// failed authentications, authentication, and the key's request rate
+// (ratelimit.Enforcer), whose counters are in the Redis state instance
+// with storage.mode redis, shared by every replica, and in memory
+// otherwise; streaming requests also take a slot of the key's
+// concurrent-stream cap in the gateway. Tracing (telemetry.tracing) starts
+// the root span of every request outermost in the server's chain; the log
+// output goes through an asynchronous writer, drained last at shutdown.
 //
 // The usage ledger is kept in memory or in Postgres (storage.ledger), and
 // the budget counters in memory or, with storage.mode redis, in the Redis
@@ -44,6 +55,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,9 +74,11 @@ import (
 	"switchyard/internal/gateway"
 	"switchyard/internal/judge"
 	"switchyard/internal/providers"
+	"switchyard/internal/ratelimit"
 	"switchyard/internal/server"
 	"switchyard/internal/shadow"
 	"switchyard/internal/telemetry"
+	"switchyard/internal/tracing"
 	"switchyard/internal/usage"
 	"switchyard/internal/version"
 )
@@ -74,15 +89,29 @@ type App struct {
 	srv *server.Server
 	// ledger is the usage ledger, flushed by Run after the server has
 	// drained. redis is the state instance's client, if any.
-	ledger        ledger
-	redis         *redis.Client
-	shutdownGrace time.Duration
+	ledger ledger
+	redis  *redis.Client
 	// shadow is the shadow sampling runner, or nil when no policy samples.
 	shadow *shadow.Runner
 	// gw is the gateway, whose cache writes drain at shutdown; cacheRedis
 	// is the cache instance's client, if any.
 	gw         *gateway.Gateway
 	cacheRedis *redis.Client
+	// reload is the hot reload state (see Reload); budgetFailClosed is
+	// budgets.fail_mode closed in the configuration in force, for the
+	// budget store's readiness check.
+	reload           reloader
+	budgetFailClosed atomic.Bool
+	// limits is the gateway-wide rate-limit settings in force, swapped on
+	// every reload; rlimiter is the Redis rate limiter, if any, closed
+	// before the state client.
+	limits   atomic.Pointer[ratelimit.Limits]
+	rlimiter *ratelimit.RedisLimiter
+	// tracing is the tracer provider, shut down after the server drains.
+	tracing *tracing.Provider
+	// logWriter queues the log lines for a background goroutine; Run
+	// closes it last, after everything else has logged.
+	logWriter *telemetry.AsyncWriter
 }
 
 // ledger is a usage ledger: where events go, what reports read, and where
@@ -134,13 +163,51 @@ func cacheRedisIOTimeout(cfg *config.Config) time.Duration {
 	return max(cfg.Cache.LookupTimeout.Std(), cfg.SemanticCache.LookupTimeout.Std(), gateway.CacheWriteTimeout) + cacheRedisIOMargin
 }
 
-// New builds the service from snap, writing logs to logOutput.
+// New builds the service from snap, writing logs to logOutput. load, which
+// may be nil to turn reloads off, loads the configuration again for a
+// reload (see Reload), from the same sources as snap.
 //
 // It also installs the service logger as slog's default logger, and logs the
 // loaded configuration: "config loaded" at INFO, each snapshot warning at
 // WARN and the effective configuration at DEBUG.
-func New(snap *config.Snapshot, logOutput io.Writer) (*App, error) {
-	return newApp(snap, logOutput, openStorage)
+func New(snap *config.Snapshot, logOutput io.Writer, load Loader) (*App, error) {
+	a, err := newApp(snap, logOutput, openStorage)
+	if err != nil {
+		return nil, err
+	}
+	a.reload.load = load
+	return a, nil
+}
+
+// The bounds of the shutdown work after the server has drained (see Run).
+// It all fits in PostDrainTimeout, so a process stops within
+// server.shutdown_delay + server.shutdown_grace + PostDrainTimeout of
+// SIGTERM: the formula for compose's stop_grace_period and Kubernetes'
+// terminationGracePeriodSeconds.
+const (
+	// PostDrainTimeout bounds everything Run does once the server has
+	// drained.
+	PostDrainTimeout = 15 * time.Second
+	// tracingShutdownTimeout bounds the flush of the queued spans, and
+	// logCloseTimeout the final drain of the log queue; they come last.
+	tracingShutdownTimeout = 2 * time.Second
+	logCloseTimeout        = 2 * time.Second
+	// storageCloseTimeout is the rest: the shadow runner, the cache
+	// writes and the usage ledger's flush, which share one deadline.
+	storageCloseTimeout = PostDrainTimeout - tracingShutdownTimeout - logCloseTimeout
+	// shadowCloseTimeout and cacheCloseTimeout bound the shadow runner and
+	// the cache writes within it; the ledger gets what they leave, at
+	// least storageCloseTimeout - 5 s.
+	shadowCloseTimeout = 4 * time.Second
+	cacheCloseTimeout  = time.Second
+)
+
+// closeLogWriter drains the log queue, within logCloseTimeout. Lines
+// logged afterwards are written synchronously.
+func closeLogWriter(w *telemetry.AsyncWriter) {
+	ctx, cancel := context.WithTimeout(context.Background(), logCloseTimeout)
+	defer cancel()
+	_ = w.Close(ctx) // the error says lines were still queued; nowhere to log it
 }
 
 // storage is what the storage settings open: the usage ledger, the budget
@@ -179,7 +246,10 @@ func openStorage(cfg *config.Config, reg prometheus.Registerer, logger *slog.Log
 	return storage{ledger: led, budgets: budgets, redis: rdb, cache: caches, cacheRedis: cacheRdb}, nil
 }
 
-// newApp is New with the storage opened by open.
+// newApp is New with the storage opened by open. The log output is
+// wrapped in an asynchronous writer (telemetry.AsyncWriter), so writing
+// the access log never blocks a request; on error newApp closes it, so the
+// lines logged so far are written.
 func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*App, error) {
 	if snap == nil {
 		return nil, errors.New("app: nil config snapshot")
@@ -187,13 +257,26 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 	if logOutput == nil {
 		return nil, errors.New("app: nil log output")
 	}
+	// Audit lines wait for room in a full queue rather than being dropped.
+	logWriter := telemetry.NewAsyncWriter(logOutput, telemetry.AsyncOptions{Durable: server.IsAuditLine})
+	a, err := buildApp(snap, logWriter, open)
+	if err != nil {
+		closeLogWriter(logWriter)
+		return nil, err
+	}
+	a.logWriter = logWriter
+	return a, nil
+}
+
+// buildApp is newApp with the log output wrapped in logWriter.
+func buildApp(snap *config.Snapshot, logWriter *telemetry.AsyncWriter, open storageOpener) (*App, error) {
 	cfg := snap.Config()
 
 	level, err := telemetry.ParseLevel(cfg.Logging.Level)
 	if err != nil {
 		return nil, fmt.Errorf("app: logging.level: %w", err)
 	}
-	logger := telemetry.NewLogger(logOutput, telemetry.LogOptions{
+	logger := telemetry.NewLogger(logWriter, telemetry.LogOptions{
 		Level:   level,
 		Format:  cfg.Logging.Format,
 		Secrets: cfg.SecretValues(),
@@ -209,6 +292,24 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 	// The server and the gateway share one registry, which admin /metrics
 	// serves.
 	registry := telemetry.NewRegistry()
+	if err := registry.Register(logWriter.Collector()); err != nil {
+		return nil, fmt.Errorf("app: register the log writer metrics: %w", err)
+	}
+	// Tracing starts first, so every later component's requests are
+	// traced; telemetry is restart-only, so it is never rebuilt.
+	tp, err := tracing.New(context.Background(), cfg.Telemetry.Tracing, version.Get(), logger)
+	if err != nil {
+		return nil, fmt.Errorf("app: telemetry.tracing: %w", err)
+	}
+	built := false
+	defer func() {
+		if !built {
+			shutdownTracing(tp, logger)
+		}
+	}()
+	if err := registerTracingMetrics(registry, tp); err != nil {
+		return nil, err
+	}
 	srv, err := server.New(server.Options{
 		Listen:            cfg.Server.Listen,
 		AdminListen:       cfg.Server.AdminListen,
@@ -219,8 +320,13 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 		ShutdownDelay:     cfg.Server.ShutdownDelay.Std(),
 		ShutdownGrace:     cfg.Server.ShutdownGrace.Std(),
 		ConfigVersion:     snap.Version(),
+		TLSCertFile:       cfg.Server.TLS.CertFile,
+		TLSKeyFile:        cfg.Server.TLS.KeyFile,
+		TLSMinVersion:     cfg.Server.TLS.TLSMinVersion(),
+		AdminToken:        cfg.Server.AdminToken.Value(),
 		Logger:            logger,
 		Registry:          registry,
+		Tracing:           tp,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: %w", err)
@@ -231,22 +337,33 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 		return nil, err
 	}
 	led, rdb := st.ledger, st.redis
-	a := &App{log: logger, srv: srv, ledger: led, redis: rdb, cacheRedis: st.cacheRedis, shutdownGrace: cfg.Server.ShutdownGrace.Std()}
+	a := &App{log: logger, srv: srv, ledger: led, redis: rdb, cacheRedis: st.cacheRedis, tracing: tp}
+	a.budgetFailClosed.Store(cfg.Budgets.FailMode == config.BudgetFailClosed)
+	a.limits.Store(ratelimit.NewLimits(cfg))
+	enf, af, err := a.newRateLimits(rdb, registry)
+	if err != nil {
+		_ = a.closeStorage(context.Background())
+		return nil, err
+	}
 	var budgetCheck func(ctx context.Context) error
 	if rdb != nil {
 		budgetCheck = func(ctx context.Context) error { return rdb.Ping(ctx).Err() }
 		// With fail_mode open, requests are served while Redis is down, so
 		// the replica stays ready; GET /admin/v1/providers and
-		// budget_store_errors_total show the outage.
-		if cfg.Budgets.FailMode == config.BudgetFailClosed {
-			srv.AddReadinessCheck("budget_store", budgetCheck)
-		}
+		// budget_store_errors_total show the outage. fail_mode can change
+		// on reload, so the check reads it each time.
+		srv.AddReadinessCheck("budget_store", func(ctx context.Context) error {
+			if !a.budgetFailClosed.Load() {
+				return nil
+			}
+			return budgetCheck(ctx)
+		})
 	}
 
 	gw, err := gateway.New(gateway.Options{
 		Config: cfg, Logger: logger, Registry: registry,
 		Ledger: led, Budgets: st.budgets, BudgetStoreCheck: budgetCheck, ConfigVersion: snap.Version(),
-		Cache: st.cache,
+		Cache: st.cache, Streams: enf, PropagateTrace: cfg.Telemetry.Tracing.Enabled && cfg.Telemetry.Tracing.PropagateUpstream,
 	})
 	if err != nil {
 		_ = a.closeStorage(context.Background())
@@ -269,25 +386,47 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 		gw.SetShadow(a.shadow)
 	}
 	store := auth.NewStore(cfg.Tenants)
-	authenticate := auth.Middleware(store)
+	keys := auth.NewKeyring(store)
+	authenticate := auth.Middleware(keys, auth.Options{Guard: af.Check})
+	// Every authenticated public route: authentication, with the limit on
+	// failed authentications per client address, then the key's request
+	// rate. Instrument goes
+	// outside them all, so that rejected requests count in the API
+	// metrics too.
+	protect := func(endpoint string, h http.Handler) http.Handler {
+		return gw.Instrument(endpoint, authenticate(enf.Middleware(h)))
+	}
 	routes := openaiapi.Routes(gw, openaiapi.Options{
 		BodyReadTimeout: cfg.Server.BodyReadTimeout.Std(),
 		WriteTimeout:    cfg.Server.WriteTimeout.Std(),
 	})
 	for _, r := range routes {
-		// Instrument goes outside authentication, so that rejected
-		// requests count in the API metrics too.
-		srv.Handle(r.Pattern, gw.Instrument(r.Endpoint, authenticate(r.Handler)))
+		srv.Handle(r.Pattern, protect(r.Endpoint, r.Handler))
 	}
 	usageOpts := usageapi.Options{Verification: usage.Verification{
 		MinSamples:  cfg.Evaluation.Shadow.VerifiedMinSamples,
 		MinPassRate: cfg.Evaluation.Shadow.VerifiedMinPassRate,
 	}}
-	srv.Handle("GET "+usageEndpoint, gw.Instrument(usageEndpoint, authenticate(usageapi.TenantHandler(led, usageOpts))))
-	srv.Handle("POST "+feedbackEndpoint, gw.Instrument(feedbackEndpoint, authenticate(usageapi.FeedbackHandler(led, usageOpts))))
+	srv.Handle("GET "+usageEndpoint, protect(usageEndpoint, usageapi.TenantHandler(led, usageOpts)))
+	srv.Handle("POST "+feedbackEndpoint, protect(feedbackEndpoint, usageapi.FeedbackHandler(led, usageOpts)))
+	// The admin API shares the guard: failed admin tokens count against
+	// the client address as failed keys do.
+	srv.SetAdminGuard(af)
 	srv.HandleAdmin("GET /admin/v1/providers", gw.ProvidersHandler())
 	srv.HandleAdmin("GET /admin/v1/usage", usageapi.AdminHandler(led, usageOpts))
 	srv.HandleAdmin("POST /admin/v1/cache/purge", gw.CachePurgeHandler())
+	total, lastSuccess, err := newReloadMetrics(registry)
+	if err != nil {
+		_ = a.closeStorage(context.Background())
+		return nil, err
+	}
+	a.reload = reloader{
+		start: cfg, running: snap.Version(), secrets: cfg.SecretValues(), keys: keys,
+		hasShadow: a.shadow != nil, hasSemantic: semanticEnabled(cfg),
+		now: time.Now, total: total, lastSuccess: lastSuccess,
+	}
+	lastSuccess.Set(float64(time.Now().UnixNano()) / 1e9)
+	srv.HandleAdmin(reloadEndpoint, a.reloadHandler())
 
 	logger.Info("config loaded",
 		"config_version", snap.Version(),
@@ -315,7 +454,68 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 	// the second line of defense.
 	logger.Debug("effective config", slog.Any("config", cfg))
 
+	built = true
 	return a, nil
+}
+
+// newRateLimits builds the rate limiting (DESIGN §7 step 3, §17): the
+// limiter, in the state Redis behind a ratelimit.Circuit when state is
+// set (storage.mode redis), so every replica shares the counters, and in
+// memory otherwise; the Enforcer of the keys' request rates and stream
+// caps; and the per-replica, in-memory limit on failed authentications.
+// Both read the settings in force through a.limits, so a reload applies
+// at once.
+func (a *App) newRateLimits(state *redis.Client, reg prometheus.Registerer) (*ratelimit.Enforcer, *ratelimit.AuthFailures, error) {
+	var limiter ratelimit.Limiter
+	if state != nil {
+		a.rlimiter = ratelimit.NewRedis(state, ratelimit.RedisOptions{})
+		limiter = ratelimit.NewCircuit(a.rlimiter, ratelimit.CircuitOptions{})
+	} else {
+		limiter = ratelimit.NewMemory(time.Now)
+	}
+	enf, err := ratelimit.NewEnforcer(ratelimit.EnforcerOptions{Limiter: limiter, Limits: a.limits.Load, Registerer: reg})
+	if err != nil {
+		return nil, nil, fmt.Errorf("app: rate limits: %w", err)
+	}
+	af, err := ratelimit.NewAuthFailures(ratelimit.AuthFailuresOptions{
+		PerMinute:  func() int { return a.limits.Load().AuthFailuresPerMinute() },
+		Registerer: reg,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("app: rate limits: %w", err)
+	}
+	return enf, af, nil
+}
+
+// registerTracingMetrics exports the tracer provider's span counts:
+// switchyard_tracing_spans_exported_total and
+// switchyard_tracing_spans_dropped_total, both 0 with tracing disabled.
+func registerTracingMetrics(reg prometheus.Registerer, tp *tracing.Provider) error {
+	for _, c := range []prometheus.Collector{
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "switchyard_tracing_spans_exported_total",
+			Help: "Spans the trace collector accepted.",
+		}, func() float64 { return float64(tp.ExportStats().Exported) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "switchyard_tracing_spans_dropped_total",
+			Help: "Spans dropped: the export queue was full, or the collector failed or refused them.",
+		}, func() float64 { return float64(tp.ExportStats().Dropped) }),
+	} {
+		if err := reg.Register(c); err != nil {
+			return fmt.Errorf("app: register the tracing metrics: %w", err)
+		}
+	}
+	return nil
+}
+
+// shutdownTracing flushes the queued spans, within tracingShutdownTimeout,
+// and stops the exporter. A failure is only logged: tracing fails open.
+func shutdownTracing(tp *tracing.Provider, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), tracingShutdownTimeout)
+	defer cancel()
+	if err := tp.Shutdown(ctx); err != nil {
+		logger.Warn("tracing: spans were lost at shutdown", "error", err)
+	}
 }
 
 // Paths of the public Switchyard endpoints: the usage report and feedback.
@@ -546,6 +746,11 @@ func (a *App) closeStorage(ctx context.Context) error {
 	if err != nil {
 		a.log.Error("usage ledger: events were lost at shutdown", "error", err)
 	}
+	if a.rlimiter != nil {
+		// Gives back the stream leases still held, while the state
+		// client is open.
+		a.rlimiter.Close()
+	}
 	if a.redis != nil {
 		_ = a.redis.Close()
 	}
@@ -565,7 +770,10 @@ func (a *App) Logger() *slog.Logger { return a.log }
 // (within a quarter of it; each is bounded by its own one-second timeout
 // anyway), then the usage ledger writes the events still queued, within
 // what is left of the grace period, at least a quarter. The runner stops
-// first because it stores its results in the ledger. Canceling forceCtx
+// first because it stores its results in the ledger. The queued spans are
+// flushed before the ledger (within 5 seconds), the rate limiter's stream
+// leases are given back before the Redis clients close, and the log queue
+// is drained last (within 5 seconds). Canceling forceCtx
 // aborts the requests still in flight, the samples, the cache writes and
 // the flush. It returns nil after a clean shutdown,
 // server.ErrShutdownTimeout if requests had to be aborted, and an error if
@@ -579,22 +787,26 @@ func (a *App) Run(ctx, forceCtx context.Context) error {
 		"go_version", info.GoVersion,
 	)
 	err := a.srv.Run(ctx, forceCtx)
-	// The server has drained: no request records events any more. The
-	// ledger gets the shutdown grace period to write what is queued, cut
-	// short by forceCtx.
-	cctx, cancel := context.WithTimeout(context.Background(), a.shutdownGrace)
+	// The server has drained: no request records events any more. What
+	// follows is bounded by PostDrainTimeout in all, in this order: the
+	// shadow samples (which charge budgets and record usage events) and
+	// the cache writes, then the usage ledger's flush, sharing one deadline
+	// that forceCtx cuts short; then the optimisations that fail open,
+	// the span flush and the log drain, each with a bound of its own. Money
+	// comes before them, so a dead collector cannot delay the ledger.
+	cctx, cancel := context.WithTimeout(context.Background(), storageCloseTimeout)
 	defer cancel()
 	stop := context.AfterFunc(forceCtx, cancel)
 	defer stop()
 	if a.shadow != nil {
-		sctx, scancel := context.WithTimeout(cctx, a.shutdownGrace/2)
+		sctx, scancel := context.WithTimeout(cctx, shadowCloseTimeout)
 		if serr := a.shadow.Close(sctx); serr != nil {
 			a.log.Warn("shadow sampling: samples were canceled at shutdown", "error", serr)
 		}
 		scancel()
 	}
 	if a.gw != nil {
-		wctx, wcancel := context.WithTimeout(cctx, a.shutdownGrace/4)
+		wctx, wcancel := context.WithTimeout(cctx, cacheCloseTimeout)
 		if werr := a.gw.CloseCache(wctx); werr != nil {
 			a.log.Warn("response cache: writes were abandoned at shutdown", "error", werr)
 		}
@@ -602,6 +814,12 @@ func (a *App) Run(ctx, forceCtx context.Context) error {
 	}
 	if cerr := a.closeStorage(cctx); cerr != nil {
 		err = errors.Join(err, fmt.Errorf("app: %w", cerr))
+	}
+	if a.tracing != nil {
+		shutdownTracing(a.tracing, a.log)
+	}
+	if a.logWriter != nil {
+		closeLogWriter(a.logWriter)
 	}
 	return err
 }

@@ -7,43 +7,39 @@ Switchyard is a cost-aware, OpenAI-compatible LLM inference gateway written in G
 
 ## Status
 
-**Phase 6: exact and semantic caching**, with Phase 8's quality feedback loop on top of Phase 5's cost-aware routing (Phase 7, production hardening, is not done yet). Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment that has every capability it needs and meets its policy, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Every request gets an exact cost in a usage ledger (memory or Postgres) with tenant-scoped reports, and tenants and keys can have daily or monthly budgets (see [Usage ledger and reporting](#usage-ledger-and-reporting) and [Budgets](#budgets)). With `model: "auto"`, a policy with a baseline model, and quality priors in the catalog, the gateway picks the cheapest model whose estimated quality for the request clears the profile's bar, explains every decision, and measures the savings against the baseline (see [Routing](#routing)). `switchyard eval` measures the quality priors on your own prompts, and opt-in shadow sampling and client feedback check on live traffic that the savings do not cost quality (see [Evaluation and verification](#evaluation-and-verification)). Policies can turn on an exact response cache and an opt-in semantic cache for chat completions, which answer repeated and near-repeated requests at cost 0, scoped to the tenant, purgeable, and failing open (see [Caching](#caching)).
+**v0.1: Phases 0 to 8 are done** (see [CHANGELOG.md](CHANGELOG.md)); the v0.1.0 tag is not cut yet. Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment that has every capability it needs and meets its policy, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Every request gets an exact cost in a usage ledger (memory or Postgres) with tenant-scoped reports, and tenants and keys can have daily or monthly budgets (see [Usage ledger and reporting](#usage-ledger-and-reporting) and [Budgets](#budgets)). With `model: "auto"`, a policy with a baseline model, and quality priors in the catalog, the gateway picks the cheapest model whose estimated quality for the request clears the profile's bar, explains every decision, and measures the savings against the baseline (see [Routing](#routing)). `switchyard eval` measures the quality priors on your own prompts, and opt-in shadow sampling and client feedback check on live traffic that the savings do not cost quality (see [Evaluation and verification](#evaluation-and-verification)). Policies can turn on an exact response cache and an opt-in semantic cache for chat completions (see [Caching](#caching)). For production there are per-key rate limits and concurrent-stream caps shared through Redis, OpenTelemetry tracing, hot reload, an admin token, TLS, a compose stack with dashboards and alerts, and operator docs (see [Rate limits](#rate-limits), [Tracing](#tracing), [Hot reload](#hot-reload), [Admin API and TLS](#admin-api-and-tls) and [Operations](#operations)).
+
+Not verified on this machine, which has no provider keys: the live smoke test, fixture recording, a live judge or semantic-cache check, and the GitHub Actions workflows, which have not run yet.
 
 ## Quickstart
 
-Prerequisites: Go 1.26 or newer, and Docker (only for the image and the dev dependencies).
+With Docker and one provider key, the full stack (gateway, Redis for cache
+and state, Postgres for the usage ledger) runs in a few minutes:
 
 ```sh
-make build        # writes bin/switchyard
-make run          # bin/switchyard serve --config configs/quickstart.yaml
+cd deploy
+export OPENAI_API_KEY=sk-...        # or ANTHROPIC_API_KEY=...
+./init.sh                           # writes .env: admin token, a gateway API key
+docker compose up -d --wait
+
+. ./.env
+curl -s localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $SWITCHYARD_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Say hello"}]}'
+curl -s localhost:8080/switchyard/v1/usage -H "Authorization: Bearer $SWITCHYARD_API_KEY" | jq .totals.savings_usd
 ```
 
-The quickstart config needs no environment variables. It keeps state in memory, listens on `:8080` for the API and on `127.0.0.1:9090` for admin traffic. In another terminal:
+Add `--profile observability` for Prometheus with the alert rules, Grafana
+with the Switchyard dashboard, and Jaeger for traces. Without Docker, `make
+build` and `bin/switchyard serve --config configs/quickstart.yaml` run a
+single in-memory gateway.
 
-```sh
-curl -i localhost:8080/healthz          # 200 while the process is alive
-curl -i localhost:8080/readyz           # 200 with the loaded config version
-curl -s 127.0.0.1:9090/metrics | head   # Prometheus metrics, admin listener only
-```
-
-Validate a config without starting the server:
-
-```sh
-bin/switchyard config validate -c configs/quickstart.yaml
-```
-
-The reference config, [configs/switchyard.example.yaml](configs/switchyard.example.yaml), uses Redis and Postgres and reads its secrets from the environment. Run without them, validation lists every missing variable with its config path and exits non-zero. With placeholder values it passes, because storage settings are validated but nothing connects to Redis or Postgres yet:
-
-```sh
-bin/switchyard config validate -c configs/switchyard.example.yaml   # reports the missing variables
-
-DATABASE_URL=postgres://localhost:5433/switchyard \
-OPENAI_API_KEY=placeholder ANTHROPIC_API_KEY=placeholder \
-GEMINI_API_KEY=placeholder TOGETHER_API_KEY=placeholder \
-  bin/switchyard config validate -c configs/switchyard.example.yaml
-```
-
-`bin/switchyard version` prints the build metadata.
+- [docs/quickstart.md](docs/quickstart.md): both paths, the first request,
+  reading savings, dashboards, and hardening before production.
+- [docs/configuration.md](docs/configuration.md): every config key, with its
+  type and default.
+- [docs/runbook.md](docs/runbook.md): symptoms, alerts and fixes for every
+  degraded mode.
 
 ## Configuration basics
 
@@ -59,7 +55,7 @@ GEMINI_API_KEY=placeholder TOGETHER_API_KEY=placeholder \
 | `${VAR:-default}` | `VAR`, or `default` when it is unset. `${VAR:-}` means empty when unset. |
 | `${file:/run/secrets/name}` | The contents of a file, for Docker and Kubernetes secrets. |
 
-**Includes.** `include:` lists glob patterns, relative to the root file's directory. Included files may only define `providers`, `models` and `aliases`; list entries are appended in sorted file-name order, and a duplicate ID or alias name, in any files, is an error. The example config includes the model catalog from [configs/catalog/](configs/catalog/).
+**Includes.** `include:` lists glob patterns, relative to the root file's directory. Included files may only define `providers`, `models`, `aliases` and `quality_overrides`; list entries are appended in sorted file-name order, and a duplicate ID or alias name, in any files, is an error. The example config includes the model catalog from [configs/catalog/](configs/catalog/).
 
 **Limits.** `server.max_header_bytes` (default 64 KiB) caps request headers; net/http allows up to 4 KiB beyond it before it answers 431. A `${file:…}` reference reads only a regular file of at most 64 KiB.
 
@@ -424,7 +420,7 @@ storage:
 - **`memory`** keeps the most recent 100,000 events in process memory, per replica. It suits the quickstart and tests; nothing survives a restart.
 - **`postgres`** must be reachable at startup: the gateway exits with an error naming `storage.ledger` (never the DSN) if it cannot connect or migrate. It applies its embedded migrations at startup (recorded in `schema_migrations`, in one transaction, safe with several replicas starting at once), into the first schema of the connection's `search_path`. Events go to `usage_events`, which is append-only, partitioned by month on `ts` (`usage_events_p202611`, …) and indexed on `(tenant, ts)`. Partitions are created at startup for the current and the next month, and before writing any other month. Money is stored as `NUMERIC(38,15)`, tags as `jsonb`. To drop old data, drop old partitions.
 
-**Requests never wait for the database.** Events go into a bounded in-memory queue, and a background writer copies them to Postgres with `COPY`, in batches of `batch_size` or every `flush_interval`. If Postgres is down or failing, the writer keeps the events and retries with exponential backoff (100 ms doubling to 10 s); requests are unaffected. A retried batch is never stored twice. If the queue fills up, the oldest events are dropped and counted. On shutdown, once the server has drained, the writer flushes what is queued, within `server.shutdown_grace`; events it cannot write by then are counted as dropped and the exit status is 1. Watch these metrics:
+**Requests never wait for the database.** Events go into a bounded in-memory queue, and a background writer copies them to Postgres with `COPY`, in batches of `batch_size` or every `flush_interval`. If Postgres is down or failing, the writer keeps the events and retries with exponential backoff (100 ms doubling to 10 s); requests are unaffected. A retried batch is never stored twice. If the queue fills up, the oldest events are dropped and counted. On shutdown, once the server has drained, the writer flushes what is queued, within the shutdown's last 15 s (it shares 11 s with the shadow samples and cache writes, which go first, and comes before the span flush and the log drain, so a dead collector cannot delay it); events it cannot write by then are counted as dropped and the exit status is 1. The process exits within `server.shutdown_delay + server.shutdown_grace + 15s` of SIGTERM; size a container's stop grace period (compose's `stop_grace_period`, Kubernetes' `terminationGracePeriodSeconds`) to that. Watch these metrics:
 
 | Metric | Meaning |
 |---|---|
@@ -858,7 +854,7 @@ policies:
 
 **Cost.** Each tenant's shadow spend is capped by its own daily budget, `shadow:<tenant>/day` in the budget store (Redis or in memory, like the other budgets). The budget is reserved one call at a time: before the comparison call, its worst case is admitted (one token per byte of the request, 1,600 per image, and its output cap), and the call is settled at its actual cost right after; then each judge call (up to 4: two runs, each retried once) is admitted at its own worst case, from its real prompt and the judge's 256-token output cap, and settled after it. Costs come from the reported usage and the catalog prices, and a call that may have been billed without reporting usage is charged its estimate. A sample whose comparison does not fit is dropped; one whose next judge call does not fit stops there, with its spend so far charged and stored as a row with error kind `judge_budget` and no verdict. Both count as `dropped_budget`. Since no call starts before its worst case is admitted, concurrent samples never take the budget past its limit, except by a single call's estimator error: the estimate ignores cache-write prices for requests with `cache_control`, images a provider bills above 1,600 tokens, and hidden provider tokens such as a tool-use system prompt. Requests are sampled deterministically by a hash of their request ID, so every replica agrees.
 
-**Runtime.** Shadow calls run asynchronously after the response and never delay it: at most `concurrency` at once per replica, with a bounded queue (a full queue drops the sample, and so does one whose queued requests and served answers would exceed 64 MiB in all), each answer capped at `max_output_tokens`, each sample bounded by a timeout. Comparison calls are never streamed. A request is sampled only when it is served with status 200 and ends cleanly, by another model than the comparison, with a chat answer that no content filter stopped; a sampled stream collects its answer text (at most 64 KiB, or the sample is skipped) as it is relayed, and unsampled requests collect nothing. On shutdown, after the server has drained, the samples get half of `server.shutdown_grace` to finish, then running ones are canceled and queued ones dropped, and their last settlements and rows get no more than that half (a settlement that cannot be made keeps its estimate counted); the usage ledger flushes in the remaining time.
+**Runtime.** Shadow calls run asynchronously after the response and never delay it: at most `concurrency` at once per replica, with a bounded queue (a full queue drops the sample, and so does one whose queued requests and served answers would exceed 64 MiB in all), each answer capped at `max_output_tokens`, each sample bounded by a timeout. Comparison calls are never streamed. A request is sampled only when it is served with status 200 and ends cleanly, by another model than the comparison, with a chat answer that no content filter stopped; a sampled stream collects its answer text (at most 64 KiB, or the sample is skipped) as it is relayed, and unsampled requests collect nothing. On shutdown, after the server has drained, the samples get 4 s to finish, then running ones are canceled and queued ones dropped, and their last settlements and rows get no more than that (a settlement that cannot be made keeps its estimate counted); the usage ledger flushes after them.
 
 **Results.** Each evaluated sample stores one row (`shadow_evals` in Postgres, or in memory): request ID, time, tenant, key, category, difficulty, profile, mode, candidate and reference deployments, judge model, outcome, acceptable, cost, and an error kind when there was no verdict. Rows join to the usage ledger by request ID and tenant; usage events also record their quality `category`.
 
@@ -935,52 +931,128 @@ A small install can point both roles at one Redis server: put the cache on datab
 
 **Accounting.** A hit's usage event has `cache_status` `exact` or `semantic`, cost 0 (known), 0 attempts, the cached answer's tokens and deployment, and as baseline cost those tokens priced at the baseline model; reports count it in `cache_hit_rate` and its baseline cost as `savings_usd.cache`, never as routing savings. Budgets are never charged for the cached answer, and hits are not shadow sampled. Embedding calls are recorded as overhead (`overhead_usd`) on the request that made them, and charged to its tenant's and key's budgets: on a miss with the chat cost when the request settles, and on a hit, or a request refused before admission, on their own. A charge that fails never fails the response; it is counted in `switchyard_cache_overhead_uncharged_total`.
 
-**Failures are misses.** A cache that is down, slow or returns something unreadable never fails a request: the lookup is a miss, bounded by `cache.lookup_timeout` (default 25 ms) for the exact layer and `semantic_cache.lookup_timeout` for the semantic one, so a hung Redis adds at most the timeout; each failure is counted and logged at WARN at most once per 10 s per layer, without content. When the namespace version cannot be read, both layers are skipped; when the exact entry cannot be read, the semantic layer is skipped too (it lives on the same cache instance), counted as an error, without paying for an embedding. The cache Redis client's socket timeouts are set above the longest of these deadlines (and the write timeout), so the configured timeouts, not a shorter client default, bound each call. Writes are asynchronous, after the response, each within 1 s, on a bounded pool; a write that finds the pool full is dropped and counted. At shutdown, writes in flight get a quarter of `server.shutdown_grace`, after the shadow runner and before the usage ledger flush. `/readyz` never checks the cache Redis.
+**Failures are misses.** A cache that is down, slow or returns something unreadable never fails a request: the lookup is a miss, bounded by `cache.lookup_timeout` (default 25 ms) for the exact layer and `semantic_cache.lookup_timeout` for the semantic one, so a hung Redis adds at most the timeout; each failure is counted and logged at WARN at most once per 10 s per layer, without content. When the namespace version cannot be read, both layers are skipped; when the exact entry cannot be read, the semantic layer is skipped too (it lives on the same cache instance), counted as an error, without paying for an embedding. The cache Redis client's socket timeouts are set above the longest of these deadlines (and the write timeout), so the configured timeouts, not a shorter client default, bound each call. Writes are asynchronous, after the response, each within 1 s, on a bounded pool; a write that finds the pool full is dropped and counted. At shutdown, writes in flight get 1 s, after the shadow runner and before the usage ledger flush. `/readyz` never checks the cache Redis.
 
 **Metrics and logs.** On the admin `/metrics`: `switchyard_cache_lookups_total{layer,result}` (layer `exact` or `semantic`; result `hit`, `miss`, `error`, `skipped` for a request of a caching policy that is not eligible for the layer, `policy` for an entry, or for the semantic layer the embedding deployment, that the request's policy does not permit, and `budget` for a semantic lookup skipped on a spent budget), `switchyard_cache_writes_total{layer,result}` (`ok`, `error`, `dropped`, `too_large`, `not_cacheable`), `switchyard_cache_similarity{outcome}` (the nearest semantic entry's similarity, `hit` or `miss`, with buckets dense between 0.8 and 1), `switchyard_cache_lookup_seconds{layer}`, `switchyard_cache_coalesced_total`, `switchyard_cache_coalesce_waiting` (requests waiting on another's upstream call now), `switchyard_cache_overhead_uncharged_total`, and `switchyard_savings_usd_total{source="cache"}`. The access log's `cache` field is `miss`, `exact` or `semantic`. Prompts and responses are never logged.
+
+## Rate limits
+
+Each key's request rate and concurrent streams can be limited (DESIGN §7 step 3, §17), on the tenant for all its keys or on one key, which replaces the tenant's limit entirely:
+
+```yaml
+tenants:
+  - id: acme
+    rate_limit: {requests_per_minute: 600, burst: 100, max_concurrent_streams: 20}
+    keys:
+      - {id: acme-batch, hash: "sha256:...", rate_limit: {requests_per_minute: 60}}
+rate_limits:
+  fail_mode: open                 # or closed: 503 rate_limit_unavailable while the store is down
+  auth_failures_per_minute: 30    # per client address; -1 turns it off
+```
+
+- **Request rate.** GCRA, charged right after authentication, for every request, cache hits included. `burst` (default a sixth of the rate, at least 1) is how many requests an idle key may send at once on top of the rate. Over the rate, the answer is `429` with code `rate_limit_exceeded` and `Retry-After` in whole seconds, rounded up.
+- **Concurrent streams.** A streaming chat or legacy completion request takes a slot once it is decoded and gives it back when its response ends; a cached stream replay takes one too. Over the cap: `429 rate_limit_exceeded` with `Retry-After: 1`.
+- **Where the counters live.** With `storage.mode: redis`, in the state Redis (`storage.redis.state_url`), so every replica enforces one limit per key together: each decision is one Lua script on the Redis server's clock. A stream slot is a lease that its replica renews; a replica that crashes frees its slots within the lease TTL (60 s). In memory mode each replica has its own counters.
+- **Store down.** `rate_limits.fail_mode` decides: `open` (default) serves the request unlimited, `closed` answers `503 rate_limit_unavailable`. After a failure the store is skipped for a few seconds. Both show in `switchyard_ratelimit_decisions_total{result="error"}`.
+- **Failed authentications.** A client address (the TCP peer's IPv4 address, or its IPv6 /64) that fails authentication `auth_failures_per_minute` times within a minute gets `429`, whatever key or admin token it sends (so a refused guess learns nothing), until its failures age out; concurrent attempts cannot exceed the limit, and valid keys never count against it. This is in each replica's memory, not in Redis, so with n replicas an address can fail up to n times the limit. Forwarding headers are never trusted: behind a reverse proxy every client has the proxy's address, so turn it off (`-1`) and limit at the proxy.
+- **Reload.** Every rate-limit setting is reloadable and applies to the next request; a raised rate takes effect within one new interval.
+
+Metrics: `switchyard_ratelimit_decisions_total{kind,result}` (`kind` `request` or `stream`; `result` `allowed`, `limited` or `error`) and `switchyard_ratelimit_auth_limited_total`.
+
+## Tracing
+
+Switchyard exports OpenTelemetry traces over OTLP/HTTP (protobuf) to `<endpoint>/v1/traces`, with its own small exporter (no gRPC):
+
+```yaml
+telemetry:
+  tracing:
+    enabled: true
+    endpoint: http://jaeger:4318       # a secret: it may hold user:password@
+    sample_ratio: 0.05                 # of new traces; a sampled parent is always followed
+    service_name: switchyard
+    propagate_upstream: false          # send traceparent to providers
+```
+
+- **Spans.** One root server span per request (`POST /v1/chat/completions`, with the HTTP method, route and status), and a child for each step: `auth`, `ratelimit`, `policy`, `cache.exact`, `cache.semantic` (with `embed` and `search` under it), `route`, `budget.admit`, one `upstream.attempt` per attempt (`attempt.number`, provider, deployment, outcome, retry reason) and `usage.record`.
+- **Attributes.** The GenAI semantic conventions on the attempt and the root (`gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`), and on the root `switchyard.tenant`, `switchyard.key_id` (never the key), `switchyard.profile`, `switchyard.cache_status`, `switchyard.route_reason`, `switchyard.cost_usd` and `switchyard.attempts`. Spans never hold prompt or response content, nor the URL's query.
+- **Propagation.** An incoming W3C `traceparent` is honored, even with tracing disabled, so the client's trace ID reaches the logs: every request log line, the access log included, carries `trace_id` and `span_id` whenever a trace context exists. Upstream calls carry a `traceparent` only with `propagate_upstream: true` and tracing enabled, and only that of the gateway's own upstream-attempt span: with tracing disabled nothing is propagated, a client's own trace context is never forwarded, and neither `tracestate` nor baggage is ever sent. Clients control sampling and trace IDs: a request with a sampled `traceparent` is always sampled (parent-based), whatever `sample_ratio` says, and its spans and log lines carry the client's trace ID.
+- **Failing open.** Spans wait at most 5 s in a bounded queue (2,048 spans; a span that finds it full is dropped, never waited for) and are posted once, without retries; a failed export is dropped and logged, rate limited, without the endpoint. Both kinds of drop are counted. Counters: `switchyard_tracing_spans_exported_total` and `switchyard_tracing_spans_dropped_total` (alert `SwitchyardTracingSpansDropped`). With tracing disabled, the spans cost nothing.
+- **Collector auth** is the endpoint URL's userinfo, sent as Basic auth. `OTEL_EXPORTER_OTLP_HEADERS` and other header settings are not supported. `OTEL_RESOURCE_ATTRIBUTES` adds resource attributes.
+- `telemetry.*` is restart-only.
+
+## Hot reload
+
+`SIGHUP` or `POST /admin/v1/reload` (on the admin listener) loads and validates the configuration again, from the same file, includes, environment overrides and flags the process started with, builds the new snapshot and swaps it in atomically. In-flight requests, streams included, finish on the snapshot they started with.
+
+- **Rejected.** On any error the configuration in force keeps serving; the admin caller gets `400 {"result":"error","error":"…"}` (config paths and problems, never secret values), and the error is logged and counted.
+- **Applied at once.** Tenants and keys, the admin token, policies, the catalog, aliases, routing, budgets, cache policies, rate limits and quality overrides.
+- **Restart-only.** These are not applied; a reload that changes them answers `200` with them listed in `restart_required`, and logs them: the listeners and every other `server.*` setting except `admin_token` (TLS included), `storage`, `logging`, `telemetry`, `evaluation`, `cache`, `semantic_cache`, the health tracker's settings (`routing.breaker`, `routing.rate_limit_cooldown`, `routing.fallback.retry_budget_ratio` and `retry_budget_min`), and features a reload turns on that are built only at startup: the semantic cache (`policies[].cache.semantic`), shadow sampling (`policies[].shadow.sample_rate`), and with `storage.mode: redis`, a response cache when none was on at startup (`policies[].cache`).
+- **Startup-only parts.** The semantic cache's embedder and the shadow runner keep the adapters built at startup: a provider key rotated by a reload (a `${file:…}` reference is read again; the environment is not) reaches the request path at once, but those two only after a restart. A deployment a reload removes is never chosen again, but stays listed with its last health in `/admin/v1/providers` until a restart.
+- **Signals.** `switchyard_config_reloads_total{result="ok|error"}`, `switchyard_config_last_reload_success_timestamp_seconds`, the alert `SwitchyardConfigReloadFailed`, and `/readyz`'s `config_version`, which shows config drift between replicas. Every reload writes an audit line (`msg="audit"`, `action="config.reload"`, `result`, `remote_ip`, the fingerprint), as does every cache purge (`action="cache.purge"`); audit lines never hold a token or a body.
+
+## Admin API and TLS
+
+**Admin token.** With `server.admin_token` set, every `/admin/v1/*` route requires `Authorization: Bearer <token>`, compared in constant time; anything else gets `401` with code `invalid_admin_token`. The token must be at least 32 characters, with no whitespace or control characters (validation rejects anything else, at startup and on reload; `openssl rand -base64 32` or `switchyard keys generate` make one). Failed admin tokens count against the client address's `rate_limits.auth_failures_per_minute`, shared with failed API keys: past it, every admin request from that address gets `429` whatever token it sends, and no line is logged for it. `/metrics`, `/healthz` and `/readyz` on the admin listener stay open for Prometheus and probes. The token is required when `server.admin_listen` is not a loopback address (an empty host and `0.0.0.0` are not loopback), and a reload cannot remove it while the listener is exposed. It is reloadable, so rotate it with a `${file:…}` reference and a reload. The admin listener is plain HTTP: keep it on loopback or a private network, never public.
+
+**TLS.** `server.tls` serves the public listener over HTTPS:
+
+```yaml
+server:
+  tls: {cert_file: /run/secrets/tls.crt, key_file: /run/secrets/tls.key, min_version: "1.3"}   # min_version 1.2 (default) or 1.3
+```
+
+The certificate and key are PEM files, read at startup (TLS is restart-only), and both must be set. The admin listener is always plain HTTP and serves `/healthz` and `/readyz` too, open like `/metrics`, so with TLS on point the container healthcheck there: `switchyard healthcheck --url http://127.0.0.1:9090/readyz` (or `/healthz`; use your `server.admin_listen` port). The image binds the admin listener to `127.0.0.1:9090` by default, loopback inside the container, which a healthcheck run in the container reaches; compose's `:9090` does too. The public listener's certificate names your public host, not `127.0.0.1`, so an `https://127.0.0.1` healthcheck would fail verification. Or terminate TLS in front of the gateway instead.
+
+## Operations
+
+- [docs/quickstart.md](docs/quickstart.md): the compose stack and the single binary, the first request, dashboards and traces, changing the configuration, and hardening before production.
+- [docs/configuration.md](docs/configuration.md): every config key, with its type and default, generated from `internal/config/types.go` (`make docs-config`).
+- [docs/runbook.md](docs/runbook.md): symptom, signal, impact and fix for every degraded mode and alert, and what to do when a key leaks.
+- [deploy/](deploy/): `compose.yaml` (gateway, both Redis instances and Postgres; profiles `observability` with Prometheus, Grafana and Jaeger, and `tei`), `init.sh`, the Prometheus alert rules with their unit tests, and the Grafana dashboard.
+- [test/load/RESULTS.md](test/load/RESULTS.md): the overhead benchmarks, the 1,000 req/s SLO run and the soak, with the hardware they ran on.
+- Releases: `make release-snapshot` builds the archives, checksums and SBOMs locally; a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml), which is written but has never run. Replace `OWNER` in `.goreleaser.yaml`, the image labels and the alert `runbook_url`s with your GitHub owner or registry namespace first.
 
 ## Docker
 
 ```sh
 make docker          # builds deploy/Dockerfile as switchyard:dev
-make docker-check    # also fails unless the image is <= 40 MB and runs as UID 65532
+make docker-check    # also fails unless the image is <= 40 MB uncompressed, runs as UID 65532,
+                     # and serves /healthz and /readyz read-only with no capabilities
 ```
 
-The image is a static binary on `gcr.io/distroless/static-debian13:nonroot`. It runs as `65532:65532` and starts `serve` with the quickstart config baked in at `/etc/switchyard/switchyard.yaml`:
+The image is a static binary on `gcr.io/distroless/static-debian13:nonroot`. It runs as `65532:65532`, with nothing written at runtime, so it runs on a read-only root filesystem, and starts `serve` with the quickstart config baked in at `/etc/switchyard/switchyard.yaml`. Its `HEALTHCHECK` runs `switchyard healthcheck`, which GETs `http://127.0.0.1:8080/healthz` and exits 0 on 200 (`--url` and `--timeout` change it); the image has no shell or curl.
 
 ```sh
-docker run --rm \
-  -p 8080:8080 \
-  -p 127.0.0.1:9090:9090 \
-  switchyard:dev
+docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  -p 8080:8080 -e OPENAI_API_KEY switchyard:dev
 ```
 
-Inside the container the admin listener binds `:9090` (set by `SWITCHYARD_ADMIN_LISTEN`), so Prometheus can scrape it over a private network. Never publish port 9090 on a public interface: publish it explicitly on loopback with `-p 127.0.0.1:9090:9090`, as above, or reach it over a private network. The image exposes only port 8080, so `docker run -P` publishes the API but not the admin listener. To use your own config, mount it and point `--config` at it:
+The admin listener keeps the quickstart's `127.0.0.1:9090`, loopback inside the container, so nothing outside it reaches `/metrics`, `/healthz`, `/readyz` or `/admin/v1/*`, and no admin token is needed; a healthcheck inside the container can use it (see TLS above). To scrape it from another container, bind it to all interfaces (`SWITCHYARD_ADMIN_LISTEN=":9090"`) and set `server.admin_token`, which validation then requires, as [deploy/compose.yaml](deploy/compose.yaml) does; never publish 9090 on a public interface. The image exposes only port 8080, so `docker run -P` cannot publish the admin listener. To use your own config, mount the directory that holds it and point `--config` at the file. Mount the directory, not the file: editors and `sed -i` save by writing a new file and renaming it, which a single-file bind mount never shows the container, so a reload would read the old file.
 
 ```sh
 docker run --rm -p 8080:8080 \
-  -v "$PWD/switchyard.yaml:/etc/switchyard/custom.yaml:ro" \
+  -v "$PWD/myconfig:/etc/switchyard/custom:ro" \
   -e OPENAI_API_KEY \
-  switchyard:dev serve --config /etc/switchyard/custom.yaml
+  switchyard:dev serve --config /etc/switchyard/custom/switchyard.yaml
 ```
 
-The Dockerfile uses BuildKit features (cache mounts), so `docker build` needs the buildx plugin.
+The Dockerfile uses BuildKit features (cache mounts), so `docker build` needs the buildx plugin. For the whole stack, see [Quickstart](#quickstart) and `make compose-up`.
 
 ## Dev dependencies
 
 ```sh
-make dev-up      # start the services and wait until all are healthy
+make dev-up      # start redis-cache, redis-state and postgres and wait until healthy
 make dev-logs    # follow their logs
 make dev-down    # stop them; the named volumes are kept
 ```
 
-[deploy/compose.yaml](deploy/compose.yaml) runs only the dependencies, not the gateway. The ports bind to 127.0.0.1:
+`dev-up` starts only the dependencies from [deploy/compose.yaml](deploy/compose.yaml), not the gateway (`make compose-up` runs the whole stack). The ports bind to 127.0.0.1:
 
 | Service | Host port | Role |
 |---|---|---|
 | `redis-cache` | 6379 | Evictable cache: `maxmemory 256mb`, `allkeys-lru`, no persistence |
-| `redis-state` | 6380 | Budgets and limits: `noeviction`, append-only file on a named volume |
-| `postgres` | 5433 | Usage ledger. User, password and database are all `switchyard`, for development only. |
+| `redis-state` | 6380 | Budgets, rate limits and cache namespaces: `noeviction`, append-only file on a named volume |
+| `postgres` | 5433 | Usage ledger. User, password and database are all `switchyard` unless `POSTGRES_PASSWORD` is set, for development only. |
 
 To delete the data as well, run `docker-compose -f deploy/compose.yaml down -v` (or `docker compose …`).
 
@@ -999,8 +1071,14 @@ Run `make` or `make help` to list them.
 |---|---|
 | `build` | Builds `bin/switchyard` with `-trimpath` and version metadata from git. |
 | `test` | `go test -race -count=1 ./...` |
-| `test-integration` | Starts Postgres, `redis-state` and `redis-cache` from `deploy/compose.yaml` in a separate compose project (`switchyard-test`), runs the tests tagged `integration` with `SWITCHYARD_TEST_POSTGRES_DSN`, `SWITCHYARD_TEST_REDIS_URL`, `SWITCHYARD_TEST_CACHE_REDIS_URL` and `SWITCHYARD_TEST_COMPOSE` (the compose command of that project) set, and always removes the containers and their volumes afterwards. The tests cover the Postgres ledger, the Redis budget store, the Redis cache stores and vector index, and in `test/integration` the P4 acceptance scenarios through the gateway binary: exact costs checked against the ledger rows, 1,000 concurrent requests against a Redis budget, and Postgres stopped for 60 s under load; the P8 shadow scenarios: the shadow budget in Redis under concurrent sampled requests, with every `shadow_evals` row checked against `usage_events`, and verified savings from the Postgres report; and the P6 cache scenarios: an exact hit's ledger row and report, purging one tenant's exact and semantic entries in Redis, and the cache Redis stopped mid-run. It takes a few minutes. It uses the same host ports as `dev-up`, so run `make dev-down` first. Without those variables, `go test -tags integration` skips these tests. Override the packages with `INTEGRATION_PKGS` and the flags with `INTEGRATION_FLAGS` (default `-race -count=1 -p 1 -timeout 20m`; `-p 1` because the outage test stops the shared Postgres). |
+| `test-integration` | Starts Postgres, `redis-state` and `redis-cache` from `deploy/compose.yaml` in a separate compose project (`switchyard-test`), runs the tests tagged `integration` with `SWITCHYARD_TEST_POSTGRES_DSN`, `SWITCHYARD_TEST_REDIS_URL`, `SWITCHYARD_TEST_CACHE_REDIS_URL` and `SWITCHYARD_TEST_COMPOSE` (the compose command of that project) set, and always removes the containers and their volumes afterwards. The tests cover the Postgres ledger, the Redis budget store, the Redis cache stores and vector index, the Redis rate limiter, and in `test/integration` the P4 acceptance scenarios through the gateway binary: exact costs checked against the ledger rows, 1,000 concurrent requests against a Redis budget, and Postgres stopped for 60 s under load; the P8 shadow scenarios: the shadow budget in Redis under concurrent sampled requests, with every `shadow_evals` row checked against `usage_events`, and verified savings from the Postgres report; the P6 cache scenarios: an exact hit's ledger row and report, purging one tenant's exact and semantic entries in Redis, and the cache Redis stopped mid-run; and the P7 rate limits across two gateway replicas sharing the state Redis. It takes a few minutes. It uses the same host ports as `dev-up`, so run `make dev-down` first. Without those variables, `go test -tags integration` skips these tests. Override the packages with `INTEGRATION_PKGS` and the flags with `INTEGRATION_FLAGS` (default `-race -count=1 -p 1 -timeout 20m`; `-p 1` because the outage test stops the shared Postgres). |
 | `cover` | Writes `coverage.out` and prints a per-function coverage summary. |
+| `bench-slo` | The P7 overhead SLO: an open loop at 1,000 req/s for 60 s (80% non-streaming, 20% streaming, caching off; a key rate limit and stream cap never reached, and every request traced to an in-process collector) through the gateway binary in front of a fake with 20 ms latency; fails if the added latency is over 2 ms at p50 or 10 ms at p99, and warns when the load generator itself stalled. Pass flags with `BENCH_SLO_FLAGS`. Results and hardware in [test/load/RESULTS.md](test/load/RESULTS.md). |
+| `soak` | Runs the gateway for `DURATION` (default `1h`) at the target load, 1,000 req/s (the SLO's rate), with 2% injected upstream 500s, a per-key rate limit and stream cap it never reaches, and tracing of every request to an in-process collector. It checks that goroutines and memory stay flat, that the client's errors equal the injected ones exactly, and that no span, log line or request was dropped or rate limited; the report goes to `SOAK_OUT` (default `bin/soak-report.md`). Pass flags with `SOAK_FLAGS`, for example `-redis-url redis://127.0.0.1:6380/0` (or `SWITCHYARD_SOAK_REDIS_URL`) for `storage.mode: redis`. The warm-up is a third of the run, at least until the memory usage ledger is full (110 s at 1,000 req/s), so `make soak DURATION=10m` works at the default rate. |
+| `compose-up`, `compose-down` | Start the full stack in `deploy/compose.yaml` (writing `deploy/.env` with `init.sh` on the first run), with `PROFILES="observability tei"` for the optional services; stop it, keeping the volumes unless `COMPOSE_DOWN_FLAGS=-v`. |
+| `release-snapshot` | A local GoReleaser dry run: binaries for linux and darwin on amd64 and arm64, their archives, checksums and CycloneDX SBOMs in `dist/`, without images and without publishing. |
+| `docs-config` | Regenerates `docs/configuration.md` from `internal/config/types.go`; a test fails while it is stale. |
+| `check-deploy` | Validates `deploy/`: the Prometheus config and alert rules and their unit tests (promtool), the Grafana dashboard, that every metric they query exists in the code, the compose file with every profile, `deploy/config/switchyard.yaml` and `init.sh`. |
 | `demo-eval` | The quality evaluation demo (`test/demoeval`): one scripted fake plays the candidates, the reference and a judge that rejects the small tier on coding; runs `eval run --dry-run`, `eval run` under a cost cap and `eval fit` on the starter prompt set, prints the report, then starts the gateway without and with the overrides and shows how the coding prompts are routed. Fails unless the small tier's coding share drops and the prompts move to the mid tier. See [Evaluation and verification](#evaluation-and-verification). |
 | `eval-live` | `switchyard eval run` against real providers. Opt-in and billed: it skips unless `EVAL_CONFIG`, `EVAL_CANDIDATES`, `EVAL_REFERENCE` and `MAX_COST_USD` are set, and needs the real provider keys in the environment variables the config references (without them it fails at config load and spends nothing). `MAX_COST_USD` caps the invocation's spend, `JUDGE` is passed as `--judge`, `DRY_RUN=1` prints the estimate only (`DRY_RUN=0` runs for real), `EVAL_PROMPTS` and `EVAL_OUT` default to the starter set and `results.jsonl`. |
 | `demo-routing` | The mixed-workload routing demo: fake OpenAI-wire and Anthropic upstreams, a three-tier catalog, 30 easy, 30 medium and 30 hard prompts from the quality sanity set sent as `auto:balanced`; prints how each band was routed and the usage API's cost, baseline and savings, and fails unless most easy prompts went to the small tier, most hard ones to the large tier, and savings are above 0. See [Routing](#routing). Pass flags with `DEMO_FLAGS`. |
@@ -1018,18 +1096,19 @@ Run `make` or `make help` to list them.
 | `check` | fmt-check, vet, lint, build, test, vuln and tidy-check. Run it before every merge; it needs no Docker. |
 | `run` | Builds, then serves `configs/quickstart.yaml`. Override with `make run CONFIG=path`. |
 | `docker` | Builds the image `switchyard:dev`. |
-| `docker-check` | Builds the image and checks its size and user. |
-| `dev-up`, `dev-down`, `dev-logs` | Manage the dev dependencies in `deploy/compose.yaml`. |
+| `docker-check` | Builds the image, checks its uncompressed size (at most 40 MB, the sum of its layers as `docker history` reports them) and user, then runs it read-only with no capabilities and waits for `/healthz` and `/readyz`. Without buildx on the host: `make docker-check DOCKER="colima ssh -- docker"`. |
+| `dev-up`, `dev-down`, `dev-logs` | Manage the dev dependencies (`redis-cache`, `redis-state`, `postgres`) in `deploy/compose.yaml`. |
 | `clean` | Removes `bin/`, `dist/` and coverage files. |
 
 `VERSION`, `COMMIT` and `DATE` come from `git describe`, `git rev-parse` and the clock, with fallbacks for a repository without commits. Override any of them, for example `make build VERSION=v0.1.0`.
 
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same checks on every push and pull request: build and race tests on the two supported Go releases, sample-config validation, golangci-lint, govulncheck, `go mod tidy -diff`, and the image size and user checks. CI never calls a real provider.
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same checks on every push and pull request: build and race tests on the two supported Go releases, sample-config validation, golangci-lint, govulncheck, `go mod tidy -diff`, and the image size and user checks. CI never calls a real provider. On a `v*` tag, [.github/workflows/release.yml](.github/workflows/release.yml) runs `make check`, then GoReleaser with Buildx and QEMU, pushing the images to ghcr.io; neither workflow has run yet.
 
 ## Project layout
 
 ```
-cmd/switchyard/     CLI: serve, config validate, catalog lint, route explain, keys generate, eval, version
+cmd/switchyard/     CLI: serve, config validate, catalog lint, route explain, keys generate, eval,
+                    healthcheck, version
 internal/
   api/openaiapi/    HTTP handlers for /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
                     and /switchyard/v1/route/explain
@@ -1052,13 +1131,16 @@ internal/
   health/           per-replica breakers, cooldowns, retry budgets, concurrency, latency stats
   policy/           effective policy: base policy, governance and quality rules, header tightening
   quality/          the heuristic assessor, the quality estimate, the labeled sanity set
+  ratelimit/        per-key GCRA request rates and stream leases (memory, Redis), the enforcer,
+                    the per-address auth-failure limit
   router/           candidates, hard filters, estimates, soft checks, ranking, plan, explanation
   providers/        adapter interfaces; openai/ (OpenAI wire) and anthropic/ (Messages API)
   schema/           lossless chat, legacy completion and embedding requests; capabilities
   shadow/           shadow sampling: deterministic sampler, budgeted background runner
   server/           listeners, middleware, health checks, graceful shutdown
   sse/              server-sent events reader and writer
-  telemetry/        slog with secret redaction, Prometheus registry
+  telemetry/        slog with secret redaction, the asynchronous log writer, Prometheus registry
+  tracing/          OpenTelemetry: tracer provider, server middleware, spans, the OTLP/HTTP exporter
   usage/            exact money and costs, usage events, shadow evaluations, feedback, memory and
                     Postgres ledgers, reports with verified savings
   reqctx/           request ID and request-scoped logger in context
@@ -1077,12 +1159,14 @@ test/
   cachebench/       exact-cache hit latency through the gateway with Redis (make bench-cache)
   eval/             fake judge (fakejudge/), the starter prompt set (prompts/starter.jsonl)
   demoeval/         quality evaluation demo (make demo-eval)
-  load/             overhead benchmark (make bench-overhead)
+  load/             overhead benchmark and the 1,000 req/s SLO (make bench-overhead, make bench-slo)
+  soak/             the soak test (make soak)
   demo/             mixed-workload routing demo (make demo-routing)
   smoke/            opt-in live smoke test (make smoke)
 configs/            quickstart.yaml, switchyard.example.yaml, catalog/
-deploy/             Dockerfile, compose.yaml (dev dependencies)
-docs/               DESIGN.md, PLAN.md
+deploy/             Dockerfiles, compose.yaml (the stack), config/switchyard.yaml, init.sh, prometheus/, grafana/
+docs/               DESIGN.md, PLAN.md, quickstart.md, configuration.md (generated), runbook.md
+tools/configdoc/    generates docs/configuration.md
 ```
 
 Later phases add the packages listed in [DESIGN §19](docs/DESIGN.md#19-project-structure).

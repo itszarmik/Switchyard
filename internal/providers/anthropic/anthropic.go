@@ -34,6 +34,7 @@ import (
 	"switchyard/internal/config"
 	"switchyard/internal/providers"
 	"switchyard/internal/schema"
+	"switchyard/internal/tracing"
 	"switchyard/internal/version"
 )
 
@@ -115,8 +116,9 @@ var _ providers.Adapter = (*Adapter)(nil)
 // base_url is the API root, such as https://api.anthropic.com. The
 // transport is built as in the openai adapter: connect bounds dialing and
 // the TLS handshake, idle connections are pooled and kept alive, and
-// redirects are not followed.
-func New(p config.Provider) (*Adapter, error) {
+// redirects are not followed. With o.PropagateTrace the transport sends the
+// W3C traceparent of the call's span.
+func New(p config.Provider, o providers.Options) (*Adapter, error) {
 	endpoint, err := url.JoinPath(p.BaseURL, "v1/messages")
 	if err != nil {
 		// The URL is not echoed; it is the operator's to print.
@@ -153,7 +155,9 @@ func New(p config.Provider) (*Adapter, error) {
 			total:      p.Timeouts.Total.Std(),
 		},
 		client: &http.Client{
-			Transport: transport,
+			// tracing.Transport returns transport itself unless the trace
+			// context is propagated.
+			Transport: tracing.Transport(transport, o.PropagateTrace),
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},

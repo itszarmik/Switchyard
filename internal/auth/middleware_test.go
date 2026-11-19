@@ -47,7 +47,7 @@ func newHarness(t *testing.T, s *Store) *harness {
 		reqctx.Logger(r.Context()).InfoContext(r.Context(), "handled")
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mw := Middleware(s)(next)
+	mw := Middleware(s, Options{})(next)
 	// Stand in for the server's request-ID middleware.
 	h.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := reqctx.WithRequestID(r.Context(), "req-1")
@@ -250,7 +250,7 @@ func TestMiddlewareLoggerIsPerRequest(t *testing.T) {
 // the connection is closed rather than held while net/http waits for the
 // rest of the body.
 func TestMiddlewareRejectsStalledBody(t *testing.T) {
-	srv := httptest.NewServer(Middleware(NewStore(nil))(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	srv := httptest.NewServer(Middleware(NewStore(nil), Options{})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("the handler ran for a rejected request")
 	})))
 	defer srv.Close()
@@ -288,7 +288,7 @@ func TestMiddlewareRejectsStalledBody(t *testing.T) {
 // A rejected request without a body keeps its connection.
 func TestMiddlewareRejectKeepsBodylessConnection(t *testing.T) {
 	rec := httptest.NewRecorder()
-	Middleware(NewStore(nil))(http.NotFoundHandler()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	Middleware(NewStore(nil), Options{})(http.NotFoundHandler()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
 	if rec.Code != http.StatusUnauthorized || rec.Header().Get("Connection") != "" {
 		t.Errorf("status %d, Connection %q; want 401 without Connection: close", rec.Code, rec.Header().Get("Connection"))
 	}
@@ -312,13 +312,64 @@ func TestMiddlewareAnnotatesPrincipal(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 			req.Header.Set("Authorization", "Bearer "+tt.key)
 			req = req.WithContext(reqctx.WithAnnotations(req.Context(), ann))
-			Middleware(s)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), req)
+			Middleware(s, Options{})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), req)
 			var got []string
 			for _, a := range ann.Attrs() {
 				got = append(got, a.String())
 			}
 			if strings.Join(got, " ") != tt.want {
 				t.Errorf("annotations = %q, want %q", strings.Join(got, " "), tt.want)
+			}
+		})
+	}
+}
+
+// TestMiddlewareGuard: Options.Guard sees every request once its key is
+// checked, with whether it authenticated, before anything is written;
+// when it refuses, the middleware writes and calls nothing more.
+func TestMiddlewareGuard(t *testing.T) {
+	key, hash := mustGenerate(t)
+	unknown, _ := mustGenerate(t)
+	s := NewStore([]config.Tenant{{ID: "acme", Keys: []config.APIKey{{ID: "k", Hash: hash}}}})
+	tests := []struct {
+		name       string
+		header     []string
+		refuse     bool
+		wantStatus int
+		wantAuth   bool
+	}{
+		{"accepted", []string{"Bearer " + key}, false, http.StatusNoContent, true},
+		{"missing", nil, false, http.StatusUnauthorized, false},
+		{"malformed", []string{"Basic abc"}, false, http.StatusUnauthorized, false},
+		{"repeated", []string{"Bearer " + key, "Bearer " + key}, false, http.StatusUnauthorized, false},
+		{"unknown key", []string{"Bearer " + unknown}, false, http.StatusUnauthorized, false},
+		{"refused, good key", []string{"Bearer " + key}, true, http.StatusTooManyRequests, true},
+		{"refused, unknown key", []string{"Bearer " + unknown}, true, http.StatusTooManyRequests, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []bool
+			rec := httptest.NewRecorder()
+			h := Middleware(s, Options{Guard: func(w http.ResponseWriter, r *http.Request, authenticated bool) bool {
+				if rec.Code != http.StatusOK || rec.Body.Len() > 0 {
+					t.Error("Guard ran after a response was written")
+				}
+				calls = append(calls, authenticated)
+				if tt.refuse {
+					w.WriteHeader(http.StatusTooManyRequests)
+				}
+				return !tt.refuse
+			}})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			for _, v := range tt.header {
+				req.Header.Add("Authorization", v)
+			}
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus || len(calls) != 1 || calls[0] != tt.wantAuth {
+				t.Errorf("status %d, Guard calls %v; want %d, [%v]", rec.Code, calls, tt.wantStatus, tt.wantAuth)
+			}
+			if tt.refuse && rec.Body.Len() > 0 {
+				t.Errorf("the middleware wrote %q after Guard refused", rec.Body)
 			}
 		})
 	}

@@ -6,9 +6,8 @@ import "time"
 // after includes are merged, ${…} references are expanded and defaults are
 // applied. Field names and yaml tags are the operator-facing contract
 // (docs/DESIGN.md §16); renaming one breaks existing config files.
-//
-// Phase 0 defines the skeleton below. Later phases add sections (tenants,
-// policies, routing, cache) and extend Model with catalog data.
+// docs/configuration.md is generated from these comments (make
+// docs-config).
 
 // Config is the root of the configuration.
 type Config struct {
@@ -16,8 +15,9 @@ type Config struct {
 	Version int `yaml:"version"`
 	// Include lists glob patterns of additional files, resolved relative to the
 	// directory of the root file. Included files may only define providers,
-	// models and aliases; list entries are appended in sorted file-name order,
-	// and an alias defined twice, in any files, is an error.
+	// models, aliases and quality_overrides; list entries are appended in
+	// sorted file-name order, and a duplicate ID, or an alias defined
+	// twice, in any files, is an error.
 	Include []string `yaml:"include"`
 
 	Server    Server     `yaml:"server"`
@@ -29,9 +29,9 @@ type Config struct {
 	// tenants configured, every /v1 request is rejected with 401.
 	Tenants []Tenant `yaml:"tenants"`
 	// Aliases maps virtual model names to a catalog model ID or a pinned
-	// deployment (model@provider). Alias names follow Model.ID rules and
-	// must not collide with a model ID. Values starting with "auto" are
-	// reserved for Phase 5.
+	// deployment (model@provider), or the virtual model "auto" or
+	// "auto:<profile>" of a defined profile. Alias names follow Model.ID
+	// rules and must not collide with a model ID.
 	Aliases map[string]string `yaml:"aliases"`
 	Routing Routing           `yaml:"routing"`
 	Budgets Budgets           `yaml:"budgets"`
@@ -40,7 +40,7 @@ type Config struct {
 	// QualityOverrides replace catalog quality priors with measured values,
 	// usually written by `switchyard eval fit` into an included file.
 	QualityOverrides []QualityOverride `yaml:"quality_overrides"`
-	// Evaluation configures the judge and shadow sampling (Phase 8).
+	// Evaluation configures the judge and shadow sampling.
 	Evaluation Evaluation `yaml:"evaluation"`
 	// Cache holds gateway-wide response-cache limits (DESIGN §11). Whether
 	// a request is cached is set per policy (Policy.Cache).
@@ -48,6 +48,43 @@ type Config struct {
 	// SemanticCache configures the embedding model and lookup budget of
 	// the semantic cache (DESIGN §11.3).
 	SemanticCache SemanticCacheConfig `yaml:"semantic_cache"`
+	// RateLimits holds gateway-wide rate-limit settings; the limits
+	// themselves are per tenant and key.
+	RateLimits RateLimits `yaml:"rate_limits"`
+	// Telemetry configures tracing (DESIGN §15.3).
+	Telemetry Telemetry `yaml:"telemetry"`
+}
+
+// Telemetry configures OpenTelemetry export.
+type Telemetry struct {
+	Tracing Tracing `yaml:"tracing"`
+}
+
+// Tracing configures OpenTelemetry traces, exported over OTLP/HTTP
+// (protobuf). Switchyard accepts a W3C traceparent from clients either
+// way; spans are recorded and exported only when Enabled.
+type Tracing struct {
+	// Enabled turns tracing on. Default false.
+	Enabled bool `yaml:"enabled"`
+	// Endpoint is the collector's OTLP/HTTP base URL, for example
+	// http://otel-collector:4318; traces are posted to <endpoint>/v1/traces.
+	// Required when Enabled. It may hold credentials, so it is a secret.
+	Endpoint Secret `yaml:"endpoint"`
+	// SampleRatio is the fraction of new traces sampled, in [0, 1]; a
+	// request that arrives with a sampled parent is always sampled
+	// (parent-based), so clients control sampling, and the trace ID of
+	// their requests' spans and log lines, through the traceparent they
+	// send. Default 0.05.
+	SampleRatio float64 `yaml:"sample_ratio"`
+	// ServiceName is the service.name resource attribute. Default
+	// switchyard.
+	ServiceName string `yaml:"service_name"`
+	// PropagateUpstream sends the W3C traceparent of the gateway's
+	// upstream attempt span to providers, only with tracing enabled;
+	// tracestate and baggage are never sent, and nor is a client's own
+	// trace context. Default false: provider calls leave the trust
+	// boundary.
+	PropagateUpstream bool `yaml:"propagate_upstream"`
 }
 
 // Server configures the public and admin HTTP listeners.
@@ -81,6 +118,28 @@ type Server struct {
 	// ShutdownGrace bounds how long in-flight requests may take to finish once
 	// the listeners have closed. Default 60s.
 	ShutdownGrace Duration `yaml:"shutdown_grace"`
+	// AdminToken, when set, must be sent as "Authorization: Bearer <token>"
+	// on every /admin/v1/* route; /metrics and the health routes of the
+	// admin listener stay open, for scrapers and probes. It is required
+	// when AdminListen is not a loopback address. It must be at least 32
+	// characters, without whitespace or control characters (`openssl rand
+	// -base64 32` or `switchyard keys generate` make one). Failed admin
+	// tokens count against the client address's
+	// rate_limits.auth_failures_per_minute, as failed API keys do.
+	AdminToken Secret `yaml:"admin_token"`
+	// TLS, when CertFile and KeyFile are set, serves the public listener
+	// over HTTPS. Both or neither must be set.
+	TLS ServerTLS `yaml:"tls"`
+}
+
+// ServerTLS configures HTTPS on the public listener. The files are read at
+// startup and on reload is reported as needing a restart.
+type ServerTLS struct {
+	// CertFile is a PEM certificate chain; KeyFile its PEM private key.
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	// MinVersion is 1.2 (default) or 1.3.
+	MinVersion string `yaml:"min_version"`
 }
 
 // Logging configures the process logger.
@@ -91,8 +150,8 @@ type Logging struct {
 	Format string `yaml:"format"`
 }
 
-// Storage selects the state backends. Phase 0 validates these settings but
-// does not connect to anything yet.
+// Storage selects the state backends: where budgets, rate limits, cache
+// entries and namespace versions live, and the usage ledger.
 type Storage struct {
 	// Mode is memory (quickstart and dev only; state is lost on restart) or
 	// redis. Default memory.
@@ -196,8 +255,8 @@ type Model struct {
 	// (Routing).
 	Capabilities []string `yaml:"capabilities"`
 	// Quality holds quality priors in [0, 1] per category: general, coding,
-	// reasoning, extraction, creative, tool_use (DESIGN §10.2). Used from
-	// Phase 5; validated now.
+	// reasoning, extraction, creative, tool_use (DESIGN §10.2), used by
+	// cost-aware routing; quality_overrides can replace them.
 	Quality map[string]float64 `yaml:"quality"`
 	// TokenRatio scales the bytes/4 token estimate for this model's
 	// tokenizer. 0 means 1.
@@ -245,8 +304,7 @@ type Pricing struct {
 
 // Price is a non-negative decimal amount of USD per million tokens, written
 // as a YAML number or string, for example 0.15 or "0.0375". It keeps the
-// exact decimal text so that cost accounting (Phase 4) can avoid float
-// rounding. The zero value means "not set".
+// exact decimal text so that cost accounting can avoid float rounding. The zero value means "not set".
 type Price struct {
 	text string
 }
@@ -259,8 +317,8 @@ type LatencyHint struct {
 	TokensPerSec float64 `yaml:"tokens_per_sec"`
 }
 
-// Routing holds gateway-wide routing settings. Phase 5 adds profiles and
-// per-policy overrides.
+// Routing holds gateway-wide routing settings: profiles, fallback and
+// retries, breakers, the assessor and the router's estimates.
 type Routing struct {
 	// DropUnsupportedParams lets a request reach a deployment that cannot
 	// honor some optional parameters (n, logprobs, seed, penalties,
@@ -384,6 +442,37 @@ type Tenant struct {
 	// Policy names the tenant's policy. Empty means the policy with ID
 	// "default" if one exists, otherwise built-in defaults.
 	Policy string `yaml:"policy"`
+	// RateLimit applies to each of the tenant's keys separately, unless the
+	// key sets its own. The zero value means no limit.
+	RateLimit RateLimit `yaml:"rate_limit"`
+}
+
+// RateLimit limits one API key (DESIGN §7 step 3, §17). The counters live
+// in the state Redis with storage.mode redis, so every replica shares
+// them, and in memory otherwise.
+type RateLimit struct {
+	// RequestsPerMinute is the sustained request rate, enforced with GCRA.
+	// 0 means unlimited.
+	RequestsPerMinute int `yaml:"requests_per_minute"`
+	// Burst is how many requests may arrive at once on top of the
+	// sustained rate. Default: RequestsPerMinute / 6 (ten seconds' worth),
+	// at least 1.
+	Burst int `yaml:"burst"`
+	// MaxConcurrentStreams caps the key's in-flight streaming requests.
+	// 0 means unlimited.
+	MaxConcurrentStreams int `yaml:"max_concurrent_streams"`
+}
+
+// RateLimits holds gateway-wide rate-limit settings.
+type RateLimits struct {
+	// FailMode decides what happens when the rate-limit store is
+	// unavailable: open (serve, and alert; default) or closed (reject with
+	// 503).
+	FailMode string `yaml:"fail_mode"`
+	// AuthFailuresPerMinute caps failed authentications per client IP;
+	// once exceeded, that IP gets 429 whatever key it sends. Default
+	// 30; -1 disables the limit.
+	AuthFailuresPerMinute int `yaml:"auth_failures_per_minute"`
 }
 
 // Budget is a spend limit over a calendar window in UTC.
@@ -395,7 +484,8 @@ type Budget struct {
 	// LimitUSD is the cap, in USD, as an exact decimal (for example "2000").
 	LimitUSD Price `yaml:"limit_usd"`
 	// SoftAt, when set, is a fraction in (0, 1) of the limit. Crossing it is
-	// logged and counted once per window; Phase 5 adds downgrading.
+	// logged and counted once per window, and with SoftProfile it
+	// downgrades "auto" requests.
 	SoftAt float64 `yaml:"soft_at"`
 	// OnExhausted is block (requests that would exceed the limit get 429
 	// budget_exceeded) or notify (they are served, logged and counted).
@@ -427,6 +517,8 @@ type APIKey struct {
 	Tags []string `yaml:"tags"`
 	// Policy, when set, overrides the tenant's policy for this key.
 	Policy string `yaml:"policy"`
+	// RateLimit, when set, replaces the tenant's rate_limit for this key.
+	RateLimit *RateLimit `yaml:"rate_limit"`
 }
 
 // Profile is a routing objective plus constraints (DESIGN §9.3).
@@ -442,7 +534,7 @@ type Profile struct {
 
 // AssessorConfig configures the request assessor.
 type AssessorConfig struct {
-	// Type is heuristic, the only kind in Phase 5. Default heuristic.
+	// Type is heuristic, the only kind so far. Default heuristic.
 	Type string `yaml:"type"`
 	// Weights overrides the heuristic's signal weights by signal name; see
 	// internal/quality for the names and defaults.
@@ -485,7 +577,7 @@ type Policy struct {
 	// Rules are evaluated in order; the first whose match holds applies its
 	// set.
 	Rules []Rule `yaml:"rules"`
-	// Shadow configures shadow sampling for this policy's traffic (Phase 8).
+	// Shadow configures shadow sampling for this policy's traffic.
 	// It is off unless SampleRate > 0.
 	Shadow ShadowPolicy `yaml:"shadow"`
 	// Cache configures the response caches for this policy's chat

@@ -11,6 +11,7 @@ import (
 	"switchyard/internal/providers"
 	"switchyard/internal/router"
 	"switchyard/internal/schema"
+	"switchyard/internal/tracing"
 )
 
 // reasonNoEmbeddings excludes a deployment whose adapter cannot embed.
@@ -26,10 +27,10 @@ const reasonNoEmbeddings = "provider does not serve embeddings"
 // after header tightening, against each deployment's estimated input
 // cost; its profile, substitution and routing mode never apply. The request is forwarded losslessly with the model
 // replaced, and the answer returned byte for byte.
-func (g *Gateway) Embeddings(ctx context.Context, ex Exchange) {
+func (g *snapshot) Embeddings(ctx context.Context, ex Exchange) {
 	rec := g.newRecord(ctx, EndpointEmbeddings)
 	defer rec.done()
-	if !g.readTags(ex, rec) {
+	if !g.knownCaller(ex, rec) || !g.readTags(ex, rec) {
 		return
 	}
 
@@ -65,10 +66,12 @@ func (g *Gateway) Embeddings(ctx context.Context, ex Exchange) {
 	// The policy's deny, allow, require_tags and cost cap apply; nothing
 	// else of it does, since embeddings never change models.
 	tenant := g.tenants[rec.tenant]
+	_, span := tracing.Start(ctx, tracing.SpanPolicy)
 	eff, perr := g.policy.Resolve(tenant, rec.keyID, policy.Request{
 		Model: req.Model(), KeyID: rec.keyID, KeyTags: keyTags(tenant, rec.keyID),
 		Headers: ex.Header(), Tags: rec.tags, EstInputTokens: estIn,
 	})
+	span.End()
 	if perr != nil {
 		rec.respondError(ex, rec.info, policyError(req.Model(), perr))
 		return
@@ -77,6 +80,7 @@ func (g *Gateway) Embeddings(ctx context.Context, ex Exchange) {
 	rec.info.PolicyWarning = strings.Join(eff.Warnings, "; ")
 	// The context filter applies per input, so the estimate is the
 	// largest input's.
+	_, span = tracing.Start(ctx, tracing.SpanRoute)
 	e = g.buildPlan(&rec.plan, res, schema.CapabilitySet{}, req.LargestInputTokens(res.Model.TokenRatio), 0,
 		func(d *catalog.Deployment) string {
 			if _, ok := g.adapters[d.Provider].(providers.Embedder); !ok {
@@ -87,6 +91,7 @@ func (g *Gateway) Embeddings(ctx context.Context, ex Exchange) {
 			}
 			return router.CostCapReason(&eff, d, estIn, 0)
 		})
+	span.End()
 	rec.excluded = len(rec.plan.exclusions)
 	if e != nil {
 		rec.respondError(ex, rec.info, e)

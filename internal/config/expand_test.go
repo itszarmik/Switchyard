@@ -316,6 +316,7 @@ func TestSecretPaths(t *testing.T) {
 	want := map[string]bool{
 		"storage.redis.cache_url": true, "storage.redis.state_url": true,
 		"storage.ledger.dsn": true, "providers[].api_key": true,
+		"server.admin_token": true, "telemetry.tracing.endpoint": true,
 	}
 	if diff := cmp.Diff(want, secretPaths); diff != "" {
 		t.Errorf("secret paths (-want +got):\n%s", diff)

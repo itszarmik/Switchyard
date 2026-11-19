@@ -163,19 +163,30 @@ func (t *Tracker) Deployment(id, provider string, hint LatencyHint) *Deployment 
 	defer t.mu.Unlock()
 	d := t.deployments[id]
 	if d == nil {
-		d = &Deployment{
-			id: id, provider: provider, t: t,
-			window: newWindow(t.config().Window),
-			budget: newWindow(BudgetWindow),
-		}
-		d.healthy.Store(true)
+		d = t.newDeployment(id, provider)
 		t.deployments[id] = d
 	}
+	d.set(provider, hint)
+	return d
+}
+
+// newDeployment returns a new, unregistered deployment handle.
+func (t *Tracker) newDeployment(id, provider string) *Deployment {
+	d := &Deployment{
+		id: id, provider: provider, t: t,
+		window: newWindow(t.config().Window),
+		budget: newWindow(BudgetWindow),
+	}
+	d.healthy.Store(true)
+	return d
+}
+
+// set updates the deployment's provider and latency hint.
+func (d *Deployment) set(provider string, hint LatencyHint) {
 	d.mu.Lock()
 	d.provider = provider
 	d.hint = hint
 	d.mu.Unlock()
-	return d
 }
 
 // Provider returns the handle of provider id, creating it on first use,
@@ -190,6 +201,96 @@ func (t *Tracker) Provider(id string, maxConcurrency int) *Provider {
 	}
 	p.max.Store(int64(maxConcurrency))
 	return p
+}
+
+// Registry hands out deployment and provider handles. *Tracker registers
+// them, and applies their settings, at once; *Batch defers both to Apply.
+type Registry interface {
+	Deployment(id, provider string, hint LatencyHint) *Deployment
+	Provider(id string, maxConcurrency int) *Provider
+}
+
+// Batch collects handle registrations and setting changes, for a
+// configuration that may never be put in force (a reload is staged, then
+// checked, then committed), and applies them with Apply. Until then the
+// Tracker and every handle it holds are unchanged: the handle of an ID the
+// Tracker does not know is created unregistered, and the settings given
+// for a known one are recorded, not set. A Batch is used by one goroutine.
+// Batches whose lifetimes overlap must not register the same new IDs.
+type Batch struct {
+	t     *Tracker
+	deps  map[string]depSettings
+	provs map[string]provSettings
+}
+
+type depSettings struct {
+	d        *Deployment
+	provider string
+	hint     LatencyHint
+}
+
+type provSettings struct {
+	p   *Provider
+	max int
+}
+
+// Batch returns an empty Batch over t.
+func (t *Tracker) Batch() *Batch {
+	return &Batch{t: t, deps: make(map[string]depSettings), provs: make(map[string]provSettings)}
+}
+
+// Deployment returns the handle of deployment id: the Tracker's, or a new
+// one that Apply registers. Apply sets its provider and hint.
+func (b *Batch) Deployment(id, provider string, hint LatencyHint) *Deployment {
+	s, ok := b.deps[id]
+	if !ok {
+		b.t.mu.Lock()
+		s.d = b.t.deployments[id]
+		b.t.mu.Unlock()
+		if s.d == nil {
+			s.d = b.t.newDeployment(id, provider)
+		}
+	}
+	s.provider, s.hint = provider, hint
+	b.deps[id] = s
+	return s.d
+}
+
+// Provider returns the handle of provider id: the Tracker's, or a new one
+// that Apply registers. Apply sets its concurrency limit.
+func (b *Batch) Provider(id string, maxConcurrency int) *Provider {
+	s, ok := b.provs[id]
+	if !ok {
+		b.t.mu.Lock()
+		s.p = b.t.providers[id]
+		b.t.mu.Unlock()
+		if s.p == nil {
+			s.p = &Provider{id: id, t: b.t}
+		}
+	}
+	s.max = maxConcurrency
+	b.provs[id] = s
+	return s.p
+}
+
+// Apply registers the batch's new handles with the Tracker and applies
+// every setting the batch recorded, the last one given for each ID.
+func (b *Batch) Apply() {
+	t := b.t
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, s := range b.provs {
+		if t.providers[id] == nil {
+			t.providers[id] = s.p
+		}
+		s.p.max.Store(int64(s.max))
+	}
+	for id, s := range b.deps {
+		if t.deployments[id] == nil {
+			t.deployments[id] = s.d
+		}
+		s.d.set(s.provider, s.hint)
+	}
 }
 
 // Provider is the concurrency state of one provider on this replica.

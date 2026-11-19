@@ -98,6 +98,8 @@ func (e *acctEnv) doAs(ctx context.Context, p auth.Principal, endpoint, body str
 		e.g.Completions(ctx, x)
 	case EndpointEmbeddings:
 		e.g.Embeddings(ctx, x)
+	case EndpointExplain:
+		e.g.Explain(ctx, x)
 	default:
 		e.g.ChatCompletions(ctx, x)
 	}
@@ -427,7 +429,7 @@ func TestBudgets(t *testing.T) {
 		return []config.Budget{{Scope: config.BudgetScopeTenant, Window: config.BudgetWindowDay, LimitUSD: limit(micro), OnExhausted: on}}
 	}
 	scope := func(e *acctEnv) budget.Scope {
-		return e.g.scopes[principal{"t1", "k1"}][0]
+		return e.g.current().scopes[principal{"t1", "k1"}][0]
 	}
 
 	t.Run("admit and settle", func(t *testing.T) {
@@ -629,7 +631,7 @@ func TestSettleAfterClientGone(t *testing.T) {
 		t.Fatalf("status %d", res.status)
 	}
 	est := int64(len(chatBody)/4) + defaultEstOut
-	if spent, err := e.store.Spent(context.Background(), e.g.scopes[principal{"t1", "k1"}][0], e.now); err != nil || spent != est {
+	if spent, err := e.store.Spent(context.Background(), e.g.current().scopes[principal{"t1", "k1"}][0], e.now); err != nil || spent != est {
 		t.Errorf("spent %d, %v; want the estimate %d settled", spent, err, est)
 	}
 	if !errors.Is(ctx.Err(), context.Canceled) {

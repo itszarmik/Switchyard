@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+
+# Release image, built by GoReleaser (dockers_v2 in .goreleaser.yaml) from
+# the binaries it has already built, so the image holds exactly the release
+# binaries. GoReleaser puts each platform's binaries under $TARGETPLATFORM/
+# in the build context (for example linux/arm64/switchyard), plus the
+# extra_files. For local and CI builds from source, use deploy/Dockerfile;
+# both produce the same runtime image. The base is pinned by digest, as in
+# deploy/Dockerfile, which says how to bump it.
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
+
+ARG TARGETPLATFORM
+
+LABEL org.opencontainers.image.title="switchyard" \
+      org.opencontainers.image.description="Cost-aware, OpenAI-compatible LLM inference gateway" \
+      org.opencontainers.image.source="https://github.com/OWNER/switchyard"
+
+COPY ${TARGETPLATFORM}/switchyard /usr/local/bin/switchyard
+COPY configs/quickstart.yaml /etc/switchyard/switchyard.yaml
+
+# The admin listener (/metrics, /healthz, /readyz, /admin/v1/*) keeps its default,
+# 127.0.0.1:9090: loopback inside the container, so the image starts with
+# the baked-in quickstart config and no admin token, and nothing outside the
+# container reaches it. To scrape /metrics from another container, bind it
+# to all interfaces (SWITCHYARD_ADMIN_LISTEN=":9090", or server.admin_listen)
+# and set server.admin_token, which validation then requires; never publish
+# 9090 on a public interface. deploy/compose.yaml does this.
+
+USER 65532:65532
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --start-interval=1s --retries=3 \
+  CMD ["/usr/local/bin/switchyard", "healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/switchyard"]
+CMD ["serve", "--config", "/etc/switchyard/switchyard.yaml"]

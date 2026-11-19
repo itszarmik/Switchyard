@@ -83,12 +83,13 @@ type dep struct {
 }
 
 // New returns a Router over cat. tracker supplies breaker, cooldown,
-// concurrency and latency state; it is the same Tracker the gateway
-// executes with, and New registers every deployment and provider with it
-// as the gateway does. A nil tracker means every deployment is healthy and
-// latency estimates come from the catalog's hints, which suits offline
-// explanations. cfg supplies fallback.max_deployments; 0 means 3.
-func New(cat *catalog.Catalog, tracker *health.Tracker, cfg config.Routing) *Router {
+// concurrency and latency state: the gateway's Tracker, or a Batch of it
+// for a snapshot not yet in force. New takes every deployment's and
+// provider's handle from it, as the gateway does. A nil tracker means
+// every deployment is healthy and latency estimates come from the
+// catalog's hints, which suits offline explanations. cfg supplies
+// fallback.max_deployments; 0 means 3.
+func New(cat *catalog.Catalog, tracker health.Registry, cfg config.Routing) *Router {
 	r := &Router{cat: cat, maxPlan: cfg.Fallback.MaxDeployments, byID: map[string]int{}}
 	if r.maxPlan <= 0 {
 		r.maxPlan = defaultMaxPlan

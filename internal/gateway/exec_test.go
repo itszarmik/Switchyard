@@ -272,7 +272,7 @@ func newExecEnvOpts(t *testing.T, routing config.Routing, edit func(*config.Conf
 		t.Fatal(err)
 	}
 	e := &execEnv{g: g, reg: reg, logs: logs, a: &scripted{name: "a"}, b: &scripted{name: "b"}, c: &scripted{name: "c"}}
-	g.adapters["a"], g.adapters["b"], g.adapters["c"] = e.a, e.b, e.c
+	g.current().adapters["a"], g.current().adapters["b"], g.current().adapters["c"] = e.a, e.b, e.c
 	return e
 }
 
@@ -952,12 +952,12 @@ func TestPlanPrefersProviderDiversity(t *testing.T) {
 	r := fastRouting()
 	r.Fallback.MaxDeployments = 2
 	e := newExecEnv(t, r, nil)
-	res, err := e.g.catalog.Resolve("m")
+	res, err := e.g.current().catalog.Resolve("m")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var p plan
-	if perr := e.g.buildPlan(&p, res, nil, 10, 10, nil); perr != nil {
+	if perr := e.g.current().buildPlan(&p, res, nil, 10, 10, nil); perr != nil {
 		t.Fatal(perr)
 	}
 	if len(p.entries) != 2 || p.entries[0].d.ID != "m@a" || p.entries[1].d.ID != "m@b" {
@@ -1077,16 +1077,16 @@ func TestPanicReleasesSlotAndProbe(t *testing.T) {
 				r := fastRouting()
 				r.StreamKeepalive = config.Duration(keepalive)
 				e := newExecEnv(t, r, func(c *config.Config) { c.Providers[1].MaxConcurrency = 1 }) // a
-				e.g.adapters["a"] = panicky{e.a}
+				e.g.current().adapters["a"] = panicky{e.a}
 				for _, stream := range []bool{false, true} {
 					if v := chatRecovered(e, stream); v != "boom" {
 						t.Fatalf("stream=%v: recovered %v, want the panic", stream, v)
 					}
-					if n := e.g.provs["a"].InFlight(); n != 0 {
+					if n := e.g.current().provs["a"].InFlight(); n != 0 {
 						t.Fatalf("stream=%v: %d requests in flight after the panic", stream, n)
 					}
 				}
-				e.g.adapters["a"] = e.a
+				e.g.current().adapters["a"] = e.a
 				if res := e.chat(false); res.status != 200 || res.info.Provider != "a" {
 					t.Errorf("after the panic: status %d, provider %q", res.status, res.info.Provider)
 				}
@@ -1104,17 +1104,17 @@ func TestPanicReleasesSlotAndProbe(t *testing.T) {
 		e.a.script(step{err: err503})
 		e.chat(false) // opens a's breaker
 		clk.advance(2 * time.Second)
-		e.g.adapters["a"] = panicky{e.a}
+		e.g.current().adapters["a"] = panicky{e.a}
 		if v := chatRecovered(e, false); v != "boom" {
 			t.Fatalf("recovered %v, want the panic", v)
 		}
-		if r := e.g.deps["m@a"].Skip(); r != "" {
+		if r := e.g.current().deps["m@a"].Skip(); r != "" {
 			t.Fatalf("after the probe panicked: Skip = %q, want the probe slot free", r)
 		}
-		e.g.adapters["a"] = e.a
+		e.g.current().adapters["a"] = e.a
 		e.a.script(step{})
-		if res := e.chat(false); res.info.Provider != "a" || e.g.deps["m@a"].State() != health.StateClosed {
-			t.Errorf("next probe served by %q, breaker %s", res.info.Provider, e.g.deps["m@a"].State())
+		if res := e.chat(false); res.info.Provider != "a" || e.g.current().deps["m@a"].State() != health.StateClosed {
+			t.Errorf("next probe served by %q, breaker %s", res.info.Provider, e.g.current().deps["m@a"].State())
 		}
 	})
 }
@@ -1243,11 +1243,11 @@ func TestStreamHealthAtCommitPoint(t *testing.T) {
 		clk.advance(2 * time.Second)
 		h := &heldAdapter{scripted: e.a, waiting: make(chan struct{}), release: make(chan struct{})}
 		e.a.script(step{})
-		e.g.adapters["a"] = h
+		e.g.current().adapters["a"] = h
 		done := make(chan exchangeResult, 1)
 		go func() { done <- e.chat(true) }()
 		<-h.waiting
-		d := e.g.deps["m@a"]
+		d := e.g.current().deps["m@a"]
 		if st, skip := d.State(), d.Skip(); st != health.StateClosed || skip != "" {
 			t.Errorf("while the probe streams: breaker %s, Skip %q; want closed", st, skip)
 		}
@@ -1265,7 +1265,7 @@ func TestStreamHealthAtCommitPoint(t *testing.T) {
 		e.a.script(step{})
 		var during health.State = -1
 		x := &respondHook{hdrExchange: hdrExchange{recExchange: recExchange{body: []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)}},
-			hook: func() { during = e.g.deps["m@a"].State() }}
+			hook: func() { during = e.g.current().deps["m@a"].State() }}
 		e.g.ChatCompletions(context.Background(), x)
 		if x.res.status != 200 || x.res.info.Provider != "a" || during != health.StateClosed {
 			t.Errorf("status %d, provider %q, breaker while answering %s; want closed", x.res.status, x.res.info.Provider, during)
@@ -1302,7 +1302,7 @@ func TestStreamHealthAtCommitPoint(t *testing.T) {
 				if tt.opens {
 					want = health.StateOpen
 				}
-				if st := e.g.deps["m@a"].State(); st != want || e.a.count() != 3 {
+				if st := e.g.current().deps["m@a"].State(); st != want || e.a.count() != 3 {
 					t.Errorf("breaker %s after 3 streams, calls %s; want %s", st, e.calls(), want)
 				}
 			})
@@ -1338,7 +1338,7 @@ func TestNonStreamTotalTimeout(t *testing.T) {
 		if res.status != 200 || e.calls() != "a=1 b=1 c=0" || res.info.RouteReason != "fallback:timeout" {
 			t.Fatalf("status %d, calls %s, info %+v", res.status, e.calls(), res.info)
 		}
-		if st := e.g.deps["m@a"].State(); st != health.StateOpen {
+		if st := e.g.current().deps["m@a"].State(); st != health.StateOpen {
 			t.Errorf("breaker %s, want open: the timeout counts", st)
 		}
 	})
@@ -1387,7 +1387,7 @@ func TestUnsupportedFallsBack(t *testing.T) {
 				t.Errorf("error %+v, want the adapter's body", res.err)
 			}
 			for _, id := range []string{"m@b", "m@c"} {
-				if st := e.g.deps[id].State(); st != health.StateClosed {
+				if st := e.g.current().deps[id].State(); st != health.StateClosed {
 					t.Errorf("%s breaker %s, want closed", id, st)
 				}
 			}

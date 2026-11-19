@@ -11,11 +11,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"switchyard/internal/catalog"
 	"switchyard/internal/health"
 	"switchyard/internal/providers"
 	"switchyard/internal/reqctx"
 	"switchyard/internal/schema"
+	"switchyard/internal/tracing"
 )
 
 // Route reasons, for the X-Switchyard-Route-Reason header and the logs.
@@ -52,7 +56,7 @@ type tryFunc func(ctx context.Context, e *planEntry, info *Info) attempt
 
 // requestTimeout returns the request's deadline: routing.request_timeout,
 // lowered by the client's X-Switchyard-Timeout-Ms header if it is shorter.
-func (g *Gateway) requestTimeout(h http.Header) (time.Duration, *Error) {
+func (g *snapshot) requestTimeout(h http.Header) (time.Duration, *Error) {
 	d := g.routing.RequestTimeout.Std()
 	v := h.Get(HeaderTimeoutMs)
 	if v == "" {
@@ -70,7 +74,7 @@ func (g *Gateway) requestTimeout(h http.Header) (time.Duration, *Error) {
 
 // withDeadline sets the request's deadline from its headers. When the
 // header is unusable it answers the client and returns false.
-func (g *Gateway) withDeadline(ctx context.Context, ex Exchange, rec *record) (context.Context, context.CancelFunc, bool) {
+func (g *snapshot) withDeadline(ctx context.Context, ex Exchange, rec *record) (context.Context, context.CancelFunc, bool) {
 	timeout, e := g.requestTimeout(ex.Header())
 	if e != nil {
 		rec.respondError(ex, Info{}, e)
@@ -109,7 +113,7 @@ func (g *Gateway) withDeadline(ctx context.Context, ex Exchange, rec *record) (c
 // deployment the budgets have no room for is passed over.
 //
 // The plan is rec.plan, and the response headers start from rec.info.
-func (g *Gateway) execute(ctx context.Context, ex Exchange, rec *record, try tryFunc) {
+func (g *snapshot) execute(ctx context.Context, ex Exchange, rec *record, try tryFunc) {
 	if !g.admitBudget(ctx, ex, rec) {
 		return
 	}
@@ -168,7 +172,11 @@ func (g *Gateway) execute(ctx context.Context, ex Exchange, rec *record, try try
 			info.RouteReason = rec.routeReason(p)
 			rec.deployment = e.d
 
-			a := g.runAttempt(ctx, rec, e, adm, info, try)
+			retryReason := ""
+			if retry {
+				retryReason = providers.Outcome(lastErr)
+			}
+			a := g.runAttempt(ctx, rec, e, adm, info, try, retryReason)
 			if a.committed || a.kind == "" {
 				return
 			}
@@ -222,7 +230,7 @@ type failureState struct {
 // answer is one attempt's failure, the provider, upstream request id,
 // dropped parameters and shim headers are that attempt's; the attempt
 // count and route reason are the request's.
-func (g *Gateway) answerFailure(ctx context.Context, ex Exchange, rec *record, f failureState) {
+func (g *snapshot) answerFailure(ctx context.Context, ex Exchange, rec *record, f failureState) {
 	var (
 		e      *Error
 		answer *failure
@@ -284,7 +292,7 @@ func failureRank(k providers.Kind) int {
 // deadline: a 429 waits for its Retry-After, which must fit the remaining
 // time (a 429 without one is not retried); anything else waits a full
 // jitter backoff, which must fit too.
-func (g *Gateway) retryWait(ctx context.Context, err error, n int) (time.Duration, bool) {
+func (g *snapshot) retryWait(ctx context.Context, err error, n int) (time.Duration, bool) {
 	remaining := time.Duration(1<<63 - 1)
 	if dl, ok := ctx.Deadline(); ok {
 		remaining = time.Until(dl)
@@ -318,7 +326,7 @@ func backoffCap(base, maxWait time.Duration, n int) time.Duration {
 
 // sleep waits for d, or until ctx is done, and reports whether it waited
 // the whole time. The wait counts as neither overhead nor upstream time.
-func (g *Gateway) sleep(ctx context.Context, rec *record, d time.Duration) bool {
+func (g *snapshot) sleep(ctx context.Context, rec *record, d time.Duration) bool {
 	if d <= 0 {
 		return ctx.Err() == nil
 	}
@@ -342,13 +350,19 @@ func (g *Gateway) sleep(ctx context.Context, rec *record, d time.Duration) bool 
 // It also notes whether the attempt reached the upstream (see sentTrace)
 // and may have been billed without serving the request (see billable):
 // such a request is charged its estimate (see record.account).
-func (g *Gateway) runAttempt(ctx context.Context, rec *record, e *planEntry, adm health.Admission, info *Info, try tryFunc) attempt {
+//
+// The attempt is traced as a tracing.SpanUpstreamAttempt span (see
+// endAttemptSpan), the parent of the adapter's HTTP call; retryReason is
+// the failure kind a retry follows, or "" for a first attempt.
+func (g *snapshot) runAttempt(ctx context.Context, rec *record, e *planEntry, adm health.Admission, info *Info, try tryFunc, retryReason string) attempt {
 	rec.startAttempt(e.health, adm)
+	ctx, span := tracing.Start(ctx, tracing.SpanUpstreamAttempt)
 	ended := false
 	defer func() {
 		if !ended {
 			e.prov.Release()
 			rec.reportHealth(health.Result{Kind: providers.KindCanceled})
+			span.End()
 		}
 	}()
 	var sent atomic.Bool
@@ -361,7 +375,37 @@ func (g *Gateway) runAttempt(ctx context.Context, rec *record, e *planEntry, adm
 		rec.sentTo = e.d
 	}
 	g.recordAttempt(ctx, rec, e, a, dur)
+	endAttemptSpan(span, rec.attempts, e.d, a, retryReason)
 	return a
+}
+
+// endAttemptSpan ends the span of attempt number n on d, which ended with
+// a: its number, provider, deployment and outcome, the retry reason when
+// it is a retry, the GenAI system, the upstream model and the token
+// counts, and an error status when it failed. Never content.
+func endAttemptSpan(span trace.Span, n int, d *catalog.Deployment, a attempt, retryReason string) {
+	if span.IsRecording() {
+		outcome := providers.OutcomeOK
+		if a.kind != "" {
+			outcome = string(a.kind)
+			span.SetStatus(codes.Error, outcome)
+		}
+		span.SetAttributes(
+			tracing.AttrAttemptNumber.Int(n),
+			tracing.AttrProvider.String(d.Provider),
+			tracing.AttrDeployment.String(d.ID),
+			tracing.AttrOutcome.String(outcome),
+		)
+		if retryReason != "" {
+			span.SetAttributes(tracing.AttrRetryReason.String(retryReason))
+		}
+		ga := tracing.GenAI{System: d.ProviderType, RequestModel: d.UpstreamModel}
+		if u := a.usage; u != nil {
+			ga.InputTokens, ga.OutputTokens = u.PromptTokens, u.CompletionTokens
+		}
+		tracing.SetGenAI(span, ga)
+	}
+	span.End()
 }
 
 // sentTrace returns ctx with an HTTP client trace that sets sent once the
@@ -413,7 +457,7 @@ func billable(k providers.Kind) bool {
 // commit point, the provider's total timeout, which is the request's own
 // budget running out. A client that went away or stopped reading
 // (server.write_timeout) is canceled already.
-func (g *Gateway) recordAttempt(ctx context.Context, rec *record, e *planEntry, a attempt, dur time.Duration) {
+func (g *snapshot) recordAttempt(ctx context.Context, rec *record, e *planEntry, a attempt, dur time.Duration) {
 	healthKind := a.kind
 	switch {
 	case ctx.Err() != nil && (a.kind == providers.KindTimeout || a.kind == providers.KindTransport):
@@ -470,7 +514,7 @@ func upstreamMessage(err error) string {
 // a failure is returned for the executor to handle, and a success is
 // committed in the deployment's health, the attempt's commit point (see
 // recordAttempt), then answered (translated by conv, if set).
-func (g *Gateway) responseAttempt(ex Exchange, rec *record, start time.Time, resp *providers.Response, err error, info *Info, conv converter) attempt {
+func (g *snapshot) responseAttempt(ex Exchange, rec *record, start time.Time, resp *providers.Response, err error, info *Info, conv converter) attempt {
 	rec.upstreamWait += time.Since(start)
 	if err != nil {
 		rec.upstreamFailed(err)
@@ -522,7 +566,7 @@ type opener func(ctx context.Context) (providers.Stream, error)
 // The first event is the attempt's commit point, for its deployment's
 // health too (see recordAttempt); from then on the stream is forwarded
 // (see pump) and the attempt is committed.
-func (g *Gateway) streamAttempt(ctx context.Context, ex Exchange, rec *record, info *Info, wantUsage bool, conv converter, open opener) attempt {
+func (g *snapshot) streamAttempt(ctx context.Context, ex Exchange, rec *record, info *Info, wantUsage bool, conv converter, open opener) attempt {
 	start := time.Now()
 	var (
 		s   providers.Stream
@@ -575,7 +619,7 @@ func (g *Gateway) streamAttempt(ctx context.Context, ex Exchange, rec *record, i
 // committed (200 and the SSE headers) and a ": keep-alive" comment is
 // sent every interval until the stream opens or fails. A client that goes
 // away cancels the attempt.
-func (g *Gateway) openWithKeepalive(ctx context.Context, ex Exchange, rec *record, info *Info, interval time.Duration, open opener) (providers.Stream, error) {
+func (g *snapshot) openWithKeepalive(ctx context.Context, ex Exchange, rec *record, info *Info, interval time.Duration, open opener) (providers.Stream, error) {
 	type result struct {
 		s   providers.Stream
 		err error

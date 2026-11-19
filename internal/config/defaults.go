@@ -162,6 +162,8 @@ func applyDefaults(c *Config, explicit func(path string) bool) {
 	applyPolicyDefaults(c.Policies, explicit)
 	applyEvaluationDefaults(&c.Evaluation)
 	applyCacheDefaults(c)
+	applyRateLimitDefaults(c, explicit)
+	applyTracingDefaults(&c.Telemetry.Tracing, explicit)
 }
 
 // applyPolicyDefaults fills substitution, routing_mode and on_unmet on every

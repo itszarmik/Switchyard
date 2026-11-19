@@ -1,5 +1,12 @@
 // Command load measures the latency Switchyard adds to chat completions.
 //
+// It has two modes. The default, the overhead benchmark (`make
+// bench-overhead`), is a closed loop against a zero-latency fake; the slo
+// subcommand (`make bench-slo`) is the P7 SLO bench, an open loop at a
+// fixed rate against a fake with realistic latency.
+//
+// # Overhead benchmark
+//
 // It starts a zero-latency fake upstream, measures latency directly against
 // it, then builds and starts the gateway in front of it and measures again
 // through the gateway. It prints p50, p90 and p99 for both and the added
@@ -19,6 +26,39 @@
 // warmup are measured. Run it from inside the switchyard module so it can
 // build the gateway, or pass a prebuilt binary with -bin. `make
 // bench-overhead` runs it.
+//
+// # SLO bench
+//
+//	go run ./test/load slo [-rate 1000] [-duration 60s] [-warmup 5s]
+//	                       [-upstream-latency 20ms] [-chunk-delay 1ms]
+//	                       [-stream-ratio 0.2] [-max-p50 2ms] [-max-p99 10ms]
+//	                       [-bin PATH] [-gateway-log-level info] [-out FILE]
+//
+// An open-loop generator sends -rate requests a second, each at its
+// scheduled time in a goroutine of its own, whatever the earlier ones are
+// doing, first directly to a fake upstream (switchyard/test/load/loadkit)
+// and then, with a fresh fake, through the gateway binary in front of it.
+// One request in 1/-stream-ratio streams (with stream_options.include_usage),
+// the rest do not; caching is off. The gateway runs a production-shaped
+// hot path: the key has a memory-mode rate limit and a stream cap, far
+// above the load so they never refuse, and tracing is on with sample_ratio
+// 1, exporting every span to an in-process OTLP collector
+// (loadkit.Collector). The fake answers after
+// -upstream-latency, and records how long it spent on each request, keyed
+// by the X-Load-Seq header, which the gateway forwards.
+//
+// The added latency of a request is the client's latency (from sending the
+// request to reading its last byte) minus the fake's own time for that same
+// request. Subtracting per request, rather than comparing the two
+// distributions, cancels the fake's timer jitter, which on a loaded machine
+// is as large as the overhead being measured. Through the gateway the
+// difference is everything Switchyard adds, the extra loopback hop
+// included; directly it is the cost of one hop and the client, which the
+// report shows for reference along with the percentile-by-percentile
+// difference. The run fails if the gateway's added p50 exceeds -max-p50 or
+// its p99 exceeds -max-p99 (the P7 gates: 2 ms and 10 ms), or any request
+// fails. The report names the hardware (from sysctl on macOS) and the load
+// average before and after, since on a shared machine both matter.
 package main
 
 import (
@@ -72,12 +112,15 @@ func main() {
 
 // run executes the benchmark and returns the process exit code.
 func run(args []string, stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if len(args) > 0 && args[0] == "slo" {
+		return runSLO(ctx, args[1:], stdout, stderr)
+	}
 	opts, ok := parseFlags(args, stderr)
 	if !ok {
 		return exitUsage
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	if err := bench(ctx, opts, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return exitFail

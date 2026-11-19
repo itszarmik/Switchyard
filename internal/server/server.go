@@ -1,8 +1,9 @@
 // Package server runs Switchyard's two HTTP listeners: the public API
-// listener and the admin listener that serves /metrics.
+// listener, optionally over TLS, and the admin listener that serves
+// /metrics, whose /admin/v1/* routes can require an admin token.
 //
-// Both share one middleware chain (request ID, access log and metrics, panic
-// recovery, body limit) and the graceful shutdown sequence the deployment
+// Both share one middleware chain (tracing, request ID, access log and
+// metrics, panic recovery, body limit) and the graceful shutdown sequence the deployment
 // relies on: readiness fails first, the server keeps serving for
 // ShutdownDelay so load balancers can stop routing to it, then in-flight
 // requests get up to ShutdownGrace to finish.
@@ -10,6 +11,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,6 +24,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"switchyard/internal/tracing"
 )
 
 // Listener names, used in logs and metric labels.
@@ -52,13 +57,28 @@ type Options struct {
 	// ShutdownGrace is the longest Shutdown waits for in-flight requests
 	// after the listeners close.
 	ShutdownGrace time.Duration
-	// ConfigVersion is reported by /readyz.
+	// ConfigVersion is reported by /readyz; SetConfigVersion changes it.
 	ConfigVersion string
+	// TLSCertFile and TLSKeyFile, when both set, serve the public listener
+	// over HTTPS with that PEM certificate chain and key, read by New.
+	// TLSMinVersion is the lowest TLS version accepted, tls.VersionTLS12
+	// when zero. The admin listener is always plain HTTP.
+	TLSCertFile, TLSKeyFile string
+	TLSMinVersion           uint16
+	// AdminToken, when set, must be sent as "Authorization: Bearer
+	// <token>" on every /admin/v1/* route of the admin listener (see
+	// HandleAdmin); SetAdminToken changes it.
+	AdminToken string
 	// Logger receives the access log and the server's own logs. Required.
 	Logger *slog.Logger
 	// Registry receives the HTTP metrics and is served at admin /metrics.
 	// Required.
 	Registry *prometheus.Registry
+	// Tracing, when set, starts the root span of every request on both
+	// listeners (tracing.Provider.Middleware), outermost in the chain, so
+	// the request logger and the access log carry its trace_id. Nil
+	// leaves requests untraced and an incoming traceparent unread.
+	Tracing *tracing.Provider
 }
 
 // validate reports every problem with o.
@@ -94,6 +114,14 @@ func (o Options) validate() error {
 	if o.Registry == nil {
 		errs = append(errs, errors.New("missing Registry"))
 	}
+	if (o.TLSCertFile == "") != (o.TLSKeyFile == "") {
+		errs = append(errs, errors.New("TLSCertFile and TLSKeyFile must be set together"))
+	}
+	switch o.TLSMinVersion {
+	case 0, tls.VersionTLS12, tls.VersionTLS13:
+	default:
+		errs = append(errs, fmt.Errorf("invalid TLSMinVersion %#x: must be TLS 1.2 or 1.3", o.TLSMinVersion))
+	}
 	return errors.Join(errs...)
 }
 
@@ -116,6 +144,14 @@ type Server struct {
 
 	inFlight     atomic.Int64
 	shuttingDown atomic.Bool
+	// configVersion is what /readyz reports. adminToken is the SHA-256 of
+	// the admin token, or nil when /admin/v1/* is open.
+	configVersion atomic.Pointer[string]
+	adminToken    atomic.Pointer[[sha256.Size]byte]
+	// adminGuard, when set, limits failed admin authentications.
+	adminGuard AuthGuard
+	// tls, when set, is the public listener's TLS configuration.
+	tls *tls.Config
 
 	mu                    sync.Mutex
 	started               bool
@@ -151,18 +187,55 @@ func New(opts Options) (*Server, error) {
 		checkTimeout: defaultCheckTimeout,
 		serveErr:     make(chan error, 2),
 	}
+	s.SetConfigVersion(opts.ConfigVersion)
+	s.SetAdminToken(opts.AdminToken)
+	if opts.TLSCertFile != "" {
+		cert, err := tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("server: load the TLS certificate and key: %w", err)
+		}
+		minVersion := opts.TLSMinVersion
+		if minVersion == 0 {
+			minVersion = tls.VersionTLS12
+		}
+		s.tls = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: minVersion}
+	}
 
 	s.publicMux.HandleFunc(healthzPattern, s.handleHealthz)
 	s.publicMux.HandleFunc(readyzPattern, s.handleReadyz)
 	s.publicMux.HandleFunc(catchAllPattern, handleNotFound)
+	// The admin listener serves the probes too, open like /metrics: it is
+	// plain HTTP even when the public listener has TLS, so a container's
+	// own healthcheck can always reach it.
+	s.adminMux.HandleFunc(healthzPattern, s.handleHealthz)
+	s.adminMux.HandleFunc(readyzPattern, s.handleReadyz)
 	s.adminMux.Handle(metricsPattern, promhttp.HandlerFor(opts.Registry, promhttp.HandlerOpts{Registry: opts.Registry}))
 	s.adminMux.HandleFunc(catchAllPattern, handleNotFound)
 
 	s.publicHandler = s.chain(listenerPublic, s.publicMux)
 	s.adminHandler = s.chain(listenerAdmin, s.adminMux)
 	s.public = s.newHTTPServer(listenerPublic, s.publicHandler)
+	s.public.TLSConfig = s.tls
 	s.admin = s.newHTTPServer(listenerAdmin, s.adminHandler)
 	return s, nil
+}
+
+// SetConfigVersion sets the config version /readyz reports, after a
+// reload.
+func (s *Server) SetConfigVersion(v string) { s.configVersion.Store(&v) }
+
+// ConfigVersion returns the config version /readyz reports.
+func (s *Server) ConfigVersion() string { return *s.configVersion.Load() }
+
+// SetAdminToken sets the token the /admin/v1/* routes require, after a
+// reload; "" leaves them open. Only the token's SHA-256 is kept.
+func (s *Server) SetAdminToken(token string) {
+	if token == "" {
+		s.adminToken.Store(nil)
+		return
+	}
+	sum := sha256.Sum256([]byte(token))
+	s.adminToken.Store(&sum)
 }
 
 func (s *Server) newHTTPServer(listener string, h http.Handler) *http.Server {
@@ -190,9 +263,33 @@ func (s *Server) Handle(pattern string, h http.Handler) {
 }
 
 // HandleAdmin registers h on the admin mux, with the same rules as Handle.
+// A route under /admin/v1/ requires the admin token, when one is set (see
+// requireAdminToken), with the guard set by SetAdminGuard, if any.
 func (s *Server) HandleAdmin(pattern string, h http.Handler) {
 	s.mustNotBeStarted("HandleAdmin")
+	if isAdminAPI(pattern) {
+		h = s.requireAdminToken(h)
+	}
 	s.adminMux.Handle(pattern, h)
+}
+
+// AuthGuard limits failed authentications per client address;
+// *ratelimit.AuthFailures implements it.
+type AuthGuard interface {
+	// Check is called with every request once its credential has been
+	// checked, before anything is written, with whether it was valid. It
+	// counts a failure, and when the address has too many it answers the
+	// request itself (429) and returns false.
+	Check(w http.ResponseWriter, r *http.Request, authenticated bool) bool
+}
+
+// SetAdminGuard puts the /admin/v1/* routes under g: a client address with
+// too many failed admin authentications gets 429, whatever token it sends,
+// and logs no line for it. It applies to the routes HandleAdmin registers
+// afterwards, so it must be called before them, and before Start.
+func (s *Server) SetAdminGuard(g AuthGuard) {
+	s.mustNotBeStarted("SetAdminGuard")
+	s.adminGuard = g
 }
 
 // AddReadinessCheck adds a check that /readyz runs. Checks run concurrently
@@ -245,17 +342,24 @@ func (s *Server) Start() error {
 	s.started = true
 	s.publicAddr = pub.Addr().String()
 	s.adminAddr = adm.Addr().String()
-	s.log.Info("listening", "public_addr", s.publicAddr, "admin_addr", s.adminAddr)
+	s.log.Info("listening", "public_addr", s.publicAddr, "admin_addr", s.adminAddr, "public_tls", s.tls != nil)
 	s.serve(listenerPublic, s.public, pub)
 	s.serve(listenerAdmin, s.admin, adm)
 	return nil
 }
 
-// serve runs srv on ln in a goroutine, reporting unexpected failures on
-// s.serveErr.
+// serve runs srv on ln in a goroutine, over TLS when srv has a TLS
+// configuration, reporting unexpected failures on s.serveErr.
 func (s *Server) serve(listener string, srv *http.Server, ln net.Listener) {
 	s.serving.Go(func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if srv.TLSConfig != nil {
+			// The certificate is in TLSConfig, loaded by New.
+			err = srv.ServeTLS(ln, "", "")
+		} else {
+			err = srv.Serve(ln)
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.serveErr <- fmt.Errorf("server: %s listener failed: %w", listener, err)
 		}
 	})

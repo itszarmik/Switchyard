@@ -18,6 +18,7 @@ import (
 	"switchyard/internal/config"
 	"switchyard/internal/reqctx"
 	"switchyard/internal/schema"
+	"switchyard/internal/tracing"
 	"switchyard/internal/usage"
 )
 
@@ -170,7 +171,7 @@ func budgetUnavailable() *Error {
 
 // readTags reads the request's attribution tags into rec. When the header
 // is malformed it answers the client and returns false.
-func (g *Gateway) readTags(ex Exchange, rec *record) bool {
+func (g *snapshot) readTags(ex Exchange, rec *record) bool {
 	tags, ok := parseTags(ex.Header())
 	if !ok {
 		rec.respondError(ex, Info{}, invalidTags())
@@ -184,7 +185,7 @@ func (g *Gateway) readTags(ex Exchange, rec *record) bool {
 // rounded up: its estimated input and output tokens (output at max_tokens
 // when the request sets it) at d's prices. It is 0 when d's prices are
 // unknown.
-func (g *Gateway) estimate(rec *record, d *catalog.Deployment) int64 {
+func (g *snapshot) estimate(rec *record, d *catalog.Deployment) int64 {
 	c, ok := usage.CostFor(d.Model.Type, usage.Tokens{Input: rec.estIn(d.Model), Output: rec.estOut}, d.Prices)
 	if !ok {
 		return 0
@@ -207,11 +208,15 @@ func (g *Gateway) estimate(rec *record, d *catalog.Deployment) int64 {
 // closed answers 503 budget_unavailable. While the store is marked
 // unavailable after a failure (see budget.Circuit), it is not called and
 // the outcome is the same, at once.
-func (g *Gateway) admitBudget(ctx context.Context, ex Exchange, rec *record) bool {
+//
+// An admission is traced as a tracing.SpanBudgetAdmit span.
+func (g *snapshot) admitBudget(ctx context.Context, ex Exchange, rec *record) bool {
 	scopes := g.scopes[principal{rec.tenant, rec.keyID}]
 	if len(scopes) == 0 || len(rec.plan.entries) == 0 {
 		return true
 	}
+	ctx, span := tracing.Start(ctx, tracing.SpanBudgetAdmit)
+	defer span.End()
 	est := g.estimate(rec, rec.plan.entries[0].d)
 	if est < 1 && blocks(scopes) {
 		est = 1
@@ -267,7 +272,7 @@ func warnStore(ctx context.Context, msg string, err error) {
 // estimate is higher than what the request has been charged so far, as
 // for a fallback to a pricier deployment. It returns why e must be passed
 // over, or "" if it may be tried.
-func (g *Gateway) chargeFallback(ctx context.Context, rec *record, e *planEntry) string {
+func (g *snapshot) chargeFallback(ctx context.Context, rec *record, e *planEntry) string {
 	if !rec.admitted {
 		return ""
 	}
@@ -300,7 +305,7 @@ func (g *Gateway) chargeFallback(ctx context.Context, rec *record, e *planEntry)
 // reached for the first time in their window, and notify budgets over
 // their limit. The downgrade to a budget's soft profile happens when the
 // next request is routed (see budgetState).
-func (g *Gateway) notifyBudget(ctx context.Context, adm budget.Admission) {
+func (g *snapshot) notifyBudget(ctx context.Context, adm budget.Admission) {
 	for _, s := range adm.SoftCrossed {
 		g.metrics.budgetNotices.WithLabelValues(s.Name, noticeSoftThreshold).Inc()
 		reqctx.Logger(ctx).InfoContext(ctx, "budget soft threshold reached", "budget", s.Name)
@@ -646,8 +651,9 @@ var budgetUtilizationDesc = prometheus.NewDesc("switchyard_budget_utilization_ra
 	[]string{"scope"}, nil)
 
 // budgetCollector reports each budget's utilization as it is at scrape
-// time, read from the budget store. If the store fails, the remaining
-// budgets are left out of that scrape.
+// time, read from the budget store, for the budgets of the snapshot in
+// force. If the store fails, the remaining budgets are left out of that
+// scrape.
 type budgetCollector struct{ g *Gateway }
 
 // Describe implements prometheus.Collector.
@@ -655,7 +661,7 @@ func (c budgetCollector) Describe(ch chan<- *prometheus.Desc) { ch <- budgetUtil
 
 // Collect implements prometheus.Collector.
 func (c budgetCollector) Collect(ch chan<- prometheus.Metric) {
-	g := c.g
+	g := c.g.current()
 	if len(g.allScopes) == 0 {
 		return
 	}

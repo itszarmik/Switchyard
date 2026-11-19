@@ -1,0 +1,83 @@
+# Release: on a v* tag, run every pre-merge check, then GoReleaser
+# (.goreleaser.yaml): binaries, archives, checksums, CycloneDX SBOMs, a
+# draft GitHub release, and multi-arch images on ghcr.io built with Buildx
+# and QEMU. Written for v0.1.0 but never run yet. Before the first tag,
+# replace OWNER in .goreleaser.yaml (and the image labels and alert
+# runbook URLs) with the repository's GitHub owner.
+#
+# Supply chain: every action is pinned by its full commit SHA, with the
+# release tag it was resolved from in the comment, so a moved tag cannot
+# change what runs. The checks run in their own job, with a read-only
+# token; only the release job, which runs nothing but GoReleaser, gets
+# write access. To bump an action, resolve the new tag's commit with
+#
+#   git ls-remote https://github.com/<owner>/<action> 'refs/tags/vX.Y.Z' 'refs/tags/vX.Y.Z^{}'
+#
+# (the ^{} line, when present, is the commit of an annotated tag) and
+# update the SHA and the comment together, here and in ci.yml.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          # The Dockerfile's Go; go.mod's go line is the minimum, not this.
+          go-version: 1.27.4
+          cache: true
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+          install-only: true
+      - name: make check
+        run: make check
+
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # the GitHub release
+      packages: write # the images on ghcr.io
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # GoReleaser's changelog needs the history and the tags.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: 1.27.4
+          cache: true
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: GoReleaser
+        # The version the Makefile pins (GORELEASER_VERSION), run with go run
+        # so it never enters go.mod.
+        run: go run github.com/goreleaser/goreleaser/v2@v2.20.2 release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

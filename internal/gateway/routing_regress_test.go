@@ -109,7 +109,7 @@ func TestTokenRatioInAuto(t *testing.T) {
 	in := int64(float64(len(b)) / 4 * 10)
 	femto := new(big.Int).Add(big.NewInt(in*100_000_000), big.NewInt(500*400_000_000))
 	want := new(big.Int).Div(new(big.Int).Add(femto, big.NewInt(999_999_999)), big.NewInt(1_000_000_000)).Int64()
-	if spent, err := e.store.Spent(context.Background(), e.g.scopes[principal{"t1", "k1"}][0], e.now); err != nil || spent != want {
+	if spent, err := e.store.Spent(context.Background(), e.g.current().scopes[principal{"t1", "k1"}][0], e.now); err != nil || spent != want {
 		t.Errorf("settled %d micro-USD (%v), want the estimate at small's ratio, %d", spent, err, want)
 	}
 }
@@ -176,7 +176,7 @@ func TestMinQualityHeaderClamp(t *testing.T) {
 				SoftAt: 0.5, SoftProfile: "cheap", OnExhausted: config.BudgetBlock,
 			}}
 		}, nil)
-		if _, err := e.store.Admit(t.Context(), e.g.scopes[principal{"t1", "k1"}][:1], 600_000, e.now); err != nil {
+		if _, err := e.store.Admit(t.Context(), e.g.current().scopes[principal{"t1", "k1"}][:1], 600_000, e.now); err != nil {
 			t.Fatal(err)
 		}
 		r := e.do(EndpointChatCompletions, hiBody, HeaderDifficulty, "0.6", "X-Switchyard-Min-Quality", "0.9")
@@ -221,7 +221,7 @@ func TestRuleProfileBeatsClientProfile(t *testing.T) {
 // switchyard_provider_saturated_total; only a refused Acquire counts.
 func TestSaturationCountsOnlyAcquire(t *testing.T) {
 	e := newTierEnv(t, func(c *config.Config) { c.Providers[0].MaxConcurrency = 1 }, nil)
-	p := e.g.provs["ps"]
+	p := e.g.current().provs["ps"]
 	if !p.Acquire() {
 		t.Fatal("acquire")
 	}

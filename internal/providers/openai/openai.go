@@ -27,6 +27,7 @@ import (
 	"switchyard/internal/config"
 	"switchyard/internal/providers"
 	"switchyard/internal/schema"
+	"switchyard/internal/tracing"
 	"switchyard/internal/version"
 )
 
@@ -112,8 +113,9 @@ var (
 // New returns the adapter for provider p, which must be validated config
 // with type openai. It builds the provider's own HTTP client and transport:
 // connect bounds dialing and the TLS handshake, idle connections are pooled
-// and kept alive, and redirects are not followed.
-func New(p config.Provider) (*Adapter, error) {
+// and kept alive, and redirects are not followed. With o.PropagateTrace
+// the transport sends the W3C traceparent of the call's span.
+func New(p config.Provider, o providers.Options) (*Adapter, error) {
 	endpoint, err := url.JoinPath(p.BaseURL, "chat/completions")
 	completions, err2 := url.JoinPath(p.BaseURL, "completions")
 	embeddings, err3 := url.JoinPath(p.BaseURL, "embeddings")
@@ -155,7 +157,9 @@ func New(p config.Provider) (*Adapter, error) {
 			total:      p.Timeouts.Total.Std(),
 		},
 		client: &http.Client{
-			Transport: transport,
+			// tracing.Transport returns transport itself unless the trace
+			// context is propagated.
+			Transport: tracing.Transport(transport, o.PropagateTrace),
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},

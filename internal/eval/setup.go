@@ -26,9 +26,9 @@ func Adapters(cfg *config.Config) (map[string]providers.Adapter, error) {
 		)
 		switch p.Type {
 		case "openai":
-			a, err = openai.New(p)
+			a, err = openai.New(p, providers.Options{})
 		case "anthropic":
-			a, err = anthropic.New(p)
+			a, err = anthropic.New(p, providers.Options{})
 		default:
 			continue
 		}

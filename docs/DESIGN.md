@@ -315,6 +315,13 @@ type UsageSink interface {
                      metrics · latency stats · end span
 ```
 
+**Rate limits (step 3, as built in P7)**
+
+- **Request rate.** GCRA per key: the key's `rate_limit`, else its tenant's. The counters are shared through the state Redis in a Lua script that reads the server's `TIME`, or kept in memory with `storage.mode: memory`. Cache hits are charged like any other request. An over-limit request gets `429 rate_limit_exceeded` with `Retry-After` in whole seconds, rounded up. After a reload that raises a limit, a key's stored arrival time is clamped, so the new rate applies within one interval.
+- **Concurrent streams.** The cap is taken once the request is known to stream, after decoding, and it covers cached replays too. A slot is a lease in a Redis sorted set, heartbeated while the stream lives and released on every exit path, so a crashed replica can't leak slots.
+- **Failures.** A circuit around the Redis limiter skips the store after a failure. `rate_limits.fail_mode` decides: `open` (the default) serves the request, `closed` answers `503 rate_limit_unavailable`. A client that disconnects during the limiter call is not counted as a store error.
+- **Failed authentication.** Limited per client address (the TCP peer, IPv6 grouped by /64), in memory and per replica, at `rate_limits.auth_failures_per_minute`. The key is checked first, then one atomic step decides and charges, so valid keys never count. An address over the limit gets 429 whatever it sends. The admin API shares the same guard.
+
 **Streaming specifics**
 
 - Steps 1–10 are the same. In step 11, the executor **waits for the first upstream event before committing**, that is, before sending `200` and the SSE headers. Until then, failures are retried or failed over exactly as for non-streaming requests.
@@ -735,8 +742,13 @@ Each deployment can set `max_concurrency`, enforced per replica. The router skip
 
 ### 14.8 Shutdown and hot reload
 
-- **On SIGTERM**, readiness starts failing, the listener stops accepting new connections, and in-flight requests drain for up to `shutdown_grace` (default 60 s, since streams can be long). Anything still running after that is cancelled. The usage queue is flushed, then the process exits.
-- **Hot reload** is triggered by SIGHUP or `POST /admin/v1/reload`. Switchyard loads and validates the new snapshot and swaps it in atomically. An invalid config is rejected and the old one keeps serving. In-flight requests finish on the snapshot they started with. Breaker and latency state is keyed by deployment ID, so it survives reloads. Changes to listeners or storage are reported as needing a restart.
+- **On SIGTERM**, readiness starts failing, the listener stops accepting new connections, and in-flight requests drain for up to `shutdown_grace` (default 60 s, since streams can be long). Anything still running after that is cancelled. Then, within one 15 s post-drain bound and in this order (money before optimisations): shadow work and cache writes, the usage-ledger flush, the span flush (≤ 2 s), and the log drain (≤ 2 s). The worst case is `shutdown_delay + shutdown_grace + 15s`; that is compose's `stop_grace_period`, and the value to use for Kubernetes' `terminationGracePeriodSeconds`.
+- **Hot reload** is triggered by SIGHUP or `POST /admin/v1/reload`. Switchyard loads and validates the new config, stages a new snapshot, and swaps it in atomically. An invalid config is rejected and the old one keeps serving; the error is logged, counted and returned to the admin caller, without secrets. In-flight requests finish on the snapshot they started with. Breaker and latency state is keyed by deployment ID, so it survives reloads.
+  - **Staging has no side effects.** Health-tracker changes (new deployments, provider `max_concurrency`, latency hints) are collected while staging and applied only at commit, so a reload rejected after staging leaves nothing behind. Reloads are serialized.
+  - **Keys.** The gateway snapshot is committed first, then the keyring. The gateway refuses with `401 invalid_api_key` any caller its snapshot doesn't know, so a key or tenant removed by a reload is never served, not even by a request that authenticated just before the swap.
+  - **Restart-only fields** (`config.RestartOnly()`, from which docs/configuration.md is generated) are reported as `restart_required` and not applied: listeners and the other `server.*` fields except `admin_token`, TLS, `storage.*`, `logging.*`, `telemetry.*`, `cache.*`, `semantic_cache.*`, the breaker, cooldown and retry-budget settings, and `evaluation.*`. Everything else applies, including tenants and keys, policies, catalog, routing, budgets and rate limits.
+  - **Startup-only parts.** The semantic cache and the shadow runner keep their startup provider adapters, so a rotated provider key reaches them only after a restart. Deployments removed by a reload stay listed in `/admin/v1/providers` until a restart.
+  - Reloads are counted in `config_reloads_total{result}` and `config_last_reload_success_timestamp_seconds`, and audited (§15.1).
 
 ## 15. Observability
 
@@ -745,6 +757,8 @@ Each deployment can set `max_concurrency`, enforced per replica. The router skip
 Logs are JSON from `slog`, with one access-log line per request carrying these fields:
 
 `ts · level · msg · request_id · trace_id · tenant · key_id (never the key) · endpoint · stream · requested_model · profile · served_deployment · attempts · fallback_reason · cache · status · error_code · latency_ms · ttft_ms · overhead_ms · input_tokens · output_tokens · cost_usd · savings_usd · route_reason · matched_rule`
+
+Lines carry `trace_id` and `span_id` whenever a valid trace context exists. The access log is written through a bounded asynchronous writer, so a slow log sink never blocks a request. When the queue is full, lines are dropped and counted (`log_lines_dropped_total`), except audit lines (`msg="audit"`, one per reload and cache purge, with action, result, remote address and, for reloads, the config fingerprint), which wait up to 1 s instead. The writer is drained on shutdown.
 
 Full route explanations are logged at debug level, or sampled. **Prompt and response content is never logged.** A redacting handler masks anything that looks like a credential, and tests verify it. Payload logging is post-MVP: opt-in, sampled, and written to a separate sink.
 
@@ -776,12 +790,23 @@ All metric names are prefixed `switchyard_`.
 | `state_errors_total` | counter | operation |
 | `usage_queue_depth` | gauge | none |
 | `usage_events_dropped_total` | counter | none |
+| `ratelimit_decisions_total` | counter | kind (`request`, `stream`), result (`allowed`, `limited`, `error`) |
+| `ratelimit_auth_limited_total` | counter | none |
+| `config_reloads_total` | counter | result (`ok`, `error`) |
+| `config_last_reload_success_timestamp_seconds` | gauge | none |
+| `tracing_spans_exported_total`, `tracing_spans_dropped_total` | counter | none |
+| `log_lines_dropped_total` | counter | none |
 
 **Cardinality rules.** The tenant label is configurable: turn it on for self-hosted installs with few tenants and off for SaaS, where per-tenant reporting comes from the ledger. Tags never become labels. Model and provider labels are bounded by the catalog.
 
 ### 15.3 Traces
 
 Traces use OpenTelemetry. Switchyard accepts W3C `traceparent` from clients and, if configured, propagates it upstream. Each request produces a span tree: the request span, with children for `auth`, `ratelimit`, `policy`, `cache.exact`, `cache.semantic` (with `embed` and `search`), `route`, `budget.admit`, `upstream.attempt[n]` (provider, model, status, retry reason) and `usage.record`. Attributes follow the OpenTelemetry GenAI semantic conventions where they exist, such as `gen_ai.request.model` and `gen_ai.usage.input_tokens`, so LLM observability tools understand the traces. Sampling is parent-based with a ratio, and the collector does tail-based sampling of errors.
+
+As built in P7:
+- **Export** is OTLP/HTTP protobuf only, through Switchyard's own small exporter and span processor (no gRPC). The processor's queue holds 2,048 spans, exports in batches of 512, never blocks a request, and counts queue-full drops and failed exports in `tracing_spans_dropped_total`. With tracing disabled, spans cost no allocations.
+- **Propagation.** W3C trace context is always extracted, so a client's trace ID reaches the logs even with tracing off. Clients therefore control the trace ID and, through the parent's sampled flag, sampling. Upstream propagation (`propagate_upstream`) sends only `traceparent`, only from a span the gateway created, and only with tracing enabled: never `tracestate` or baggage.
+- **Attributes.** Spans carry metadata only, never content. The root span carries `switchyard.*` (tenant, key_id, profile, cache status, route reason, cost_usd, attempts) and GenAI attributes. Each `upstream.attempt` carries `attempt.number`, provider, deployment, outcome and retry reason.
 
 ### 15.4 Dashboards and alerts
 
@@ -794,8 +819,11 @@ The Prometheus alert rules fire when:
 - a budget passes 90 %,
 - overhead p99 stays above 25 ms for 10 minutes,
 - usage events are dropped,
-- the cache error rate is elevated, or
-- a config reload fails.
+- the cache error rate is elevated,
+- a config reload fails, or
+- tracing spans are dropped.
+
+The breaker alert is `max_over_time(switchyard_circuit_state[3m]) == 2` for 5 minutes, so it clears for a deployment that tripped and then gets no more traffic. promtool unit tests cover every rule (`make check-deploy`).
 
 ### 15.5 Introspection
 
@@ -991,12 +1019,12 @@ See §14.8.
 | **Denial of service and resource exhaustion.** | Body limit (10 MiB) and header limits, a JSON depth limit, `ReadHeaderTimeout`, idle timeouts, per-write deadlines on streams, and per-deployment concurrency caps. |
 | **SSRF.** | Switchyard never fetches URLs supplied by a client. Image URLs are passed through, or the deployment is filtered out. Provider URLs come only from operator config. When SaaS later lets tenants add custom endpoints, those will need allow lists and an egress policy. |
 | **Sensitive data at rest.** | Content is never logged. The ledger holds metadata only. Cached content is opt-in, bounded by TTLs, scoped to the tenant and purgeable. Redis and Postgres must be private, with AUTH and TLS. |
-| **Admin surface exposed.** | The admin API listens on a separate port bound to localhost by default and requires an admin token. Reloads and purges are written to an audit log. |
-| **Client headers smuggled upstream.** | Client headers aren't forwarded except through a per-provider allow list (e.g. `anthropic-beta`). The client's `Authorization` header is never forwarded. |
+| **Admin surface exposed.** | The admin API listens on a separate port bound to localhost by default. When `server.admin_token` is set, `/admin/v1/*` requires it as a Bearer token, compared in constant time; failures get `401 invalid_admin_token` and are limited per address by the auth-failure guard. The token must be at least 32 characters with no whitespace or control characters, and it is required whenever `admin_listen` isn't a loopback address; a reload can't remove it from an exposed listener. `/metrics`, `/healthz` and `/readyz` on the admin listener stay open. Reloads and purges are written to an audit log. |
+| **Client headers smuggled upstream.** | Client headers aren't forwarded except through a per-provider allow list (e.g. `anthropic-beta`). The client's `Authorization` header is never forwarded, and neither are its `tracestate` or baggage (§15.3). |
 | **Policy evasion through prompt content.** | Content affects only the quality estimate, never authorization, allow lists, budgets or caps. |
 | **Refusal shopping.** | Refusals and content-filter responses are never retried on another provider (§7). |
 | **Compliance.** | Data residency and zero-data-retention requirements are enforced as hard filters through deployment tags (`region_eu`, `zdr`). |
-| **Supply chain.** | Few dependencies with pinned versions, `govulncheck` in CI, an SBOM, and a distroless image that runs as non-root on a read-only filesystem. |
+| **Supply chain.** | Few dependencies with pinned versions, `govulncheck` in CI, an SBOM, and a distroless image that runs as non-root on a read-only filesystem. GitHub Actions are pinned by commit SHA, and base and compose images by digest. The release workflow is split into a read-only `check` job and a `release` job that holds the write permissions. Go tools run via `go run module@version` and never enter go.mod. |
 
 ## 18. Deployment: self-hosted & SaaS
 

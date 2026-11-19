@@ -214,8 +214,12 @@ func TestBuiltinRoutes(t *testing.T) {
 			wantType:   "application/json; charset=utf-8",
 		},
 		{
-			name: "health is not on the admin listener", admin: true, method: http.MethodGet, path: "/healthz",
-			wantStatus: http.StatusNotFound,
+			name: "health on the admin listener", admin: true, method: http.MethodGet, path: "/healthz",
+			wantStatus: http.StatusOK, wantBody: `{"status":"ok"}` + "\n",
+		},
+		{
+			name: "readiness on the admin listener", admin: true, method: http.MethodGet, path: "/readyz",
+			wantStatus: http.StatusOK, wantInBody: `"status":"ready"`,
 		},
 	}
 	for _, tt := range tests {
@@ -578,7 +582,7 @@ func TestAccessLog(t *testing.T) {
 		{name: "readyz probe", method: http.MethodGet, target: "/readyz", wantLevel: "DEBUG", wantPath: "/readyz", status: 200},
 		{name: "healthz with wrong method", method: http.MethodPost, target: "/healthz", wantLevel: "INFO", wantPath: "/healthz", status: 404},
 		{name: "metrics scrape", admin: true, method: http.MethodGet, target: "/metrics", wantLevel: "DEBUG", wantPath: "/metrics", status: 200},
-		{name: "admin not found", admin: true, method: http.MethodGet, target: "/healthz", wantLevel: "INFO", wantPath: "/healthz", status: 404},
+		{name: "admin not found", admin: true, method: http.MethodGet, target: "/nope", wantLevel: "INFO", wantPath: "/nope", status: 404},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

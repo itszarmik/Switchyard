@@ -112,6 +112,7 @@ func (st *loadState) validate(c *Config) {
 		st.errorAt("version", fmt.Sprintf("unsupported version %d; only version 1 is defined", c.Version))
 	}
 	st.validateServer(&c.Server)
+	st.validateAdmin(&c.Server)
 	st.validateLogging(&c.Logging)
 	st.validateStorage(&c.Storage)
 	providers := st.validateProviders(c.Providers)
@@ -126,6 +127,8 @@ func (st *loadState) validate(c *Config) {
 	st.validateEvaluation(c, models)
 	st.validateShadow(c, models)
 	st.validateCache(c, models)
+	st.validateRateLimits(c)
+	st.validateTracing(&c.Telemetry.Tracing)
 	st.checkLiteralSecrets(c)
 }
 
@@ -663,6 +666,7 @@ var urlSecretPaths = map[string]bool{
 	"storage.redis.cache_url": true,
 	"storage.redis.state_url": true,
 	"storage.ledger.dsn":      true,
+	pathTracingEndpoint:       true,
 }
 
 // checkLiteralSecrets warns about secrets whose value, or part of it, was

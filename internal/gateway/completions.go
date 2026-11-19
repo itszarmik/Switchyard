@@ -28,10 +28,10 @@ const ShimChat = "chat"
 // honor (echo, suffix, logprobs, best_of above 1, several prompts) plan
 // only native deployments, and get a 400 unsupported_parameter when none
 // can serve the request.
-func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
+func (g *snapshot) Completions(ctx context.Context, ex Exchange) {
 	rec := g.newRecord(ctx, EndpointCompletions)
 	defer rec.done()
-	if !g.readTags(ex, rec) {
+	if !g.knownCaller(ex, rec) || !g.readTags(ex, rec) {
 		return
 	}
 
@@ -48,6 +48,13 @@ func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 	rec.requestedModel = req.Model()
 	rec.stream = req.Stream()
 	markStream(ctx, req.Stream())
+	if req.Stream() {
+		release, ok := g.acquireStream(ctx, ex, rec)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	ctx, cancel, ok := g.withDeadline(ctx, ex, rec)
 	defer cancel()
 	if !ok {
@@ -101,7 +108,7 @@ func (g *Gateway) Completions(ctx context.Context, ex Exchange) {
 }
 
 // native reports whether d serves legacy completions natively.
-func (g *Gateway) native(d *catalog.Deployment) bool {
+func (g *snapshot) native(d *catalog.Deployment) bool {
 	_, ok := g.adapters[d.Provider].(providers.Completer)
 	return ok && d.ProviderType == "openai" && d.Capabilities.Has(schema.CapCompletions)
 }
@@ -110,7 +117,7 @@ func (g *Gateway) native(d *catalog.Deployment) bool {
 // native call on a deployment that serves completions, else the chat shim
 // with chat, the request translated (nil when only native deployments are
 // planned).
-func (g *Gateway) completionTry(ex Exchange, rec *record, req *schema.CompletionRequest, chat *schema.ChatRequest) tryFunc {
+func (g *snapshot) completionTry(ex Exchange, rec *record, req *schema.CompletionRequest, chat *schema.ChatRequest) tryFunc {
 	shim := g.chatTry(ex, rec, chat, completionShim{})
 	return func(ctx context.Context, e *planEntry, info *Info) attempt {
 		d := e.d

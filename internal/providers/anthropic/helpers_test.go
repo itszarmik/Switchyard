@@ -63,7 +63,7 @@ func testProvider(baseURL string) config.Provider {
 
 func newAdapter(t *testing.T, p config.Provider) *Adapter {
 	t.Helper()
-	a, err := New(p)
+	a, err := New(p, providers.Options{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

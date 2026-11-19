@@ -8,6 +8,7 @@
 //	switchyard route explain [-c FILE] --tenant ID [--key ID] [--header 'Name: value']... [FILE|-]
 //	switchyard keys generate [--tenant ID] [--key-id ID]
 //	switchyard eval run|fit|report|fit-weights [flags]
+//	switchyard healthcheck [--url URL] [--timeout DURATION]
 //	switchyard version
 //	switchyard help
 //
@@ -55,6 +56,7 @@ Usage:
   switchyard route explain [flags]     explain how a chat request would be routed, offline
   switchyard keys generate [flags]     create a gateway API key
   switchyard eval SUBCOMMAND [flags]   measure model quality: run, fit, report, fit-weights (see eval help)
+  switchyard healthcheck [flags]       GET a health URL; exit 0 on 200, 1 otherwise (container healthchecks)
   switchyard version                   print the build metadata
   switchyard help                      print this help
 
@@ -67,6 +69,10 @@ Flags for route explain (the request body is FILE, or stdin for - or none):
   --tenant ID              tenant whose policy applies (required)
   --key ID                 the tenant's API key, for key policies and rules
   --header 'Name: value'   a request header, such as X-Switchyard-Profile; repeatable
+
+Flags for healthcheck:
+  --url URL            URL to GET (default http://127.0.0.1:8080/healthz)
+  --timeout DURATION   overall timeout (default 2s)
 
 Flags for keys generate:
   --tenant ID          tenant that owns the key (default "default")
@@ -111,6 +117,8 @@ func run(args []string, stdout, stderr io.Writer, lookupEnv func(string) (string
 		return runKeys(rest, stdout, stderr)
 	case "eval":
 		return runEval(rest, stdout, stderr, lookupEnv)
+	case "healthcheck":
+		return runHealthcheck(rest, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, version.Get().String())
 		return exitOK
@@ -163,6 +171,27 @@ func parseLoadFlags(name string, args []string, stderr io.Writer) (f loadFlags, 
 // load resolves the config path and overrides and loads the snapshot. On
 // failure it prints the problems to stderr. It returns the path it used.
 func load(f loadFlags, stderr io.Writer, lookupEnv func(string) (string, bool)) (*config.Snapshot, string, bool) {
+	snap, path, err := loadSnapshot(f, lookupEnv)
+	if err == nil {
+		return snap, path, true
+	}
+	var verr *config.ValidationError
+	switch {
+	case errors.As(err, &verr):
+		// Problems name settings and references, never expanded values, so
+		// they are safe to print.
+		fmt.Fprintln(stderr, verr.Error())
+	case errors.Is(err, fs.ErrNotExist):
+		fmt.Fprintf(stderr, "error: %s: no such file\n", path)
+	default:
+		fmt.Fprintf(stderr, "error: %v\n", err)
+	}
+	return nil, path, false
+}
+
+// loadSnapshot resolves the config path and overrides, as load does, and
+// loads the snapshot. A reload calls it again with the same flags.
+func loadSnapshot(f loadFlags, lookupEnv func(string) (string, bool)) (*config.Snapshot, string, error) {
 	path := f.config
 	if path == "" {
 		if v, ok := lookupEnv("SWITCHYARD_CONFIG"); ok && v != "" {
@@ -190,21 +219,10 @@ func load(f loadFlags, stderr io.Writer, lookupEnv func(string) (string, bool)) 
 	}
 
 	snap, err := config.Load(path, config.LoadOptions{LookupEnv: lookupEnv, Overrides: overrides, SecretPlaceholders: f.secretPlaceholders})
-	if err == nil {
-		return snap, path, true
+	if errors.Is(err, fs.ErrNotExist) {
+		err = fmt.Errorf("%s: no such file: %w", path, err)
 	}
-	var verr *config.ValidationError
-	switch {
-	case errors.As(err, &verr):
-		// Problems name settings and references, never expanded values, so
-		// they are safe to print.
-		fmt.Fprintln(stderr, verr.Error())
-	case errors.Is(err, fs.ErrNotExist):
-		fmt.Fprintf(stderr, "error: %s: no such file\n", path)
-	default:
-		fmt.Fprintf(stderr, "error: %v\n", err)
-	}
-	return nil, path, false
+	return snap, path, err
 }
 
 // runValidate implements `switchyard config validate`.
@@ -252,16 +270,28 @@ func runValidate(args []string, stdout, stderr io.Writer, lookupEnv func(string)
 
 // runServe implements `switchyard serve`. The first SIGINT or SIGTERM starts
 // a graceful shutdown; a second one aborts the requests still in flight.
+// SIGHUP reloads the configuration, from the same file, environment and
+// flags, and never stops the process.
 func runServe(args []string, stdout, stderr io.Writer, lookupEnv func(string) (string, bool)) int {
 	f, code, ok := parseLoadFlags("serve", args, stderr)
 	if !ok {
 		return code
 	}
+	// Catch SIGHUP before anything else, so that one sent during startup
+	// does not end the process, as its default action would; it is
+	// handled once the service runs.
+	hups := make(chan os.Signal, 1)
+	signal.Notify(hups, syscall.SIGHUP)
+	defer signal.Stop(hups)
 	snap, _, ok := load(f, stderr, lookupEnv)
 	if !ok {
 		return exitError
 	}
-	a, err := app.New(snap, stdout)
+	reload := func() (*config.Snapshot, error) {
+		snap, _, err := loadSnapshot(f, lookupEnv)
+		return snap, err
+	}
+	a, err := app.New(snap, stdout, reload)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return exitError
@@ -278,6 +308,17 @@ func runServe(args []string, stdout, stderr io.Writer, lookupEnv func(string) (s
 	defer signal.Stop(sigs)
 	done := make(chan struct{})
 	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-hups:
+				log.Info("signal received; reloading the configuration", "signal", syscall.SIGHUP.String())
+				a.ReloadOnSignal()
+			case <-done:
+				return
+			}
+		}
+	}()
 	go func() {
 		select {
 		case sig := <-sigs:

@@ -543,7 +543,9 @@ func (s *suite) testPlainChat(t *testing.T) {
 	streamModes(t, func(t *testing.T, stream bool) {
 		s.reset(t)
 		r := s.call(t, params(), stream,
-			option.WithHeader(forwardedHeader, "yes"), option.WithHeader(blockedHeader, "no"))
+			option.WithHeader(forwardedHeader, "yes"), option.WithHeader(blockedHeader, "no"),
+			option.WithHeader("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+			option.WithHeader("Cookie", "session=client"))
 		up := s.checkSuccess(t, r, stream, []answer{{Content: fakeupstream.Text, Finish: "stop"}})
 		if stream {
 			if r.usage != nil {
@@ -555,8 +557,29 @@ func (s *suite) testPlainChat(t *testing.T) {
 		if got := up.Header.Get(forwardedHeader); got != "yes" {
 			t.Errorf("upstream %s = %q, want yes", forwardedHeader, got)
 		}
-		if got := up.Header.Get(blockedHeader); s.gateway && got != "" {
-			t.Errorf("upstream got %s = %q, which is not in forward_headers", blockedHeader, got)
+		if !s.gateway {
+			return
+		}
+		// DESIGN §17: only forward_headers cross, and never the client's
+		// credentials or trace context (tracing is off here).
+		for _, h := range []string{blockedHeader, "Traceparent", "Cookie"} {
+			if got := up.Header.Get(h); got != "" {
+				t.Errorf("upstream got %s = %q, which is not in forward_headers", h, got)
+			}
+		}
+		wantAuth := "Bearer " + providerKey
+		if s.anthropic {
+			wantAuth = "" // the key goes in X-Api-Key
+		}
+		if got := up.Header.Get("Authorization"); got != wantAuth {
+			t.Errorf("upstream Authorization %q, want %q: the client's is never forwarded", got, wantAuth)
+		}
+		for name, values := range up.Header {
+			for _, v := range values {
+				if strings.Contains(v, s.apiKey) {
+					t.Errorf("upstream header %s carries the client's gateway key", name)
+				}
+			}
 		}
 	})
 }

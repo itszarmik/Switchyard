@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"switchyard/internal/budget"
 	"switchyard/internal/catalog"
 	"switchyard/internal/health"
@@ -15,12 +18,13 @@ import (
 	"switchyard/internal/reqctx"
 	"switchyard/internal/router"
 	"switchyard/internal/schema"
+	"switchyard/internal/tracing"
 )
 
 // record collects what one request did, for its metrics and its
 // access-log annotations.
 type record struct {
-	g        *Gateway
+	g        *snapshot
 	ctx      context.Context
 	start    time.Time
 	endpoint string
@@ -174,10 +178,31 @@ func (r *record) addChain(deployment, outcome string) {
 	r.nchain++
 }
 
-func (g *Gateway) newRecord(ctx context.Context, endpoint string) *record {
+func (g *snapshot) newRecord(ctx context.Context, endpoint string) *record {
 	r := &record{g: g, ctx: ctx, start: time.Now(), endpoint: endpoint}
 	r.identify()
 	return r
+}
+
+// knownCaller reports whether the request's caller is one of the
+// snapshot's keys. A request authenticates against the key store before
+// it loads the gateway's snapshot, and a reload swaps the two one after
+// the other, so a request that authenticated just before a reload with a
+// key it revoked, or of a tenant it removed, can meet a snapshot that does
+// not know it. Such a request is answered 401 invalid_api_key, as the auth
+// middleware answers an unknown key, before it is routed or charged, and
+// records no usage event. A request without a Principal (the gateway used
+// without the auth middleware) is not checked.
+func (g *snapshot) knownCaller(ex Exchange, rec *record) bool {
+	if !rec.authenticated {
+		return true
+	}
+	if _, ok := g.keys[principal{rec.tenant, rec.keyID}]; ok {
+		return true
+	}
+	rec.authenticated = false
+	rec.respondError(ex, Info{}, unknownKey())
+	return false
 }
 
 // respondError sends e and records it.
@@ -255,9 +280,12 @@ func (r *record) finish() {
 	latency := time.Since(r.start)
 	if !r.dryRun {
 		r.settle()
+		_, span := tracing.Start(r.ctx, tracing.SpanUsageRecord)
 		r.recordUsage(latency)
+		span.End()
 		r.offerShadow()
 	}
+	r.annotateSpan()
 	overhead := max(latency-r.upstreamWait-r.clientWait-r.backoff, 0)
 	r.g.metrics.overhead.WithLabelValues(r.endpoint).Observe(overhead.Seconds())
 
@@ -324,6 +352,50 @@ func (r *record) finish() {
 		attrs = r.routeAttrs(attrs)
 	}
 	reqctx.Annotate(r.ctx, attrs...)
+}
+
+// annotateSpan sets the request's outcome on its root span, when it is
+// recorded: the switchyard.* attributes (tenant, the key's ID, profile,
+// cache status, route reason, cost when known, attempts) and the GenAI
+// ones (the provider type, the model asked for and the catalog model
+// that answered, and the tokens). Never content.
+func (r *record) annotateSpan() {
+	span := trace.SpanFromContext(r.ctx)
+	if !span.IsRecording() {
+		return
+	}
+	attrs := make([]attribute.KeyValue, 0, 8)
+	if r.authenticated {
+		attrs = append(attrs, tracing.AttrTenant.String(r.tenant), tracing.AttrKeyID.String(r.keyID))
+	}
+	if r.route != nil && r.route.eff.Profile != "" {
+		attrs = append(attrs, tracing.AttrProfile.String(r.route.eff.Profile))
+	}
+	if r.cache.status != "" {
+		attrs = append(attrs, tracing.AttrCacheStatus.String(r.cache.status))
+	}
+	if r.info.RouteReason != "" {
+		attrs = append(attrs, tracing.AttrRouteReason.String(r.info.RouteReason))
+	}
+	a := r.account()
+	if (r.served || r.cache.entry != nil) && a.costKnown {
+		attrs = append(attrs, tracing.AttrCostUSD.Float64(a.cost.Float64()))
+	}
+	attrs = append(attrs, tracing.AttrAttempts.Int(r.attempts))
+	span.SetAttributes(attrs...)
+
+	ga := tracing.GenAI{RequestModel: r.requestedModel}
+	switch {
+	case r.deployment != nil:
+		ga.System, ga.ResponseModel = r.deployment.ProviderType, r.deployment.Model.ID
+	case r.cache.entry != nil:
+		ga.ResponseModel = r.cache.entry.Model
+	}
+	if r.served || r.cache.entry != nil {
+		ga.InputTokens = a.tokens.Input + a.tokens.CachedInput + a.tokens.CacheWrite
+		ga.OutputTokens = a.tokens.Output
+	}
+	tracing.SetGenAI(span, ga)
 }
 
 // routeAttrs appends the routing fields of the access log, and counts the

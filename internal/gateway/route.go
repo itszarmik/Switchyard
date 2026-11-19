@@ -48,7 +48,7 @@ func dropFields(dropped []schema.Capability) []string {
 
 // resolve maps the client's model field to its catalog resolution and
 // checks the model's type against the endpoint's.
-func (g *Gateway) resolve(name, endpoint, wantType string) (catalog.Resolution, *Error) {
+func (g *snapshot) resolve(name, endpoint, wantType string) (catalog.Resolution, *Error) {
 	res, err := g.catalog.Resolve(name)
 	switch {
 	case errors.Is(err, catalog.ErrVirtualModel):
@@ -153,7 +153,7 @@ type plan struct {
 // plan.exclusions or in the error.
 //
 // The plan is built into p, which the request's record holds.
-func (g *Gateway) buildPlan(p *plan, res catalog.Resolution, required schema.CapabilitySet, estIn, estOut int64, keep filter) *Error {
+func (g *snapshot) buildPlan(p *plan, res catalog.Resolution, required schema.CapabilitySet, estIn, estOut int64, keep filter) *Error {
 	// Candidates excluded before the catalog's filters. The candidate
 	// list is copied only when one is.
 	var pre []catalog.Exclusion

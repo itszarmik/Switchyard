@@ -56,7 +56,7 @@ func TestPostgresUnreachableAtStartup(t *testing.T) {
 	yaml := storageYAML(`storage:
   ledger: {driver: postgres, dsn: "postgres://switchyard:`+pass+`@127.0.0.1:1/switchyard?sslmode=disable&connect_timeout=2"}`, "")
 	logs := newLogBuffer()
-	_, err := New(loadSnapshot(t, yaml), logs)
+	_, err := New(loadSnapshot(t, yaml), logs, nil)
 	if err == nil {
 		t.Fatal("New succeeded with an unreachable Postgres")
 	}
@@ -95,10 +95,11 @@ func TestRedisBudgetStore(t *testing.T) {
   redis: {cache_url: "redis://`+addr+`/1", state_url: "redis://:statePass-77@`+addr+`/0"}
 budgets: {fail_mode: `+mode+`}`, "")
 			logs := newLogBuffer()
-			a, err := New(loadSnapshot(t, yaml), logs)
+			a, err := New(loadSnapshot(t, yaml), logs, nil)
 			if err != nil {
 				t.Fatalf("New with Redis down: %v", err)
 			}
+			logs.attach(a)
 			if !strings.Contains(logs.String(), "the Redis state instance is unreachable") {
 				t.Errorf("no startup warning; logs:\n%s", logs.String())
 			}
@@ -221,7 +222,7 @@ tenants:
     budgets: [{scope: tenant, window: day, limit_usd: "1"}]
 `)
 			logs := newLogBuffer()
-			a, err := New(loadSnapshot(t, yaml), logs)
+			a, err := New(loadSnapshot(t, yaml), logs, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -349,33 +350,43 @@ func TestUsageEndpoints(t *testing.T) {
 	r.stop(t)
 }
 
-// closeRecorder is a memory ledger that records how it was closed.
+// closeRecorder is a memory ledger that records how it was closed, and
+// whether the app's tracing was still live then.
 type closeRecorder struct {
 	*usage.MemoryLedger
+	app         *App
 	closed      chan struct{}
 	hasDeadline bool
 	remaining   time.Duration
+	tracingLive bool
 }
 
 func (c *closeRecorder) Close(ctx context.Context) error {
 	dl, ok := ctx.Deadline()
 	c.hasDeadline, c.remaining = ok, time.Until(dl)
+	_, span := c.app.tracing.Tracer().Start(ctx, "probe")
+	c.tracingLive = span.IsRecording()
+	span.End()
 	close(c.closed)
 	return c.MemoryLedger.Close(ctx)
 }
 
 // TestLedgerClosedAtShutdown checks that Run closes the ledger once the
-// server has drained, bounded by the shutdown grace period.
+// server has drained, within the post-drain bound and not a fresh
+// shutdown grace, and before it shuts tracing down: money first, so a
+// slow collector cannot delay the ledger's flush.
 func TestLedgerClosedAtShutdown(t *testing.T) {
 	restoreDefaultLogger(t)
 	led := &closeRecorder{MemoryLedger: usage.NewMemoryLedger(), closed: make(chan struct{})}
 	logs := newLogBuffer()
-	a, err := newApp(loadSnapshot(t, storageYAML("", "")), logs, func(*config.Config, prometheus.Registerer, *slog.Logger) (storage, error) {
+	yaml := storageYAML("", "") + "telemetry: {tracing: {enabled: true, endpoint: 'http://127.0.0.1:9', sample_ratio: 1}}\n"
+	a, err := newApp(loadSnapshot(t, yaml), logs, func(*config.Config, prometheus.Registerer, *slog.Logger) (storage, error) {
 		return storage{ledger: led, budgets: budget.NewMemoryStore()}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	led.app = a
 	r := startBuilt(t, a, logs)
 	select {
 	case <-led.closed:
@@ -388,8 +399,28 @@ func TestLedgerClosedAtShutdown(t *testing.T) {
 	default:
 		t.Fatal("Run returned without closing the ledger")
 	}
-	// shutdown_grace is 5s in storageConfig.
-	if !led.hasDeadline || led.remaining <= 4*time.Second || led.remaining > 5*time.Second {
-		t.Errorf("Close had deadline %v, %v left; want the 5s shutdown grace", led.hasDeadline, led.remaining)
+	if !led.hasDeadline || led.remaining <= storageCloseTimeout-time.Second || led.remaining > storageCloseTimeout {
+		t.Errorf("Close had deadline %v, %v left; want the %v storage bound", led.hasDeadline, led.remaining, storageCloseTimeout)
+	}
+	if !led.tracingLive {
+		t.Error("tracing was shut down before the ledger was closed")
+	}
+}
+
+// TestPostDrainBounds: the post-drain phases fit in PostDrainTimeout, and
+// leave the ledger most of the storage bound.
+func TestPostDrainBounds(t *testing.T) {
+	tests := []struct {
+		name string
+		got  time.Duration
+		max  time.Duration
+	}{
+		{"storage + tracing + logs", storageCloseTimeout + tracingShutdownTimeout + logCloseTimeout, PostDrainTimeout},
+		{"shadow + cache within storage, 6s left for the ledger", shadowCloseTimeout + cacheCloseTimeout + 6*time.Second, storageCloseTimeout},
+	}
+	for _, tt := range tests {
+		if tt.got > tt.max {
+			t.Errorf("%s = %v, more than %v", tt.name, tt.got, tt.max)
+		}
 	}
 }

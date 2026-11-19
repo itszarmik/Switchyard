@@ -243,12 +243,18 @@ func (m *metrics) registerHealth(reg prometheus.Registerer, t *health.Tracker, g
 		Help: "Requests waiting on another identical request's upstream call (in-process coalescing), at scrape time.",
 	}, func() float64 { return float64(g.cache.coalescer.Followers()) })
 	if err := registerAll(reg, []prometheus.Collector{healthCollector{t: t}, budgetCollector{g: g}, waiting}); err != nil {
-		for _, c := range m.registeredCounters {
-			reg.Unregister(c)
-		}
+		m.unregister(reg)
 		return err
 	}
 	return nil
+}
+
+// unregister removes the metrics newMetrics registered, for a gateway that
+// failed to start.
+func (m *metrics) unregister(reg prometheus.Registerer) {
+	for _, c := range m.registeredCounters {
+		reg.Unregister(c)
+	}
 }
 
 // Transition implements health.Observer.

@@ -2,8 +2,12 @@
 //
 // NewLogger returns a JSON (or text) slog.Logger whose handler is wrapped in a
 // redacting handler, so credentials never reach the log output even when a
-// caller logs them by mistake. NewRegistry returns a Prometheus registry with
-// the process and Go runtime collectors and the build-info gauge.
+// caller logs them by mistake. NewAsyncWriter takes the log write off the
+// caller's path: the logger encodes and redacts each record as before, and
+// the AsyncWriter queues the line for a background goroutine, dropping and
+// counting lines when its bounded queue is full. NewRegistry returns a
+// Prometheus registry with the process and Go runtime collectors and the
+// build-info gauge.
 package telemetry
 
 import (
@@ -45,6 +49,8 @@ func ParseLevel(s string) (slog.Level, error) {
 
 // NewLogger returns a logger that writes to w in the configured format,
 // through a redacting handler that scrubs credentials and opts.Secrets.
+// Pass an AsyncWriter as w to keep the write syscall off the caller's path;
+// redaction happens before the line reaches w either way.
 func NewLogger(w io.Writer, opts LogOptions) *slog.Logger {
 	var level slog.Leveler = slog.LevelInfo
 	if opts.Level != nil {
