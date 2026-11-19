@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P8 complete** (P8 was done ahead of P6/P7 at the user's request). Tagged v0.1.0 on 2026-11-19 (local only; not pushed). CI and the release workflow, the live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P8 complete** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -418,7 +418,7 @@ Six of the seven criteria pass. The semantic criterion passes offline but has no
 - [x] The overhead SLO holds at 1,000 requests/s on documented hardware: p50 ≤ 2 ms and p99 ≤ 10 ms.
 - [x] Rate limits are enforced across two replicas that share Redis.
 - [x] `govulncheck` is clean, the image runs as non-root with a read-only root filesystem, and an automated test confirms no secrets appear in logs.
-- [x] The v0.1.0 release artifacts are tagged. *Tagged `v0.1.0` on 2026-11-19; the artifacts build locally (`make release-snapshot`). The repository is github.com/itszarmik/Switchyard; the release workflow runs when the tag is pushed and hadn't run when this was written.*
+- [x] The v0.1.0 release artifacts are tagged. *Tagged `v0.1.0` on 2026-11-19; the artifacts build locally (`make release-snapshot`). The release workflow ran on the pushed tag and published the GitHub release and the images at `ghcr.io/itszarmik/switchyard`.*
 
 **Outcome (2026-11-19)**
 
@@ -462,7 +462,7 @@ The closed-loop `make bench-overhead` 5 ms gate still fails on this shared machi
 - **Secret scan:** `TestNoSecretsLeak` covers logs, the access log, audit lines, CLI output, metrics, reload responses and the exported spans, including after key and admin-token rotation.
 - **Headers:** a conformance test checks that only allow-listed client headers reach upstreams and that the client's `Authorization` never does.
 
-**Release.** `make release-snapshot` builds 4 archives (linux and darwin, amd64 and arm64), checksums and CycloneDX SBOMs. The CI and release workflows are written and pinned by SHA, but have never run. Images publish to `ghcr.io/itszarmik/switchyard`.
+**Release.** `make release-snapshot` builds 4 archives (linux and darwin, amd64 and arm64), checksums and CycloneDX SBOMs. The CI and release workflows are pinned by SHA. Both ran on GitHub on 2026-11-19: CI's first run exposed a Linux-only failure in a P3 conformance test (`TestReliabilitySlowReader` shrank the client's receive buffer so far that Linux couldn't deliver the stream in time); after the fix, CI and the release passed, publishing the v0.1.0 release and the images at `ghcr.io/itszarmik/switchyard`.
 
 **Review fixes.** Independent security and correctness reviews found:
 - **critical:** 1, a rejected reload changing the live health tracker;

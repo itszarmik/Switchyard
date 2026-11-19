@@ -9,7 +9,7 @@ Switchyard is a cost-aware, OpenAI-compatible LLM inference gateway written in G
 
 **v0.1: Phases 0 to 8 are done** (see [CHANGELOG.md](CHANGELOG.md)); the v0.1.0 tag is not cut yet. Switchyard serves `POST /v1/chat/completions` and `POST /v1/completions` (JSON and streaming), `POST /v1/embeddings` and `GET /v1/models` behind gateway API keys. Each request goes to the cheapest deployment that has every capability it needs and meets its policy, on OpenAI, Anthropic (translated from and to the OpenAI format), Gemini's OpenAI-compatible endpoint or any OpenAI-compatible host. Failures are retried and fall back to the next cheapest deployment of the same model, within a deadline and a retry budget, with circuit breakers, rate-limit cooldowns and per-provider concurrency limits (see [Reliability](#reliability)). Every request gets an exact cost in a usage ledger (memory or Postgres) with tenant-scoped reports, and tenants and keys can have daily or monthly budgets (see [Usage ledger and reporting](#usage-ledger-and-reporting) and [Budgets](#budgets)). With `model: "auto"`, a policy with a baseline model, and quality priors in the catalog, the gateway picks the cheapest model whose estimated quality for the request clears the profile's bar, explains every decision, and measures the savings against the baseline (see [Routing](#routing)). `switchyard eval` measures the quality priors on your own prompts, and opt-in shadow sampling and client feedback check on live traffic that the savings do not cost quality (see [Evaluation and verification](#evaluation-and-verification)). Policies can turn on an exact response cache and an opt-in semantic cache for chat completions (see [Caching](#caching)). For production there are per-key rate limits and concurrent-stream caps shared through Redis, OpenTelemetry tracing, hot reload, an admin token, TLS, a compose stack with dashboards and alerts, and operator docs (see [Rate limits](#rate-limits), [Tracing](#tracing), [Hot reload](#hot-reload), [Admin API and TLS](#admin-api-and-tls) and [Operations](#operations)).
 
-Not verified on this machine, which has no provider keys: the live smoke test, fixture recording, a live judge or semantic-cache check, and the GitHub Actions workflows, which have not run yet.
+Not verified on this machine, which has no provider keys: the live smoke test, fixture recording, and a live judge or semantic-cache check. CI and the release workflow run on GitHub.
 
 ## Quickstart
 
@@ -1010,7 +1010,7 @@ The certificate and key are PEM files, read at startup (TLS is restart-only), an
 - [docs/runbook.md](docs/runbook.md): symptom, signal, impact and fix for every degraded mode and alert, and what to do when a key leaks.
 - [deploy/](deploy/): `compose.yaml` (gateway, both Redis instances and Postgres; profiles `observability` with Prometheus, Grafana and Jaeger, and `tei`), `init.sh`, the Prometheus alert rules with their unit tests, and the Grafana dashboard.
 - [test/load/RESULTS.md](test/load/RESULTS.md): the overhead benchmarks, the 1,000 req/s SLO run and the soak, with the hardware they ran on.
-- Releases: `make release-snapshot` builds the archives, checksums and SBOMs locally; a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml), which is written but has never run. Images go to `ghcr.io/itszarmik/switchyard`; a fork changes the owner in `.goreleaser.yaml`, the image labels and the alert `runbook_url`s.
+- Releases: `make release-snapshot` builds the archives, checksums and SBOMs locally; a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml), which publishes the GitHub release and the images. Images go to `ghcr.io/itszarmik/switchyard`; a fork changes the owner in `.goreleaser.yaml`, the image labels and the alert `runbook_url`s.
 
 ## Docker
 
@@ -1102,7 +1102,7 @@ Run `make` or `make help` to list them.
 
 `VERSION`, `COMMIT` and `DATE` come from `git describe`, `git rev-parse` and the clock, with fallbacks for a repository without commits. Override any of them, for example `make build VERSION=v0.1.0`.
 
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same checks on every push and pull request: build and race tests on the two supported Go releases, sample-config validation, golangci-lint, govulncheck, `go mod tidy -diff`, and the image size and user checks. CI never calls a real provider. On a `v*` tag, [.github/workflows/release.yml](.github/workflows/release.yml) runs `make check`, then GoReleaser with Buildx and QEMU, pushing the images to ghcr.io; neither workflow has run yet.
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same checks on every push and pull request: build and race tests on the two supported Go releases, sample-config validation, golangci-lint, govulncheck, `go mod tidy -diff`, and the image size and user checks. CI never calls a real provider. On a `v*` tag, [.github/workflows/release.yml](.github/workflows/release.yml) runs `make check`, then GoReleaser with Buildx and QEMU, pushing the images to ghcr.io.
 
 ## Project layout
 
