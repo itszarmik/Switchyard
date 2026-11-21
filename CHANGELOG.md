@@ -4,7 +4,10 @@ All notable changes to Switchyard. Versions follow [Semantic
 Versioning](https://semver.org/); before 1.0, a minor version may change
 the configuration or the API.
 
-## Unreleased
+## v0.2.0 (2026-11-21)
+
+Adds a Helm chart for running Switchyard on Kubernetes. The gateway itself
+is unchanged from v0.1.0.
 
 ### Kubernetes (P9)
 
@@ -18,6 +21,11 @@ the configuration or the API.
   derived from the shutdown settings.
 - `make helm-lint`, `make helm-test` (a kind cluster) and
   `make helm-package`; CI runs them, and releases attach the packaged chart.
+
+### Build
+
+- The Dockerfiles pin their BuildKit frontend (`docker/dockerfile:1.29.0`)
+  by digest.
 
 ## v0.1.0 (2026-11-19)
 
