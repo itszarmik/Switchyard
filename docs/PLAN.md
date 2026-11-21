@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P8 complete; P9 (Helm chart) built and verified locally, not yet committed** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P8 complete; P9 (Helm chart) committed and passing CI; its last criterion waits on the v0.2.0 release** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -583,13 +583,13 @@ All three criteria pass against fake upstreams. No real provider has been called
 
 **Acceptance**
 
-- [ ] `helm lint --strict` passes, and the manifests rendered from the default values and from a full example pass `kubeconform` against the supported Kubernetes versions. *`helm lint --strict` passes with both example values files; kubeconform isn't installed locally, so it first runs in CI.*
+- [x] `helm lint --strict` passes, and the manifests rendered from the default values and from a full example pass `kubeconform` against the supported Kubernetes versions. *In CI on 2026-11-21: 9 resources (default values) and 13 (full example) valid against Kubernetes 1.30, 1.35, 1.36 and 1.37, none skipped. The first CI run validated nothing (kubeconform skips files without a .yaml name); `make helm-lint` now fails if no resources are validated.*
 - [x] The schema rejects invalid values (for example no admin token or Secret, replicas below 1, a malformed duration), with a clear message.
 - [x] On kind, `helm install` with 3 replicas against in-cluster Redis and Postgres becomes ready, `helm test` passes, and a chat request through the Service, to a fake provider, returns 200 and is recorded in the Postgres ledger.
 - [x] Rate limits are shared across the replicas: a key's limit holds however requests spread over the pods.
 - [x] `helm upgrade` with a changed config rolls the pods without a failed request under steady load, including a stream in flight.
 - [x] The pods run in a namespace that enforces Pod Security "restricted", and no secret value appears in any rendered ConfigMap or in the pod spec.
-- [ ] CI runs the lint, schema and kind install tests on every push, and the v0.2.0 release workflow attaches the packaged chart. *The CI job and release packaging are written; neither has run on GitHub yet, and v0.2.0 isn't tagged.*
+- [ ] CI runs the lint, schema and kind install tests on every push, and the v0.2.0 release workflow attaches the packaged chart. *The CI `helm` job (lint, kubeconform, render tests, kind install) passes on GitHub since 2026-11-21. The release packaging hasn't run: v0.2.0 isn't tagged.*
 
 **Outcome (2026-11-20)**
 
@@ -617,7 +617,7 @@ All three criteria pass against fake upstreams. No real provider has been called
 - **Release job.** It ran a third-party setup action holding the write token; the chart is now packaged in the read-only job, which also runs kubeconform and the kind test before any release.
 - **`helm test`** could fail right after install; the test pod retries, and the e2e runs it with no wait.
 
-**Not yet run:** kubeconform (CI only), the CI `helm` job and the release packaging on GitHub, the chart against a real HPA with metrics-server and against the Prometheus Operator's CRDs, and Helm 3.
+**Not yet run:** the release packaging on GitHub (no v0.2.0 tag yet), the chart against a real HPA with metrics-server and against the Prometheus Operator's CRDs, and Helm 3.
 
 ## Post-MVP backlog
 
