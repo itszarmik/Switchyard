@@ -1,0 +1,32 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+# Scrapes /metrics on every gateway pod through the metrics Service. The
+# job label is set to "switchyard", which the bundled alerts (SwitchyardDown)
+# expect, whatever the release is called.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "switchyard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "switchyard.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: metrics
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      relabelings:
+        - action: replace
+          targetLabel: job
+          replacement: switchyard
+{{- end }}

@@ -1,0 +1,182 @@
+# Switchyard alert rules (DESIGN §15.4), loaded by deploy/prometheus/
+# prometheus.yml. Each alert links to its section of docs/runbook.md, which
+# gives the impact and what to do. runbook_url points at github.com/itszarmik/Switchyard;
+# a fork points it at its own copy of the runbook.
+#
+# Checked by `make check-deploy`: promtool check rules, and the unit tests
+# in alerts_test.yml (promtool test rules).
+#
+# The thresholds are starting points. Rules with a traffic floor (">= 20
+# requests in 5m") stay quiet on idle installs, where one failure would be
+# a large percentage.
+groups:
+  - name: switchyard
+    rules:
+      # §15.4: a provider's error rate stays above 5 % for 5 minutes. Errors
+      # are the failures the provider or the path to it caused; client
+      # errors (400, context length, content filter, a client that went
+      # away) are not counted.
+      - alert: SwitchyardProviderErrorRateHigh
+        expr: |
+          (
+            sum by (provider) (rate(switchyard_upstream_requests_total{outcome=~"transport|timeout|server_error|rate_limited|auth|not_found"}[5m]))
+            /
+            sum by (provider) (rate(switchyard_upstream_requests_total[5m]))
+          ) > 0.05
+          and on (provider)
+          sum by (provider) (increase(switchyard_upstream_requests_total[5m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider {{ $labels.provider }}: {{ $value | humanizePercentage }} of upstream attempts fail"
+          description: "More than 5% of attempts to {{ $labels.provider }} have failed for 5 minutes. Requests fall back to other deployments while any remain; see switchyard_upstream_requests_total by outcome."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#provider-outage-and-open-breakers"
+
+      # §15.4: a breaker stays open for more than 5 minutes. The gauge reads
+      # half-open (1) once open_for has passed, even without traffic, so a
+      # breaker that keeps failing its probes alternates between 2 and 1.
+      - alert: SwitchyardCircuitBreakerOpen
+        # Open (2) within each 3-minute window, not merely "not closed": an
+        # open breaker turns half-open (1) after open_for, with or without
+        # traffic, and only a probe request closes it, so a deployment no
+        # longer routed to would otherwise stay "not closed" for ever.
+        expr: max_over_time(switchyard_circuit_state[3m]) == 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker for {{ $labels.deployment }} keeps opening"
+          description: "The deployment {{ $labels.deployment }} has been open (routed around) at least once in every 3 minutes for 5 minutes: its half-open probes keep failing. Its traffic goes to the next deployment in each plan. A breaker that tripped and then saw no traffic shows half-open and does not alert."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#provider-outage-and-open-breakers"
+
+      # §15.4: a budget passes 90 %.
+      - alert: SwitchyardBudgetAbove90Percent
+        expr: switchyard_budget_utilization_ratio > 0.9
+        labels:
+          severity: warning
+        annotations:
+          summary: "Budget {{ $labels.scope }} is at {{ $value | humanizePercentage }}"
+          description: "A blocking budget rejects requests with 429 budget_exceeded once its limit is reached; a notify budget keeps serving."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#budget-exhausted"
+
+      # §15.4: overhead p99 stays above 25 ms for 10 minutes. The SLO is
+      # p99 <= 10 ms (PLAN P7); 25 ms means something is wrong.
+      - alert: SwitchyardOverheadP99High
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(switchyard_overhead_duration_seconds_bucket[5m]))) > 0.025
+          and
+          sum(rate(switchyard_overhead_duration_seconds_count[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway overhead p99 is {{ $value | humanizeDuration }}"
+          description: "The time requests spend in the gateway itself, excluding the upstream, has had a p99 above 25 ms for 10 minutes."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#gateway-overhead-high"
+
+      # §15.4: usage events are dropped (the ledger queue overflowed).
+      - alert: SwitchyardUsageEventsDropped
+        expr: increase(switchyard_usage_events_dropped_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value | humanize }} usage events dropped in 5 minutes"
+          description: "The usage queue overflowed and dropped its oldest events: the ledger, usage reports and savings are missing those requests. Budgets are unaffected (they are counted in Redis)."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#usage-events-dropped"
+
+      # §15.4: the cache error rate is elevated. Errors and timeouts are
+      # served as misses, so this costs money, not availability.
+      - alert: SwitchyardCacheErrorRateHigh
+        expr: |
+          (
+            sum by (layer) (rate(switchyard_cache_lookups_total{result="error"}[5m]))
+            /
+            sum by (layer) (rate(switchyard_cache_lookups_total{result!="skipped"}[5m]))
+          ) > 0.05
+          and on (layer)
+          sum by (layer) (increase(switchyard_cache_lookups_total{result!="skipped"}[5m])) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.layer }} cache: {{ $value | humanizePercentage }} of lookups fail"
+          description: "Failed or timed-out cache lookups are served as misses. For the exact layer, check the cache Redis; for semantic, also the embedding deployment."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#cache-redis-down"
+
+      # §15.4: a config reload fails. The old config keeps serving.
+      - alert: SwitchyardConfigReloadFailed
+        expr: increase(switchyard_config_reloads_total{result="error"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A config reload failed on {{ $labels.instance }}"
+          description: "The new config was rejected and the previous one is still serving. The gateway log line for the reload says why."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#config-reload-failed"
+
+      # §14.7: the state Redis is failing (budgets follow budgets.fail_mode,
+      # rate limits rate_limits.fail_mode).
+      - alert: SwitchyardStateStoreErrors
+        expr: |
+          sum(rate(switchyard_budget_store_errors_total[5m])) > 0
+          or
+          sum(rate(switchyard_ratelimit_decisions_total{result="error"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The state Redis is failing: budgets and rate limits are in fail mode"
+          description: "With fail_mode open, requests are served without budget or rate-limit enforcement (per-request cost caps still apply); with closed, they get 503."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#state-redis-down-budgets-and-rate-limits"
+
+      # §14.1: a provider rejects our credential (401 or 403).
+      - alert: SwitchyardUpstreamAuthFailures
+        expr: sum by (provider) (increase(switchyard_upstream_requests_total{outcome="auth"}[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Provider {{ $labels.provider }} rejects the configured API key"
+          description: "Calls to {{ $labels.provider }} fail with 401 or 403 and fall back to other providers. The key is missing, wrong, revoked or out of credit."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#provider-key-rejected"
+
+      # §14.7: Postgres is down or rejecting writes; events are buffered.
+      - alert: SwitchyardUsageLedgerWriteErrors
+        expr: increase(switchyard_usage_write_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Usage ledger writes are failing"
+          description: "Usage events are buffered in memory (queue depth: switchyard_usage_queue_depth) and dropped, oldest first, when the queue is full."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#postgres-down"
+
+      # The access log could not keep up and dropped lines.
+      - alert: SwitchyardLogLinesDropped
+        expr: increase(switchyard_log_lines_dropped_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanize }} log lines dropped in 5 minutes"
+          description: "The asynchronous log writer's queue was full, so lines were dropped rather than slow requests down. Metrics and the usage ledger are unaffected."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#log-lines-dropped"
+
+      # Spans were lost: the export queue was full, or the collector
+      # failed or refused them. Tracing fails open, so requests are fine.
+      - alert: SwitchyardTracingSpansDropped
+        expr: increase(switchyard_tracing_spans_dropped_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanize }} trace spans dropped in 15 minutes"
+          description: "The trace exporter could not deliver spans to the collector (telemetry.tracing.endpoint), or its queue was full. Requests are unaffected; traces are incomplete."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#trace-spans-dropped"
+
+      - alert: SwitchyardDown
+        expr: up{job="switchyard"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.instance }}"
+          description: "The gateway's admin listener has not answered for 2 minutes: the process is down, restarting, or unreachable."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#gateway-down"

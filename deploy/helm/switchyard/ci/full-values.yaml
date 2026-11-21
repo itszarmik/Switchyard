@@ -1,0 +1,221 @@
+# Every optional feature on, for lint and schema checks (kubeconform). Not
+# meant to be installed as is: the secrets are fake, and the
+# PriorityClass, pull Secret and monitoring CRDs must exist first.
+replicaCount: 4
+
+image:
+  repository: registry.example.invalid/platform/switchyard
+  tag: v0.2.0
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: registry-pull
+
+fullnameOverride: llm-gateway
+
+serviceAccount:
+  create: true
+  name: llm-gateway-sa
+  annotations:
+    iam.example.invalid/role: switchyard
+
+podAnnotations:
+  example.invalid/owner: platform
+podLabels:
+  team: platform
+
+secrets:
+  env:
+    SWITCHYARD_ADMIN_TOKEN: test-admin-token-0123456789abcdefghijkl
+    DATABASE_URL: postgres://switchyard:test-password@postgres.example.invalid:5432/switchyard?sslmode=require
+    REDIS_CACHE_URL: rediss://:test-password@redis-cache.example.invalid:6380/0
+    REDIS_STATE_URL: rediss://:test-password@redis-state.example.invalid:6380/0
+    SWITCHYARD_API_KEY_HASH: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    TEAM_KEY_HASH: sha256:1111111111111111111111111111111111111111111111111111111111111111
+    OPENAI_API_KEY: test-openai-key
+    ANTHROPIC_API_KEY: test-anthropic-key
+
+extraEnv:
+  - name: SWITCHYARD_LOG_LEVEL
+    value: debug
+  - name: SWITCHYARD_ALLOW
+    value: "*@openai"
+extraEnvFrom:
+  - secretRef:
+      name: more-provider-keys
+      optional: true
+
+config:
+  server:
+    shutdown_delay: 10s
+    shutdown_grace: 2m
+  telemetry:
+    tracing:
+      enabled: true
+      endpoint: http://otel-collector.observability.svc:4318
+      sample_ratio: 0.1
+  tenants:
+    - id: default
+      policy: default
+      rate_limit:
+        requests_per_minute: 1200
+        max_concurrent_streams: 50
+      keys:
+        - id: default
+          hash: ${SWITCHYARD_API_KEY_HASH}
+        - id: team
+          hash: ${TEAM_KEY_HASH}
+
+catalog:
+  bundled: true
+  extraFiles:
+    quality-overrides.yaml: |
+      quality_overrides: []
+
+service:
+  type: NodePort
+  port: 8080
+  nodePort: 30080
+  externalTrafficPolicy: Local
+  annotations:
+    example.invalid/lb: internal
+
+metrics:
+  service:
+    enabled: true
+    port: 9090
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    labels:
+      release: kube-prometheus-stack
+  prometheusRule:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+probes:
+  startup:
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 150
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+
+autoscaling:
+  enabled: true
+  minReplicas: 4
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 60
+  extraMetrics:
+    - type: Pods
+      pods:
+        metric:
+          name: switchyard_http_requests_in_flight
+        target:
+          type: AverageValue
+          averageValue: "50"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 25%
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    matchLabelKeys: ["pod-template-hash"]
+
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 50
+        preference:
+          matchExpressions:
+            - key: example.invalid/pool
+              operator: In
+              values: [gateway]
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations:
+  - key: example.invalid/dedicated
+    operator: Equal
+    value: gateway
+    effect: NoSchedule
+
+priorityClassName: gateway-critical
+
+terminationGracePeriodSeconds: 150
+
+extraVolumes:
+  - name: tls
+    secret:
+      secretName: llm-gateway-tls
+extraVolumeMounts:
+  - name: tls
+    mountPath: /etc/switchyard/tls
+    readOnly: true
+
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: apps
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6380
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports:
+        - port: 443
+          protocol: TCP
+
+tests:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 32Mi

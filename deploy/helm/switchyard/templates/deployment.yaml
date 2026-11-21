@@ -1,0 +1,180 @@
+{{- include "switchyard.checkSecrets" . }}
+{{- $fullname := include "switchyard.fullname" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  {{- if .Values.autoscaling.enabled }}
+  # The HPA sets the replicas. The field is still rendered, at the running
+  # Deployment's count (minReplicas when there is none yet, as under helm
+  # template), so an upgrade never resets what the HPA chose, and turning
+  # autoscaling on does not let the field default to 1 replica.
+  {{- $live := lookup "apps/v1" "Deployment" .Release.Namespace $fullname }}
+  replicas: {{ dig "spec" "replicas" .Values.autoscaling.minReplicas $live }}
+  {{- else }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "switchyard.gatewaySelectorLabels" . | nindent 6 }}
+  # A new pod is ready before an old one stops, so capacity never drops
+  # during an upgrade.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+  template:
+    metadata:
+      {{- $labels := merge (dict "app.kubernetes.io/component" "gateway") (include "switchyard.labels" . | fromYaml) .Values.podLabels }}
+      labels:
+        {{- toYaml $labels | nindent 8 }}
+      # A changed config, catalog or chart-created Secret changes the
+      # checksums and rolls the pods, so restart-only settings apply too.
+      # The Secret's values are hashed, never copied. A Secret you manage
+      # (existingSecret) is not covered: restart the pods after changing it.
+      {{- $checksums := dict "checksum/config" (include "switchyard.config" . | sha256sum) "checksum/catalog" (include "switchyard.catalogFiles" . | sha256sum) }}
+      {{- if .Values.secrets.create }}
+      {{- $_ := set $checksums "checksum/secret" (.Values.secrets.env | toJson | sha256sum) }}
+      {{- end }}
+      annotations:
+        {{- merge $checksums .Values.podAnnotations | toYaml | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "switchyard.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      # No *_SERVICE_HOST / *_PORT variables from other Services: a Service
+      # named "switchyard" would otherwise inject SWITCHYARD_PORT and others
+      # into the gateway's SWITCHYARD_* namespace.
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      # Long enough for shutdown_delay, the drain (shutdown_grace) and the
+      # final flushes; see values.yaml.
+      terminationGracePeriodSeconds: {{ include "switchyard.terminationGracePeriodSeconds" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: switchyard
+          image: {{ include "switchyard.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--config", "/etc/switchyard/config/switchyard.yaml"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 9090
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: {{ include "switchyard.secretName" . }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # The listeners start after the ledger has connected to Postgres
+          # and migrated it (up to 30 s, then the container exits and
+          # restarts), so the startup probe allows minutes; after it passes,
+          # liveness and readiness take over. All three use the admin listener, which
+          # stays plain HTTP when the public listener serves TLS.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # Directories, not subPath files: a subPath mount never sees a
+            # ConfigMap update.
+            - name: config
+              mountPath: /etc/switchyard/config
+              readOnly: true
+            {{- if include "switchyard.hasCatalog" . }}
+            - name: catalog
+              mountPath: /etc/switchyard/catalog
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}-config
+        {{- if include "switchyard.hasCatalog" . }}
+        - name: catalog
+          configMap:
+            name: {{ $fullname }}-catalog
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range .Values.topologySpreadConstraints }}
+        {{- $c := deepCopy . }}
+        {{- if not (hasKey $c "labelSelector") }}
+        {{- $_ := set $c "labelSelector" (dict "matchLabels" (include "switchyard.gatewaySelectorLabels" $ | fromYaml)) }}
+        {{- end }}
+        {{- toYaml (list $c) | nindent 8 }}
+        {{- end }}
+      {{- else }}
+      # One pod per node where possible, counted per ReplicaSet
+      # (pod-template-hash) so a rollout spreads its new pods too.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "switchyard.gatewaySelectorLabels" . | nindent 14 }}
+          matchLabelKeys: ["pod-template-hash"]
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

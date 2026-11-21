@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P8 complete** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P8 complete; P9 (Helm chart) built and verified locally, not yet committed** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -57,6 +57,7 @@
 | P6 | Exact and semantic caching | M | P4 |
 | P7 | Production hardening and v0.1 | M | P5, P6 |
 | P8 | Quality feedback loop (the first post-MVP phase) | M | P5 |
+| P9 | Helm chart for Kubernetes | M | P7 |
 
 Sizes are relative (S < M < L), not calendar estimates.
 
@@ -561,6 +562,63 @@ All three criteria pass against fake upstreams. No real provider has been called
 
 ---
 
+## P9: Helm chart for Kubernetes
+
+**Goal:** the high-availability tier of DESIGN §18.1, installable with one `helm install`: at least 3 replicas, autoscaling, and Redis and Postgres you already run.
+
+**Decisions (2026-11-20)**
+
+- **Bring your own state.** The chart deploys only the gateway. Redis (separate instances for cache and state, or one for both) and Postgres are given as URLs, from values or from an existing Secret. No database subcharts.
+- **Tested on kind.** The local and CI install tests run on a throwaway kind cluster with in-cluster Redis and Postgres deployed by the test, not by the chart.
+
+**Scope**
+
+- **Chart** at `deploy/helm/switchyard`: a Deployment, Service, ConfigMap (config and catalog), ServiceAccount, PodDisruptionBudget, HorizontalPodAutoscaler, and optional NetworkPolicy, ServiceMonitor and PrometheusRule (the alerts from `deploy/prometheus/alerts.yml`). A `values.schema.json` and a `helm test` hook.
+- **Secrets.** Provider keys, the admin token, API key hashes and the database URLs come from a Secret the chart creates or one you name. They never appear in the ConfigMap; the config refers to them as `${VAR}`.
+- **Config changes.** The rendered config is the switchyard YAML from values. A changed config rolls the pods (a checksum annotation), so restart-only fields apply too.
+- **Shutdown.** `terminationGracePeriodSeconds` is derived from the config as `shutdown_delay + shutdown_grace + 15s`. `shutdown_delay` defaults to a few seconds on Kubernetes so endpoints are removed before the listener closes.
+- **Hardening.** Non-root, read-only root filesystem, no capabilities, no privilege escalation, `RuntimeDefault` seccomp, no service-account token: the pod passes Pod Security "restricted".
+- **Probes and metrics.** Liveness and readiness on the admin listener's `/healthz` and `/readyz`; `/metrics` scraped there. The admin listener is not exposed by the Service unless asked.
+- **Docs and automation.** `docs/kubernetes.md` (install, values, upgrades, sizing, troubleshooting), `make helm-lint` and `make helm-test`, a CI job, and the packaged chart attached to each GitHub release.
+
+**Acceptance**
+
+- [ ] `helm lint --strict` passes, and the manifests rendered from the default values and from a full example pass `kubeconform` against the supported Kubernetes versions. *`helm lint --strict` passes with both example values files; kubeconform isn't installed locally, so it first runs in CI.*
+- [x] The schema rejects invalid values (for example no admin token or Secret, replicas below 1, a malformed duration), with a clear message.
+- [x] On kind, `helm install` with 3 replicas against in-cluster Redis and Postgres becomes ready, `helm test` passes, and a chat request through the Service, to a fake provider, returns 200 and is recorded in the Postgres ledger.
+- [x] Rate limits are shared across the replicas: a key's limit holds however requests spread over the pods.
+- [x] `helm upgrade` with a changed config rolls the pods without a failed request under steady load, including a stream in flight.
+- [x] The pods run in a namespace that enforces Pod Security "restricted", and no secret value appears in any rendered ConfigMap or in the pod spec.
+- [ ] CI runs the lint, schema and kind install tests on every push, and the v0.2.0 release workflow attaches the packaged chart. *The CI job and release packaging are written; neither has run on GitHub yet, and v0.2.0 isn't tagged.*
+
+**Outcome (2026-11-20)**
+
+**Built.** The chart (`deploy/helm/switchyard`, chart 0.2.0, Kubernetes ≥ 1.30) with a schema, a commented values file, a recursive config merge (maps merge, lists and scalars replace, `null` removes a default), the derived grace period, checksum rolls, a PDB, an optional HPA, NetworkPolicy (on by default), ServiceMonitor and PrometheusRule (the 13 alerts), and a `helm test` hook that uses the gateway image. Bundled copies of the catalog and the alerts are checked against their sources by a test. `docs/kubernetes.md` covers install, managed Redis and Postgres, the private image, upgrades, sizing, monitoring and troubleshooting. A standalone fake provider (`test/fakeupstream/cmd/fakeupstream`) serves the cluster tests.
+
+**Kind e2e** (`make helm-test`, one fresh cluster, 123 s for the test):
+- The chart namespace enforces Pod Security "restricted" and rejects a non-compliant pod; `helm install --wait` with 3 replicas is ready in about 7 s, and `helm test` passes straight after.
+- A chat request to the fake returns 200 and its row is in the Postgres ledger.
+- Through a NodePort, 30 requests are served by all 3 pods (11, 10, 9).
+- One key at 1 request a minute with a burst of 9: 90 requests in 26 ms allow exactly 10 and refuse 80 with 429, spread 24–33 per pod (limits per replica would have allowed 30).
+- A config-change upgrade under load: 450 requests at 100 ms intervals, 0 failed; 3 of 3 long streams crossed their pod's SIGTERM and completed; every pod replaced.
+- A bad-config upgrade with `--rollback-on-failure` fails and rolls back in 41 s; the old pods stay ready on the old config and serve.
+- The default NetworkPolicy: from another namespace port 8080 answers and 9090 times out; 9090 answers from the release's namespace.
+- Turning autoscaling on keeps the 3 pods.
+
+**Render tests** (`make helm-lint`): sentinel secrets appear only in Secrets, never in ConfigMaps, annotations or the pod spec; the rendered config loads with the gateway's own loader; hardening, the grace derivation, checksum rolls, the schema and template refusals, and the NetworkPolicy.
+
+**Review fixes.** Independent security and correctness reviews found 0 critical, 3 high, 6 medium and 12 low issues, all fixed:
+- **Secrets in errors.** A schema `pattern` made Helm print a rejected admin token; the format checks moved into the template, whose errors name the key only.
+- **Literal secrets.** A key pasted into `config` landed in the ConfigMap; secret fields must now be references.
+- **Bare `0` durations** passed the schema and crash-looped the pods; durations now need units, and the grace derivation follows the gateway's defaults (zero grace means 60 s).
+- **Failed upgrades.** The docs claimed a bad config never takes the service down; they now say what happens and recommend `--rollback-on-failure`, which the e2e tests.
+- **Admin port exposure.** Port 9090 was reachable cluster-wide by default; the NetworkPolicy is now on by default and NOTES warns when it's off.
+- **Autoscaling** briefly dropped to 1 replica when turned on; the chart now renders the live count.
+- **Release job.** It ran a third-party setup action holding the write token; the chart is now packaged in the read-only job, which also runs kubeconform and the kind test before any release.
+- **`helm test`** could fail right after install; the test pod retries, and the e2e runs it with no wait.
+
+**Not yet run:** kubeconform (CI only), the CI `helm` job and the release packaging on GitHub, the chart against a real HPA with metrics-server and against the Prometheus Operator's CRDs, and Helm 3.
+
 ## Post-MVP backlog
 
 - **SaaS:**
@@ -570,7 +628,7 @@ All three criteria pass against fake upstreams. No real provider has been called
   - A principal cache with revocation over pub/sub.
   - A control-plane UI, billing export, and a ClickHouse usage sink.
 - **Platform:**
-  - A Helm chart, a native Gemini adapter, and the Responses API (a stateless subset).
+  - A native Gemini adapter, and the Responses API (a stateless subset).
   - Normalizing reasoning parameters across providers.
   - Conversation stickiness and prefix affinity, and automatic Anthropic `cache_control`.
   - Hedged requests for latency profiles, and request coalescing across replicas.

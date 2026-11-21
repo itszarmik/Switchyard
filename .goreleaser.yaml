@@ -87,6 +87,9 @@ sboms:
 checksum:
   name_template: checksums.txt
   algorithm: sha256
+  # The Helm chart (release.extra_files) is checksummed with the rest.
+  extra_files:
+    - glob: &chart '{{ if not .IsSnapshot }}./bin/chart/switchyard-{{ .Version }}.tgz{{ end }}'
 
 # Multi-arch images on ghcr.io, built with Buildx from the binaries above
 # (deploy/Dockerfile.release), with an SBOM and provenance attestation.
@@ -133,3 +136,9 @@ release:
   draft: true
   prerelease: auto
   name_template: "v{{ .Version }}"
+  # The Helm chart at the tag's version: release.yml's check job packages it
+  # (make helm-package) and the release job downloads it into bin/chart,
+  # which --clean leaves alone. A snapshot has no chart: the glob is empty,
+  # which GoReleaser skips.
+  extra_files:
+    - glob: *chart

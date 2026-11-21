@@ -1,0 +1,7 @@
+# Not packaged into the chart archive.
+.DS_Store
+*.swp
+*.bak
+*.tmp
+*~
+.git/

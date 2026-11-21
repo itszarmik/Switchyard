@@ -1,0 +1,14 @@
+{{- if include "switchyard.hasCatalog" . }}
+# The model catalog, mounted at /etc/switchyard/catalog: the bundled files
+# (a copy of configs/catalog) and catalog.extraFiles.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "switchyard.fullname" . }}-catalog
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+data:
+  {{- include "switchyard.catalogFiles" . | nindent 2 }}
+{{- end }}

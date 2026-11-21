@@ -1,0 +1,54 @@
+Switchyard ({{ include "switchyard.image" . }}) is installed as {{ include "switchyard.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+{{- if .Values.autoscaling.enabled }}
+Replicas: {{ .Values.autoscaling.minReplicas }} to {{ .Values.autoscaling.maxReplicas }} (HorizontalPodAutoscaler).
+{{- else }}
+Replicas: {{ .Values.replicaCount }}.
+{{- end }}
+Shutdown: each pod has {{ include "switchyard.terminationGracePeriodSeconds" . }}s from SIGTERM (terminationGracePeriodSeconds).
+
+Wait for the pods, then check them:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "switchyard.fullname" . }}
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+The API is the Service {{ include "switchyard.fullname" . }}, port {{ .Values.service.port }}:
+{{- if eq .Values.service.type "NodePort" }}
+
+  kubectl -n {{ .Release.Namespace }} get service {{ include "switchyard.fullname" . }} -o jsonpath='{.spec.ports[0].nodePort}'
+{{- else if eq .Values.service.type "LoadBalancer" }}
+
+  kubectl -n {{ .Release.Namespace }} get service {{ include "switchyard.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0]}'
+{{- else }}
+
+  inside the cluster: http://{{ include "switchyard.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/v1
+  from here:          kubectl -n {{ .Release.Namespace }} port-forward service/{{ include "switchyard.fullname" . }} 8080:{{ .Values.service.port }}
+{{- end }}
+
+The admin listener (/metrics, /admin/v1/* with the admin token) is on port 9090 of each pod{{ if or .Values.metrics.service.enabled .Values.metrics.serviceMonitor.enabled }} and the Service {{ include "switchyard.fullname" . }}-metrics{{ end }}{{ if .Values.networkPolicy.enabled }}, reachable from {{ if .Values.networkPolicy.metricsFrom }}networkPolicy.metricsFrom{{ else }}this namespace only{{ end }} (NetworkPolicy){{ end }}:
+
+  kubectl -n {{ .Release.Namespace }} port-forward deployment/{{ include "switchyard.fullname" . }} 9090:9090
+{{- if not .Values.secrets.create }}
+
+The pods load the Secret {{ .Values.secrets.existingSecret }}. After changing it, restart them:
+
+  kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ include "switchyard.fullname" . }}
+{{- end }}
+{{- if not .Values.networkPolicy.enabled }}
+
+Warning: networkPolicy.enabled is false, so port 9090 of every gateway pod is
+reachable from every namespace: /metrics without authentication, and
+/admin/v1/* behind the admin token. Enable the NetworkPolicy, or block it
+another way.
+{{- else if and .Values.metrics.serviceMonitor.enabled (not .Values.networkPolicy.metricsFrom) }}
+
+Warning: the ServiceMonitor is on, but networkPolicy.metricsFrom is empty, so
+port 9090 accepts only pods in namespace {{ .Release.Namespace }}. A Prometheus in another
+namespace is refused and SwitchyardDown fires: add it to metricsFrom.
+{{- end }}
+{{- if and (not .Values.autoscaling.enabled) (lt (int .Values.replicaCount) 3) }}
+
+Warning: {{ .Values.replicaCount }} replica(s). High availability needs at least 3, one per node.
+{{- end }}
+
+Operating it: docs/kubernetes.md and docs/runbook.md in https://github.com/itszarmik/Switchyard

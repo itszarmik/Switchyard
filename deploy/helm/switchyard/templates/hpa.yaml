@@ -1,0 +1,40 @@
+{{- if .Values.autoscaling.enabled }}
+{{- $a := .Values.autoscaling }}
+{{- if lt (int $a.maxReplicas) (int $a.minReplicas) }}
+{{- fail (printf "autoscaling.maxReplicas (%d) is below autoscaling.minReplicas (%d)" (int $a.maxReplicas) (int $a.minReplicas)) }}
+{{- end }}
+{{- if and (kindIs "invalid" $a.targetCPUUtilizationPercentage) (not $a.extraMetrics) }}
+{{- fail "autoscaling has no metric: set autoscaling.targetCPUUtilizationPercentage or autoscaling.extraMetrics" }}
+{{- end }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "switchyard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "switchyard.fullname" . }}
+  minReplicas: {{ $a.minReplicas }}
+  maxReplicas: {{ $a.maxReplicas }}
+  metrics:
+    {{- if not (kindIs "invalid" $a.targetCPUUtilizationPercentage) }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $a.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- with $a.extraMetrics }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $a.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

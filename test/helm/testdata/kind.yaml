@@ -1,0 +1,16 @@
+# The kind cluster of make helm-test: one node, whose NodePort 30080 (the
+# gateway Service's nodePort in e2e-values.yaml) is published on the host
+# at 127.0.0.1:28080. Through a NodePort, kube-proxy picks a pod for each
+# new connection, so the test's requests spread over the replicas the way
+# a load balancer's would; kubectl port-forward would pin them to one pod.
+# The host port is above 20000 to stay clear of the ports compose and the
+# integration tests use; change both here and HELM_E2E_URL to move it.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 28080
+        listenAddress: 127.0.0.1
+        protocol: TCP

@@ -1,0 +1,134 @@
+# The chart's default Switchyard configuration: deploy/config/switchyard.yaml
+# (the compose setup) adapted to Kubernetes. The `config` value is
+# deep-merged over it: maps merge key by key, and any other value, a list
+# included, replaces the default (see docs/kubernetes.md). `helm template
+# --show-only templates/configmap.yaml` shows the result.
+#
+# Secrets are never written here. Each `${VAR}` is an environment variable
+# the pod gets from the chart's Secret (secrets.env) or your existingSecret;
+# `${VAR:-default}` falls back to the default when VAR is unset. For every
+# key and its default, see docs/configuration.md.
+version: 1
+
+# The catalog ConfigMap (catalog.bundled and catalog.extraFiles) is mounted
+# at /etc/switchyard/catalog, beside this file's directory.
+include:
+  - ../catalog/*.yaml
+
+server:
+  # The chart's container ports, Service and probes use these two ports.
+  listen: ":8080"
+  # All interfaces inside the pod, for the kubelet's probes and Prometheus.
+  # The Service does not expose it unless metrics.service.enabled is set,
+  # and the NetworkPolicy (networkPolicy.metricsFrom) limits who reaches it.
+  # Because it is not loopback, the admin token is required.
+  admin_listen: ":9090"
+  admin_token: ${SWITCHYARD_ADMIN_TOKEN}
+  # After SIGTERM /readyz fails at once, but the gateway keeps serving for
+  # shutdown_delay so that every kube-proxy and load balancer stops sending
+  # new connections first; then it drains in-flight requests (long streams
+  # included) for up to shutdown_grace. The pod's
+  # terminationGracePeriodSeconds is derived from both: delay + grace + 15s.
+  shutdown_delay: 5s
+  shutdown_grace: 60s
+
+# SWITCHYARD_LOG_LEVEL (extraEnv) overrides the level without a config
+# change.
+logging:
+  level: info
+  format: json
+
+storage:
+  mode: redis
+  redis:
+    # Evictable cache instance (allkeys-lru, no persistence).
+    cache_url: ${REDIS_CACHE_URL}
+    # Budgets, rate limits and cache namespace versions (noeviction,
+    # persistent). Every replica shares them. It may be the same instance as
+    # the cache only if that one does not evict.
+    state_url: ${REDIS_STATE_URL}
+  ledger:
+    driver: postgres
+    # The ledger migrates at startup under an advisory lock, so replicas
+    # starting together are safe.
+    dsn: ${DATABASE_URL}
+
+# Providers for every deployment in the bundled catalog. A key that is not
+# set is empty, and that provider's calls fail with 401: they fall back to
+# another provider and open its breakers, which the
+# SwitchyardUpstreamAuthFailures alert reports. Set SWITCHYARD_ALLOW (or
+# override `policies`) to keep "auto" routing on the providers you have keys
+# for.
+providers:
+  - id: openai
+    type: openai
+    base_url: ${SWITCHYARD_OPENAI_BASE_URL:-https://api.openai.com/v1}
+    api_key: ${OPENAI_API_KEY:-}
+  - id: anthropic
+    type: anthropic
+    base_url: ${SWITCHYARD_ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+    api_key: ${ANTHROPIC_API_KEY:-}
+    forward_headers: [anthropic-beta]
+  - id: google
+    type: openai
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key: ${GEMINI_API_KEY:-}
+  - id: together
+    type: openai
+    base_url: https://api.together.xyz/v1
+    api_key: ${TOGETHER_API_KEY:-}
+
+aliases:
+  fast: claude-haiku-5-5
+  smart: claude-opus-5-5
+
+routing:
+  default_profile: balanced
+
+policies:
+  - id: default
+    profile: balanced
+    # "What you would have used without Switchyard": savings are measured
+    # against it.
+    baseline_model: claude-sonnet-5-5
+    # Deployments "auto" may route to (globs over model@provider), for
+    # example "*@openai" when that is the only key you have.
+    allow: ["${SWITCHYARD_ALLOW:-*}"]
+    # A hard cap per request, against runaway prompts.
+    max_cost_per_request_usd: "0.50"
+    cache:
+      exact:
+        enabled: true
+        ttl: 24h
+        scope: tenant
+
+budgets:
+  # If the state Redis is down, keep serving (per-request caps still apply)
+  # and alert. Set closed to reject with 503 instead.
+  fail_mode: open
+
+rate_limits:
+  fail_mode: open
+
+tenants:
+  - id: default
+    policy: default
+    # Per key: 600 requests a minute (bursts of 100) and 20 concurrent
+    # streams, shared by every replica through the state Redis.
+    rate_limit:
+      requests_per_minute: 600
+      max_concurrent_streams: 20
+    budgets:
+      # A monthly ceiling against surprises. At 80 % "auto" requests switch
+      # to the cheap profile; at 100 % requests get 429 budget_exceeded.
+      - scope: tenant
+        window: month
+        limit_usd: "100"
+        soft_at: 0.8
+        soft_profile: cheap
+        on_exhausted: block
+    keys:
+      # Only the key's SHA-256 hash is stored, in the Secret. Make one with
+      # `switchyard keys generate`. Add more keys by overriding `tenants`.
+      - id: default
+        hash: ${SWITCHYARD_API_KEY_HASH}

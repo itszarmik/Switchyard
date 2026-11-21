@@ -1,0 +1,8 @@
+# The build context of Dockerfile.fakeupstream (BuildKit reads this file in
+# place of the root .dockerignore, which excludes test/): only what the
+# fake's build copies.
+*
+!go.mod
+!go.sum
+!test/fakeupstream/
+test/fakeupstream/**/*_test.go

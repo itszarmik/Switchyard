@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -611,6 +612,30 @@ func TestModelsAndUnknownPaths(t *testing.T) {
 		t.Errorf("POST /v1/embeddings = %d, want 404", r.status)
 	}
 	decodeEnvelope(t, r)
+}
+
+func TestListener(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer(t, fakeupstream.Options{Listener: l})
+	if want := "http://" + l.Addr().String(); s.URL() != want {
+		t.Errorf("URL() = %q, want %q, the given listener's address", s.URL(), want)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+	defer cancel()
+	r, err := do(ctx, t, http.MethodGet, s.BaseURL()+"/models", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.status != http.StatusOK {
+		t.Errorf("GET /v1/models = %d, want 200", r.status)
+	}
+	s.Close()
+	if _, err := net.Dial("tcp", l.Addr().String()); err == nil {
+		t.Error("the listener still accepts connections after Close")
+	}
 }
 
 func TestRecording(t *testing.T) {

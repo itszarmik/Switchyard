@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -119,6 +120,11 @@ type Options struct {
 	// Sequence, as chat completions do. Without Embed, the path is unknown
 	// (404). Embed must be safe for concurrent use.
 	Embed func(input string) []float32
+	// Listener, when set, is the listener the server serves on, for a
+	// standalone fake (test/fakeupstream/cmd/fakeupstream) on a fixed
+	// address. When nil, the server listens on a random loopback port, as
+	// httptest does. Close closes it.
+	Listener net.Listener
 }
 
 // Request is a recorded request and what the fake did with it.
@@ -176,7 +182,14 @@ func New(opts Options) *Server {
 		changed: make(chan struct{}),
 	}
 	s.opts.Models = append([]string(nil), opts.Models...)
-	s.ts = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
+	s.opts.Listener = nil // Close closes it through s.ts
+	s.ts = httptest.NewUnstartedServer(http.HandlerFunc(s.serveHTTP))
+	if opts.Listener != nil {
+		// httptest's own documented way to serve on a chosen listener.
+		_ = s.ts.Listener.Close()
+		s.ts.Listener = opts.Listener
+	}
+	s.ts.Start()
 	return s
 }
 

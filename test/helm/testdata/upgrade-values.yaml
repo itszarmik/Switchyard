@@ -1,0 +1,6 @@
+# The config change of the kind test's helm upgrade: a new alias. It
+# changes the config ConfigMap and so its checksum, which rolls every pod,
+# and a request for the alias succeeds only on a pod with the new config.
+config:
+  aliases:
+    e2e-upgraded: fake-chat

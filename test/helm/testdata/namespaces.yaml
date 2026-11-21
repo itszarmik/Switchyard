@@ -1,0 +1,20 @@
+# The kind test's namespaces. The chart's enforces Pod Security
+# "restricted" (and warns and audits at that level, so helm reports any
+# violation by name); the dependencies' does not, because the official
+# Redis and Postgres images run as root.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: switchyard-e2e
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: switchyard-e2e-deps

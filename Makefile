@@ -164,6 +164,106 @@ check-deploy: ## Validate deploy/: alert rules and their tests, dashboard, metri
 	@echo "check-deploy: OK"
 # --- end ops ---
 
+# --- helm (P9): chart lint and render tests, kind install test ---
+#
+# helm-lint checks the chart in deploy/helm/switchyard without a cluster:
+# helm lint --strict with each example values file (ci/*-values.yaml); the
+# render tests in test/helm (helm template: secrets only in Secrets, the
+# rendered config loads, pod hardening, the derived termination grace,
+# the checksum that rolls the pods, the values the chart refuses) and the
+# check that the chart's bundled catalog and alert rules are identical to
+# configs/catalog and deploy/prometheus/alerts.yml; then kubeconform
+# -strict over each example's render for every Kubernetes version in
+# HELM_KUBE_VERSIONS (the chart's minimum and the releases supported
+# upstream), when kubeconform is on PATH (CI installs it). Each render goes
+# to a file first, so a failing helm template fails the check (make's
+# /bin/sh may have no pipefail). Its schemas are fetched from the two
+# repositories below, pinned to a commit, and cached in KUBECONFORM_CACHE.
+#
+# helm-test is the end-to-end test on kind: it builds the gateway image
+# (the docker target, so DOCKER="colima ssh -- docker" works here too) and
+# the fake provider's (test/helm/Dockerfile.fakeupstream), creates the kind
+# cluster KIND_CLUSTER from test/helm/testdata/kind.yaml (KIND_REUSE=1 uses
+# an existing one instead), loads both images, runs TestKind in test/helm
+# (see its package doc for what it checks), and deletes the cluster at the
+# end, pass or fail, unless KIND_KEEP=1 or KIND_REUSE=1 (a reused cluster
+# is never deleted). The gateway is reached through a
+# NodePort published on the host at HELM_E2E_URL. The cluster's
+# credentials go to HELM_E2E_KUBECONFIG, never to your ~/.kube/config, so
+# the target leaves your current kubectl context alone.
+#
+# helm-package writes the chart to bin/chart/switchyard-CHART_VERSION.tgz,
+# with CHART_VERSION, which must be a semantic version, as both its version
+# and its appVersion (so the image tag defaults to vCHART_VERSION). The
+# release workflow runs it with the tag's version in its read-only check
+# job and hands the file to the release job, whose GoReleaser attaches it.
+HELM               ?= helm
+KIND               ?= kind
+KUBECONFORM        ?= kubeconform
+CHART_DIR          := deploy/helm/switchyard
+HELM_KUBE_VERSIONS ?= 1.30.0 1.35.0 1.36.0 1.37.0
+KUBECONFORM_CACHE  ?= bin/kubeconform-cache
+KUBECONFORM_SCHEMAS := \
+	-schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/88b0235585da4efb0e4bc6cc00baccf0e327e54d/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json' \
+	-schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/784ec895547a36e548e6810b41f27baade3a0890/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+KIND_CLUSTER       ?= switchyard-helm
+KIND_REUSE         ?=
+KIND_KEEP          ?=
+FAKE_IMAGE         := switchyard-fakeupstream:dev
+HELM_E2E_URL       ?= http://127.0.0.1:28080
+HELM_E2E_KUBECONFIG ?= $(CURDIR)/bin/helm-test.kubeconfig
+HELM_E2E_FLAGS     ?= -v -count=1 -timeout 30m
+CHART_VERSION      ?= $(shell awk '$$1 == "version:" { print $$2; exit }' $(CHART_DIR)/Chart.yaml)
+# helm-package reads CHART_VERSION from its environment, quoted, rather
+# than pasted into its shell line: a release derives it from the tag name.
+CHART_VERSION      := $(CHART_VERSION)
+export CHART_VERSION
+SEMVER_RE          := [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?
+
+.PHONY: helm-lint helm-test helm-package
+helm-lint: ## Lint the Helm chart: helm lint --strict, render tests, bundled-copy drift, kubeconform (if installed).
+	@for f in $(CHART_DIR)/ci/*-values.yaml; do \
+		echo "$(HELM) lint --strict $(CHART_DIR) -f $$f"; \
+		$(HELM) lint --strict $(CHART_DIR) -f "$$f" || exit 1; \
+	done
+	$(GO) test -count=1 -run 'Render|Bundled' ./test/helm
+	@if ! command -v $(KUBECONFORM) >/dev/null 2>&1; then \
+		echo "kubeconform: skipped: kubeconform not installed"; exit 0; \
+	fi; \
+	mkdir -p $(KUBECONFORM_CACHE) || exit 1; \
+	render=$$(mktemp) || exit 1; \
+	trap 'rm -f "$$render"' EXIT; \
+	for f in $(CHART_DIR)/ci/*-values.yaml; do \
+		for v in $(HELM_KUBE_VERSIONS); do \
+			echo "kubeconform: $$f, Kubernetes $$v"; \
+			$(HELM) template sy $(CHART_DIR) -f "$$f" --kube-version "$$v" >"$$render" || exit 1; \
+			$(KUBECONFORM) -strict -summary -kubernetes-version "$$v" -cache $(KUBECONFORM_CACHE) $(KUBECONFORM_SCHEMAS) "$$render" || exit 1; \
+		done; \
+	done
+
+helm-test: docker ## Install the chart on a kind cluster and test it end to end (KIND_CLUSTER, KIND_REUSE=1, KIND_KEEP=1).
+	DOCKER_BUILDKIT=1 $(DOCKER) build -f test/helm/Dockerfile.fakeupstream -t $(FAKE_IMAGE) .
+	@mkdir -p $(dir $(HELM_E2E_KUBECONFIG)); \
+	kubeconfig='$(HELM_E2E_KUBECONFIG)'; \
+	if [ -z "$(KIND_REUSE)" ]; then \
+		echo "$(KIND) create cluster --name $(KIND_CLUSTER)"; \
+		$(KIND) create cluster --name $(KIND_CLUSTER) --config test/helm/testdata/kind.yaml --kubeconfig "$$kubeconfig" --wait 2m || exit 1; \
+	else \
+		$(KIND) export kubeconfig --name $(KIND_CLUSTER) --kubeconfig "$$kubeconfig" || exit 1; \
+	fi; \
+	if [ -z "$(KIND_REUSE)$(KIND_KEEP)" ]; then trap '$(KIND) delete cluster --name $(KIND_CLUSTER) --kubeconfig "$$kubeconfig"' EXIT; fi; \
+	$(KIND) load docker-image --name $(KIND_CLUSTER) $(IMAGE) $(FAKE_IMAGE) || exit 1; \
+	echo "$(GO) test $(HELM_E2E_FLAGS) -run TestKind ./test/helm"; \
+	KUBECONFIG="$$kubeconfig" SWITCHYARD_HELM_E2E=1 HELM_E2E_CONTEXT=kind-$(KIND_CLUSTER) HELM_E2E_URL=$(HELM_E2E_URL) \
+		HELM_E2E_IMAGE=$(IMAGE) $(GO) test $(HELM_E2E_FLAGS) -run TestKind ./test/helm
+
+helm-package: ## Package the chart as bin/chart/switchyard-CHART_VERSION.tgz (default: Chart.yaml's version).
+	@printf '%s\n' "$$CHART_VERSION" | grep -Eqx '$(SEMVER_RE)' || \
+		{ echo "helm-package: CHART_VERSION is not a semantic version such as 0.2.0" >&2; exit 1; }
+	@mkdir -p bin/chart
+	$(HELM) package $(CHART_DIR) --version "$$CHART_VERSION" --app-version "$$CHART_VERSION" --destination bin/chart
+# --- end helm ---
+
 .PHONY: demo-routing
 demo-routing: ## Run the mixed-workload routing demo against fake upstreams (pass flags with DEMO_FLAGS).
 	$(GO) run ./test/demo $(DEMO_FLAGS)

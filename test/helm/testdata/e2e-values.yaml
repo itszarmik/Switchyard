@@ -1,0 +1,91 @@
+# Values for the kind test (kind_test.go), on top of the chart's
+# defaults. The secrets are not here: the test generates them for each run
+# and passes them in a values file of its own (secrets.env).
+#
+# The dependencies are the in-cluster services of deps.yaml, in the
+# namespace switchyard-e2e-deps. Every provider points at the fake there,
+# so nothing can reach a real one, whatever routing picks.
+replicaCount: 3
+
+image:
+  # Built by make helm-test (make docker) and loaded into kind, never pulled.
+  repository: switchyard
+  tag: dev
+  pullPolicy: Never
+
+service:
+  type: NodePort
+  # Published on the host by testdata/kind.yaml.
+  nodePort: 30080
+
+metrics:
+  service:
+    enabled: true
+
+# networkPolicy stays at the chart's default (on, empty peer lists), which
+# kind_test.go's networkPolicy step checks.
+
+config:
+  providers:
+    # The chart's four providers, kept because the bundled catalog's
+    # deployments name them, but pointed at the fake: their keys are unset,
+    # so the fake answers them 401.
+    - id: openai
+      type: openai
+      base_url: http://fakeupstream.switchyard-e2e-deps.svc.cluster.local:8080/v1
+      api_key: ${OPENAI_API_KEY:-}
+    - id: anthropic
+      type: anthropic
+      base_url: http://fakeupstream.switchyard-e2e-deps.svc.cluster.local:8080
+      api_key: ${ANTHROPIC_API_KEY:-}
+    - id: google
+      type: openai
+      base_url: http://fakeupstream.switchyard-e2e-deps.svc.cluster.local:8080/v1
+      api_key: ${GEMINI_API_KEY:-}
+    - id: together
+      type: openai
+      base_url: http://fakeupstream.switchyard-e2e-deps.svc.cluster.local:8080/v1
+      api_key: ${TOGETHER_API_KEY:-}
+    # The fake that answers at once, and the one whose streams are slow.
+    - id: fake
+      type: openai
+      base_url: http://fakeupstream.switchyard-e2e-deps.svc.cluster.local:8080/v1
+      api_key: ${FAKE_API_KEY}
+    - id: fakeslow
+      type: openai
+      base_url: http://fakeupstream.switchyard-e2e-deps.svc.cluster.local:8081/v1
+      api_key: ${FAKE_API_KEY}
+
+  models:
+    - id: fake-chat
+      context_window: 8192
+      capabilities: [streaming, stream_usage]
+      deployments:
+        - provider: fake
+          upstream_model: fake-chat
+          pricing: { input: "0.10", output: "0.40" }
+    - id: fake-slow
+      context_window: 8192
+      capabilities: [streaming, stream_usage]
+      deployments:
+        - provider: fakeslow
+          upstream_model: fake-slow
+          pricing: { input: "0.10", output: "0.40" }
+
+  tenants:
+    - id: default
+      policy: default
+      # No request rate for the steady load of the upgrade; enough streams
+      # for the ones kept in flight across it.
+      rate_limit:
+        max_concurrent_streams: 20
+      keys:
+        - id: e2e
+          hash: ${SWITCHYARD_API_KEY_HASH}
+        # The rate-limit check's key: 1 request a minute with a burst of 9,
+        # so 10 requests are allowed in any one minute, across every replica.
+        - id: e2e-limited
+          hash: ${E2E_LIMITED_KEY_HASH}
+          rate_limit:
+            requests_per_minute: 1
+            burst: 9

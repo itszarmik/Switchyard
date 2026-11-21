@@ -1,0 +1,17 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Node drains and other voluntary disruptions take down at most
+# maxUnavailable gateway pods at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "switchyard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "switchyard.gatewaySelectorLabels" . | nindent 6 }}
+{{- end }}

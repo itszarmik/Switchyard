@@ -1,0 +1,262 @@
+# Default values for the Switchyard chart. docs/kubernetes.md explains
+# installing, upgrading and sizing. values.schema.json checks the values,
+# and helm stops with a message naming the one that is wrong.
+#
+# A minimal install needs only the required secrets (secrets.env, or an
+# existingSecret): see ci/default-values.yaml.
+
+# Gateway replicas: at least 3 for high availability, spread over nodes
+# (see topologySpreadConstraints). Ignored when autoscaling.enabled is true.
+replicaCount: 3
+
+image:
+  # The gateway image. ghcr.io/itszarmik/switchyard is private: give
+  # imagePullSecrets, or build the image (make docker) and push it to your
+  # own registry (docs/kubernetes.md).
+  repository: ghcr.io/itszarmik/switchyard
+  # The image tag. Empty means v<the chart's appVersion>, for example v0.2.0.
+  tag: ""
+  # An image digest (sha256:...) to pin the image; the tag is then only
+  # informative. Empty pulls by tag.
+  digest: ""
+  # Always, IfNotPresent or Never (Never for an image loaded into kind).
+  pullPolicy: IfNotPresent
+
+# Secrets for pulling the image, as [{name: <Secret>}]; create one with
+# `kubectl create secret docker-registry`. Used by the helm test pod too.
+imagePullSecrets: []
+
+# Replaces the chart name ("switchyard") in resource names and labels.
+nameOverride: ""
+# Replaces the whole resource name prefix (default <release>-switchyard, or
+# the release name when it contains "switchyard").
+fullnameOverride: ""
+
+serviceAccount:
+  # Create a ServiceAccount for the gateway pods. Its token is never
+  # mounted, whatever this says: the gateway never calls the Kubernetes API.
+  create: true
+  # The ServiceAccount's name. Empty means the full name when create is
+  # true, and "default" when it is false.
+  name: ""
+  # Annotations on the created ServiceAccount, for example a cloud IAM role.
+  annotations: {}
+
+# Annotations on every gateway pod. Never put secrets here: annotations are
+# readable by anyone who can read the pod.
+podAnnotations: {}
+# Labels on every gateway pod, besides the chart's own (which win on a
+# clash).
+podLabels: {}
+
+secrets:
+  # true: the chart creates the Secret <fullname> from secrets.env, and a
+  # change to it rolls the pods. false: the pods load existingSecret, which
+  # you manage (kubectl, sealed-secrets, External Secrets).
+  create: true
+  # The Secret to load when create is false. Its keys become environment
+  # variables, as secrets.env's do. Must be empty when create is true.
+  existingSecret: ""
+  # Environment variables for the chart's Secret, NAME: value, loaded with
+  # envFrom. The config refers to them as ${NAME}. Required:
+  # SWITCHYARD_ADMIN_TOKEN (at least 32 characters, no whitespace),
+  # DATABASE_URL, REDIS_CACHE_URL and REDIS_STATE_URL (may be equal). The
+  # default config also uses SWITCHYARD_API_KEY_HASH (the default tenant's
+  # key hash, from `switchyard keys generate`; required unless you override
+  # config.tenants) and, when set, OPENAI_API_KEY, ANTHROPIC_API_KEY,
+  # GEMINI_API_KEY and TOGETHER_API_KEY. Add any other variable your config
+  # references. Pass them in a separate, uncommitted file (-f secrets.yaml).
+  env: {}
+
+# Plain environment variables for the gateway container (Kubernetes EnvVar
+# entries), for example SWITCHYARD_LOG_LEVEL, SWITCHYARD_ALLOW or
+# SWITCHYARD_OPENAI_BASE_URL. Not for secrets: they are visible in the pod
+# spec.
+extraEnv: []
+# More envFrom sources for the gateway container (Kubernetes EnvFromSource
+# entries), for example a second Secret with provider keys.
+extraEnvFrom: []
+
+# The Switchyard config (docs/configuration.md), deep-merged over the
+# chart's default, files/switchyard.yaml: maps merge key by key; a list or
+# any other value replaces the default; null removes a default key. A
+# change rolls the pods, so restart-only fields apply too. Keep
+# server.listen on port 8080 and server.admin_listen on ":9090", and refer
+# to secrets as ${VAR}, never literally: rendering stops when a secret
+# field (admin_token, api_key, the Redis URLs, the ledger dsn) is not one
+# reference.
+config: {}
+
+catalog:
+  # Mount the bundled model catalog (files/catalog, a copy of
+  # configs/catalog) at /etc/switchyard/catalog, where the default config's
+  # include: ["../catalog/*.yaml"] finds it.
+  bundled: true
+  # More catalog files, as name.yaml: content, in the same ConfigMap. A file
+  # named like a bundled one (models.yaml, quality-overrides.yaml) replaces
+  # it, for example with the quality-overrides.yaml `switchyard eval fit`
+  # writes. Keep the ConfigMap under 1 MiB.
+  extraFiles: {}
+
+service:
+  # The API Service's type: ClusterIP, NodePort or LoadBalancer. It exposes
+  # only the public API port, never the admin listener (whose pod port
+  # networkPolicy guards).
+  type: ClusterIP
+  # The Service's port; the pods listen on 8080.
+  port: 8080
+  # With type NodePort, a fixed node port (30000-32767 by default); null
+  # lets Kubernetes pick one.
+  nodePort: null
+  # With type NodePort or LoadBalancer: Cluster (Kubernetes' default) or
+  # Local. Local keeps the client's address, which the gateway's
+  # per-address limit on failed authentications needs; empty leaves it to
+  # Kubernetes.
+  externalTrafficPolicy: ""
+  # Annotations on the Service, for example for a cloud load balancer.
+  annotations: {}
+
+metrics:
+  service:
+    # A separate ClusterIP Service, <fullname>-metrics, for the admin
+    # listener: /metrics, /healthz and /readyz, and /admin/v1/* behind the
+    # admin token. Keep it private (networkPolicy.metricsFrom).
+    # serviceMonitor.enabled turns it on too.
+    enabled: false
+    # The metrics Service's port; the pods listen on 9090.
+    port: 9090
+  serviceMonitor:
+    # A Prometheus Operator ServiceMonitor for the metrics Service (needs the
+    # monitoring.coreos.com CRDs). Its targets get job="switchyard", which
+    # the bundled alerts expect.
+    enabled: false
+    # How often Prometheus scrapes each pod.
+    interval: 30s
+    # Labels your Prometheus selects ServiceMonitors by, for example
+    # release: kube-prometheus-stack.
+    labels: {}
+  prometheusRule:
+    # A Prometheus Operator PrometheusRule with the alerts of
+    # deploy/prometheus/alerts.yml (bundled as files/alerts.yml), each
+    # linking to docs/runbook.md.
+    enabled: false
+    # Labels your Prometheus selects rules by.
+    labels: {}
+
+# The gateway container's resources. The CPU request is what autoscaling's
+# utilisation is measured against; the memory limit must hold the in-process
+# state and request buffers (docs/kubernetes.md, "Sizing").
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+# Probe timings. The probes always use the admin listener (port 9090), which
+# stays plain HTTP even when the public listener serves TLS.
+probes:
+  # Startup: until it first passes, the other probes wait. The listeners
+  # start once the ledger has connected to Postgres and migrated it, so the
+  # default allows 5 minutes (5s x 60).
+  startup:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 60
+  # Liveness, GET /healthz: the process is serving. Failing restarts the
+  # container.
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  # Readiness, GET /readyz: not shutting down, and every dependency check
+  # passing. Failing takes the pod out of the Service.
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+
+autoscaling:
+  # A HorizontalPodAutoscaler (autoscaling/v2) sets the replicas instead of
+  # replicaCount.
+  enabled: false
+  # The fewest replicas: keep at least 3.
+  minReplicas: 3
+  # The most replicas. Every replica shares the same Redis and Postgres, so
+  # size those for this many.
+  maxReplicas: 10
+  # Target average CPU utilisation, in percent of resources.requests.cpu.
+  # null drops the CPU metric (then set extraMetrics).
+  targetCPUUtilizationPercentage: 70
+  # More HPA metrics (autoscaling/v2 MetricSpec entries), for example
+  # switchyard_http_requests_in_flight through a Prometheus adapter.
+  extraMetrics: []
+  # The HPA's scaleUp and scaleDown behavior; {} keeps Kubernetes' defaults.
+  behavior: {}
+
+podDisruptionBudget:
+  # A PodDisruptionBudget, so node drains and other voluntary disruptions
+  # take down only a few gateway pods at once.
+  enabled: true
+  # How many gateway pods may be down at once: a number, or a percentage
+  # such as "25%".
+  maxUnavailable: 1
+
+# Topology spread constraints for the gateway pods. Empty means one default
+# constraint: spread over nodes (kubernetes.io/hostname, maxSkew 1,
+# ScheduleAnyway, per ReplicaSet). An entry without a labelSelector gets
+# the gateway pods' selector.
+topologySpreadConstraints: []
+# Affinity rules for the gateway pods (Kubernetes Affinity).
+affinity: {}
+# Node labels the gateway and test pods must match.
+nodeSelector: {}
+# Tolerations for the gateway and test pods.
+tolerations: []
+# A PriorityClass for the gateway pods; it must exist.
+priorityClassName: ""
+
+# Seconds Kubernetes waits after SIGTERM before it kills a pod. null derives
+# it from the rendered config, server.shutdown_delay + server.shutdown_grace
+# + 15 (80 with the defaults), the gateway's worst case from SIGTERM to
+# exit. Set it when those are not plain h/m/s durations (for example ${VAR}
+# references).
+terminationGracePeriodSeconds: null
+
+# More volumes for the gateway pod, for example a Secret holding TLS
+# certificates or files for ${file:/path} references.
+extraVolumes: []
+# Where extraVolumes are mounted in the gateway container; mount them
+# read-only.
+extraVolumeMounts: []
+
+networkPolicy:
+  # A NetworkPolicy for the gateway pods: ingress only on ports 8080 and
+  # 9090, from the peers below. The kubelet's probes are not affected. On by
+  # default so that the admin port 9090 (/metrics without authentication,
+  # /admin/v1/* behind the admin token) is not reachable from every
+  # namespace. It needs a network plugin that enforces NetworkPolicy; on
+  # one that does not, it does nothing and 9090 stays open cluster-wide.
+  enabled: true
+  # Peers (NetworkPolicyPeer entries) allowed to reach the API port 8080.
+  # Empty means anyone. The chart's helm test pod is always allowed.
+  ingressFrom: []
+  # Peers allowed to reach the admin port 9090 (/metrics, /admin/v1/*), for
+  # example your Prometheus. Empty means pods in the release's namespace
+  # only, so a Prometheus in another namespace must be listed here.
+  metricsFrom: []
+  # Egress rules (NetworkPolicyEgressRule entries). Empty leaves egress
+  # unrestricted, because the providers are on the internet. When set, the
+  # pods may reach only DNS (port 53) and these rules: include Redis,
+  # Postgres, every provider and the tracing endpoint.
+  egress: []
+
+tests:
+  # Resources of the helm test pod, which runs `switchyard healthcheck`
+  # against the Service.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 32Mi

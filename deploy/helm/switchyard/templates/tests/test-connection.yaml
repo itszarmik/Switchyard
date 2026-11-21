@@ -1,0 +1,58 @@
+# `helm test`: the gateway image's own healthcheck GETs /readyz through the
+# Service, so it passes when at least one ready pod serves the public API.
+# Right after `helm install --wait` kube-proxy may not have programmed the
+# Service yet, so a failed check is retried (OnFailure, with the kubelet's
+# back-off) until it passes or helm test's --timeout (5m by default) ends
+# it; `kubectl logs <pod> --previous` shows the last failure.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "switchyard.fullname" . }}-test
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: OnFailure
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: healthcheck
+      image: {{ include "switchyard.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      args:
+        - healthcheck
+        - --url
+        - http://{{ include "switchyard.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/readyz
+        - --timeout
+        - 10s
+      {{- with .Values.tests.resources }}
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}

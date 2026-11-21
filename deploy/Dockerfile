@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.29.0@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 
 # Switchyard container image: a static binary on distroless, running as a
 # non-root user. Nothing writes to the filesystem at runtime, so the image
@@ -10,13 +10,15 @@
 #
 # or use `make docker`, which also passes VERSION, COMMIT and DATE.
 #
-# Base images are pinned by the digest of their multi-arch index, so a
-# re-pushed tag cannot change the image; the tag stays for readers. To bump
-# one, resolve the new tag's index digest, with
+# Base images, and the BuildKit frontend on the syntax line, are pinned by
+# the digest of their multi-arch index, so a re-pushed tag cannot change
+# the image; the tag stays for readers. To bump one, resolve the new tag's
+# index digest, with
 #
 #   docker buildx imagetools inspect golang:1.27.N     (the "Digest:" line)
 #
-# and replace tag and digest together, in both Dockerfiles for distroless.
+# and replace tag and digest together in every Dockerfile that uses it
+# (also deploy/Dockerfile.release and test/helm/Dockerfile.fakeupstream).
 
 # ---- build ------------------------------------------------------------------
 # The build stage runs on the builder's native platform and cross-compiles,

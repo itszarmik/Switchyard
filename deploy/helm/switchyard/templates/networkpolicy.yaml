@@ -1,0 +1,55 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Ingress to the gateway pods: the API port from networkPolicy.ingressFrom
+# (anyone when empty) and the helm test pod; the admin port from
+# networkPolicy.metricsFrom (this namespace when empty). Egress is
+# restricted only when networkPolicy.egress is set.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "switchyard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "switchyard.gatewaySelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $np.egress }}
+    - Egress
+    {{- end }}
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+      {{- if $np.ingressFrom }}
+      from:
+        {{- toYaml $np.ingressFrom | nindent 8 }}
+        - podSelector:
+            matchLabels:
+              {{- include "switchyard.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: test
+      {{- end }}
+    - ports:
+        - port: admin
+          protocol: TCP
+      from:
+        {{- if $np.metricsFrom }}
+        {{- toYaml $np.metricsFrom | nindent 8 }}
+        {{- else }}
+        - podSelector: {}
+        {{- end }}
+  {{- if $np.egress }}
+  egress:
+    # DNS, wherever the cluster's resolver runs.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- toYaml $np.egress | nindent 4 }}
+  {{- end }}
+{{- end }}

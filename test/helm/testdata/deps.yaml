@@ -1,0 +1,174 @@
+# The chart's dependencies for the kind test (make helm-test), applied by
+# kind_test.go into their own namespace: the official Redis and Postgres
+# images run as root and so cannot meet Pod Security "restricted", which
+# the chart's namespace enforces. Like deploy/compose.yaml: an evictable
+# cache Redis, a non-evictable state Redis, Postgres for the usage ledger,
+# all ephemeral (emptyDir) because every run starts from a new cluster or
+# a new namespace. Plus the fake provider, so nothing calls a real one.
+#
+# Redis and Postgres are pinned to compose.yaml's version and index digest;
+# bump them together. The fake's image is built and loaded by make
+# helm-test, never pulled (imagePullPolicy: Never). Its API key comes from
+# the Secret fakeupstream, which the test creates with a random key.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres
+type: Opaque
+stringData:
+  # Throwaway: Postgres is reachable only inside the test cluster.
+  POSTGRES_PASSWORD: switchyard-e2e-not-a-secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-cache
+spec:
+  selector:
+    matchLabels: { app: redis-cache }
+  template:
+    metadata:
+      labels: { app: redis-cache }
+    spec:
+      containers:
+        - name: redis
+          image: redis:8.10@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
+          args: [redis-server, --maxmemory, 256mb, --maxmemory-policy, allkeys-lru, --save, "", --appendonly, "no"]
+          ports:
+            - { name: redis, containerPort: 6379 }
+          readinessProbe:
+            exec: { command: [redis-cli, ping] }
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cache
+spec:
+  selector: { app: redis-cache }
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-state
+spec:
+  selector:
+    matchLabels: { app: redis-state }
+  template:
+    metadata:
+      labels: { app: redis-state }
+    spec:
+      containers:
+        - name: redis
+          image: redis:8.10@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
+          args: [redis-server, --maxmemory-policy, noeviction, --appendonly, "yes"]
+          ports:
+            - { name: redis, containerPort: 6379 }
+          readinessProbe:
+            exec: { command: [redis-cli, ping] }
+            periodSeconds: 2
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-state
+spec:
+  selector: { app: redis-state }
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17.11@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
+          env:
+            - { name: POSTGRES_USER, value: switchyard }
+            - { name: POSTGRES_DB, value: switchyard }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: postgres, key: POSTGRES_PASSWORD }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            # Over TCP, as the gateway connects: the image's init phase
+            # serves the Unix socket only.
+            exec: { command: [pg_isready, -h, 127.0.0.1, -U, switchyard, -d, switchyard] }
+            periodSeconds: 2
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: { app: postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fakeupstream
+spec:
+  selector:
+    matchLabels: { app: fakeupstream }
+  template:
+    metadata:
+      labels: { app: fakeupstream }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: fakeupstream
+          image: switchyard-fakeupstream:dev
+          imagePullPolicy: Never
+          # 11 events, so a stream from the slow fake takes about 40 s:
+          # longer than a three-pod rollout, shorter than shutdown_grace.
+          args: [-listen, ":8080", -slow-listen, ":8081", -slow-chunk-delay, 4s]
+          env:
+            - name: FAKEUPSTREAM_API_KEY
+              valueFrom:
+                secretKeyRef: { name: fakeupstream, key: api-key }
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: slow, containerPort: 8081 }
+          readinessProbe:
+            tcpSocket: { port: http }
+            periodSeconds: 2
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakeupstream
+spec:
+  selector: { app: fakeupstream }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+    - { name: slow, port: 8081, targetPort: slow }

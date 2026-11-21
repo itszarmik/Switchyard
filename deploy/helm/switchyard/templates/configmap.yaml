@@ -1,0 +1,17 @@
+{{- include "switchyard.checkSecrets" . }}
+# The rendered Switchyard config, mounted as a directory at
+# /etc/switchyard/config. Secrets appear only as ${VAR} references.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "switchyard.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+data:
+  switchyard.yaml: |
+    # Rendered by the Switchyard Helm chart: the config value merged over
+    # the chart's files/switchyard.yaml. Change it through helm upgrade;
+    # an edit here is overwritten and does not roll the pods.
+    {{- include "switchyard.config" . | nindent 4 }}

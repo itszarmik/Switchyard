@@ -1,0 +1,29 @@
+# The public API (port 8080). The admin listener is never exposed here; see
+# service-metrics.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "switchyard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if and .Values.service.externalTrafficPolicy (ne .Values.service.type "ClusterIP") }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "switchyard.gatewaySelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") (not (kindIs "invalid" .Values.service.nodePort)) }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}

@@ -1,0 +1,22 @@
+{{- if or .Values.metrics.service.enabled .Values.metrics.serviceMonitor.enabled }}
+# The admin listener (port 9090) for Prometheus: /metrics, /healthz and
+# /readyz are open; /admin/v1/* needs the admin token. Keep it private
+# (networkPolicy.metricsFrom).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "switchyard.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "switchyard.gatewaySelectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.service.port }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

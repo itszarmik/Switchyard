@@ -4,6 +4,21 @@ All notable changes to Switchyard. Versions follow [Semantic
 Versioning](https://semver.org/); before 1.0, a minor version may change
 the configuration or the API.
 
+## Unreleased
+
+### Kubernetes (P9)
+
+- A Helm chart, `deploy/helm/switchyard`, for the high-availability tier:
+  3 replicas by default, Redis and Postgres you already run, secrets from a
+  Secret only, pods that pass Pod Security "restricted", a NetworkPolicy on
+  by default, a PodDisruptionBudget, optional autoscaling, ServiceMonitor
+  and PrometheusRule, and a `helm test` hook. See
+  [docs/kubernetes.md](docs/kubernetes.md).
+- A config, catalog or Secret change rolls the pods; the grace period is
+  derived from the shutdown settings.
+- `make helm-lint`, `make helm-test` (a kind cluster) and
+  `make helm-package`; CI runs them, and releases attach the packaged chart.
+
 ## v0.1.0 (2026-11-19)
 
 The first release: a cost-aware, OpenAI-compatible LLM gateway you can run

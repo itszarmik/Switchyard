@@ -1,0 +1,19 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+# The alert rules of deploy/prometheus/alerts.yml (bundled as
+# files/alerts.yml). Each alert's runbook_url links to docs/runbook.md.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "switchyard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "switchyard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- /* Read as data, not as a template, so the rules' own templates stay as they are. */}}
+  groups:
+    {{- get (.Files.Get "files/alerts.yml" | fromYaml) "groups" | toYaml | nindent 4 }}
+{{- end }}

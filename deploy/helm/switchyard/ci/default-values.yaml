@@ -1,0 +1,9 @@
+# The smallest valid install: the four required secrets, everything else
+# at the chart's defaults. The values are obviously fake test values.
+secrets:
+  env:
+    SWITCHYARD_ADMIN_TOKEN: test-admin-token-0123456789abcdefghijkl
+    DATABASE_URL: postgres://switchyard:test-password@postgres.example.invalid:5432/switchyard?sslmode=require
+    REDIS_CACHE_URL: redis://redis-cache.example.invalid:6379/0
+    REDIS_STATE_URL: redis://redis-state.example.invalid:6379/0
+    SWITCHYARD_API_KEY_HASH: sha256:0000000000000000000000000000000000000000000000000000000000000000

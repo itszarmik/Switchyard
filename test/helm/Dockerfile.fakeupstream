@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.29.0@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
+
+# The fake OpenAI-wire upstream (test/fakeupstream/cmd/fakeupstream) as an
+# image, for the Helm chart's kind test (make helm-test). Test only: it
+# never calls anything, and it is never released. Build from the
+# repository root:
+#
+#   docker build -f test/helm/Dockerfile.fakeupstream -t switchyard-fakeupstream:dev .
+#
+# The base images are deploy/Dockerfile's, pinned by the same index
+# digests (bump them together), so building this pulls nothing new. Like
+# the gateway, it runs as UID 65532 with nothing written at runtime, so it
+# meets Pod Security "restricted".
+
+FROM --platform=$BUILDPLATFORM golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+
+# The fake uses only the standard library, so no module is downloaded.
+COPY go.mod go.sum ./
+COPY test/fakeupstream/ test/fakeupstream/
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags "-s -w" -o /out/fakeupstream ./test/fakeupstream/cmd/fakeupstream
+
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
+
+COPY --from=build /out/fakeupstream /usr/local/bin/fakeupstream
+
+USER 65532:65532
+EXPOSE 8080 8081
+ENTRYPOINT ["/usr/local/bin/fakeupstream"]
