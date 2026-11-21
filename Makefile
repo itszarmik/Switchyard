@@ -231,13 +231,18 @@ helm-lint: ## Lint the Helm chart: helm lint --strict, render tests, bundled-cop
 		echo "kubeconform: skipped: kubeconform not installed"; exit 0; \
 	fi; \
 	mkdir -p $(KUBECONFORM_CACHE) || exit 1; \
-	render=$$(mktemp) || exit 1; \
-	trap 'rm -f "$$render"' EXIT; \
+	tmp=$$(mktemp -d) || exit 1; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	render="$$tmp/render.yaml"; \
 	for f in $(CHART_DIR)/ci/*-values.yaml; do \
 		for v in $(HELM_KUBE_VERSIONS); do \
 			echo "kubeconform: $$f, Kubernetes $$v"; \
 			$(HELM) template sy $(CHART_DIR) -f "$$f" --kube-version "$$v" >"$$render" || exit 1; \
-			$(KUBECONFORM) -strict -summary -kubernetes-version "$$v" -cache $(KUBECONFORM_CACHE) $(KUBECONFORM_SCHEMAS) "$$render" || exit 1; \
+			out=$$($(KUBECONFORM) -strict -summary -kubernetes-version "$$v" -cache $(KUBECONFORM_CACHE) $(KUBECONFORM_SCHEMAS) "$$render") || { echo "$$out"; exit 1; }; \
+			echo "$$out"; \
+			if echo "$$out" | grep -q '^Summary: 0 resource'; then \
+				echo "kubeconform: validated no resources (the rendered file was not read)"; exit 1; \
+			fi; \
 		done; \
 	done
 
