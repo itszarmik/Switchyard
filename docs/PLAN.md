@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P8 complete; P9 (Helm chart) committed and passing CI; its last criterion waits on the v0.2.0 release** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P9 complete** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -589,7 +589,7 @@ All three criteria pass against fake upstreams. No real provider has been called
 - [x] Rate limits are shared across the replicas: a key's limit holds however requests spread over the pods.
 - [x] `helm upgrade` with a changed config rolls the pods without a failed request under steady load, including a stream in flight.
 - [x] The pods run in a namespace that enforces Pod Security "restricted", and no secret value appears in any rendered ConfigMap or in the pod spec.
-- [ ] CI runs the lint, schema and kind install tests on every push, and the v0.2.0 release workflow attaches the packaged chart. *The CI `helm` job (lint, kubeconform, render tests, kind install) passes on GitHub since 2026-11-21. The release packaging hasn't run: v0.2.0 isn't tagged.*
+- [x] CI runs the lint, schema and kind install tests on every push, and the v0.2.0 release workflow attaches the packaged chart. *The CI `helm` job (lint, kubeconform, render tests, kind install) passes on GitHub since 2026-11-21. The v0.2.0 release (2026-11-21) ran the same checks in its read-only job and attached `switchyard-0.2.0.tgz`.*
 
 **Outcome (2026-11-20)**
 
@@ -617,7 +617,7 @@ All three criteria pass against fake upstreams. No real provider has been called
 - **Release job.** It ran a third-party setup action holding the write token; the chart is now packaged in the read-only job, which also runs kubeconform and the kind test before any release.
 - **`helm test`** could fail right after install; the test pod retries, and the e2e runs it with no wait.
 
-**Not yet run:** the release packaging on GitHub (no v0.2.0 tag yet), the chart against a real HPA with metrics-server and against the Prometheus Operator's CRDs, and Helm 3.
+**Not yet run:** the chart against a real HPA with metrics-server and against the Prometheus Operator's CRDs, and Helm 3.
 
 ## Post-MVP backlog
 
