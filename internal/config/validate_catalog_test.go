@@ -1,8 +1,10 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -462,4 +464,123 @@ models:
 	if a.Capabilities != nil || b.Capabilities == nil {
 		t.Fatalf("decoded capabilities %#v and %#v; want nil and empty", a.Capabilities, b.Capabilities)
 	}
+}
+
+// changesYAML returns a config whose one deployment, m@a, has the given
+// pricing.changes entries, each a flow mapping on a line of its own. The
+// first entry is on line 18.
+func changesYAML(changes ...string) string {
+	s := "  - id: m\n    deployments:\n      - provider: a\n        upstream_model: up\n" +
+		"        pricing:\n          input: 1\n          output: 2\n          changes:\n"
+	for _, c := range changes {
+		s += "            - " + c + "\n"
+	}
+	return catalogYAML(s, "")
+}
+
+func TestPriceChangeValidation(t *testing.T) {
+	const cp = "models[0].deployments[0].pricing.changes"
+	env := map[string]string{"FROM": "soon"}
+	at := func(w want, line int) want { w.file, w.line = rootFile, line; return w }
+	tests := []struct {
+		name  string
+		yaml  string
+		wants []want
+	}{
+		{"valid", changesYAML(`{from: 2026-12-01, input: 4, output: "20.00", cached_input: 0.2, cache_write: 5}`,
+			`{from: "2027-01-01T00:00:00-08:00", output: 30}`, `{from: 2027-02-01T12:30:00Z, cached_input: 0}`), nil},
+		{"null changes", changesYAML(), nil},
+		{"empty changes", catalogYAML("  - id: m\n    deployments: [{provider: a, upstream_model: up, pricing: {input: 1, output: 2, changes: []}}]\n", ""), nil},
+
+		// from
+		{"from missing", changesYAML(`{input: 4}`), []want{at(errAt(cp+"[0].from", "required; the time the change takes effect"), 18)}},
+		{"from malformed", changesYAML(`{from: 2026-12-1, input: 4}`),
+			[]want{at(errAt(cp+"[0].from", `must be a date as YYYY-MM-DD (00:00 UTC) or an RFC 3339 timestamp such as 2026-12-01T00:00:00-08:00, got "2026-12-1"`), 18)}},
+		{"from invalid date", changesYAML(`{from: 2026-02-30, input: 4}`), []want{errAt(cp+"[0].from", `got "2026-02-30"`)}},
+		{"from without offset", changesYAML(`{from: "2026-12-01T00:00:00", input: 4}`), []want{errAt(cp+"[0].from", "RFC 3339")}},
+		{"from with a space", changesYAML(`{from: "2026-12-01 00:00:00", input: 4}`), []want{errAt(cp+"[0].from", "RFC 3339")}},
+		{"from from a reference", changesYAML(`{from: '${FROM}', input: 4}`), []want{errAt(cp+"[0].from", "got the value of ${FROM}")}},
+		{"from not a string", changesYAML(`{from: [2026-12-01], input: 4}`), []want{errAt(cp+"[0].from", "expected a string, got a sequence")}},
+
+		// order
+		{"out of order", changesYAML(`{from: 2027-01-01, input: 4}`, `{from: 2026-12-01, input: 5}`),
+			[]want{at(errAt(cp+"[1].from", "must be later than "+cp+"[0].from; list changes in increasing order"), 19)}},
+		{"duplicate", changesYAML(`{from: 2026-12-01, input: 4}`, `{from: 2026-12-01, input: 5}`),
+			[]want{at(errAt(cp+"[1].from", "duplicates "+cp+"[0].from; each change needs a time of its own"), 19)}},
+		{"duplicate in another form", changesYAML(`{from: 2026-12-01, input: 4}`, `{from: "2026-12-01T01:00:00+01:00", input: 5}`),
+			[]want{errAt(cp+"[1].from", "duplicates "+cp+"[0].from")}},
+		{"compared with the latest", changesYAML(`{from: 2027-01-01, input: 4}`, `{from: 2026-11-01, input: 5}`, `{from: 2026-12-01, input: 6}`), []want{
+			errAt(cp+"[1].from", "must be later than "+cp+"[0].from"),
+			errAt(cp+"[2].from", "must be later than "+cp+"[0].from"),
+		}},
+		{"a malformed one is skipped", changesYAML(`{from: 2026-12-01, input: 4}`, `{from: nope, input: 5}`, `{from: 2027-01-01, input: 6}`),
+			[]want{errAt(cp+"[1].from", `got "nope"`)}},
+
+		// prices
+		{"sets nothing", changesYAML(`{from: 2026-12-01}`), []want{at(errAt(cp+"[0]", "sets no price; give at least one of input, output, cached_input and cache_write"), 18)}},
+		{"null prices set nothing", changesYAML(`{from: 2026-12-01, input: null}`), []want{errAt(cp+"[0]", "sets no price")}},
+		{"negative price", changesYAML(`{from: 2026-12-01, input: -4}`), []want{at(errAt(cp+"[0].input", "must not be negative"), 18)}},
+		{"price with an exponent", changesYAML(`{from: 2026-12-01, output: 2e1}`), []want{errAt(cp+"[0].output", "without an exponent")}},
+		{"price too precise", changesYAML(`{from: 2026-12-01, cached_input: "0.0000000001"}`), []want{errAt(cp+"[0].cached_input", "at most 9 decimal places")}},
+		{"price not a number", changesYAML(`{from: 2026-12-01, cache_write: low}`), []want{errAt(cp+"[0].cache_write", "expected a price")}},
+
+		// keys
+		// The change's own problem is not reported on top of its field's.
+		{"unknown key", changesYAML(`{from: 2026-12-01, inptu: 4}`),
+			[]want{at(errAt(cp+"[0].inptu", `unknown field (did you mean "input"?)`), 18)}},
+		{"changes not a list", catalogYAML("  - id: m\n    deployments: [{provider: a, upstream_model: up, pricing: {input: 1, output: 2, changes: {from: 2026-12-01}}}]\n", ""),
+			[]want{errAt("models[0].deployments[0].pricing.changes", "expected a sequence, got a mapping")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkProblems(t, problemsOf(t, tt.yaml, env, nil), tt.wants...)
+		})
+	}
+}
+
+func TestPriceChangeDecoding(t *testing.T) {
+	cfg := mustLoad(t, changesYAML(`{from: 2026-12-01, input: "4.00", cached_input: 0.2}`, `{from: 2027-01-01T00:00:00-08:00, cache_write: 5}`), nil, nil).Config()
+	want := []PriceChange{
+		{From: "2026-12-01", Input: mustPrice(t, "4.00"), CachedInput: mustPrice(t, "0.2")},
+		{From: "2027-01-01T00:00:00-08:00", CacheWrite: mustPrice(t, "5")},
+	}
+	if diff := cmp.Diff(want, cfg.Models[0].Deployments[0].Pricing.Changes); diff != "" {
+		t.Errorf("changes (-want +got):\n%s", diff)
+	}
+}
+
+// TestPricingKnownAtLoadTime (P10 review M2): whether a deployment's
+// prices are known is judged on the prices in force at load time
+// (LoadOptions.Now), as the catalog sees them: for the "pricing unknown"
+// warning and for the shadow judge's prices.
+func TestPricingKnownAtLoadTime(t *testing.T) {
+	before := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+	after := time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)
+	load := func(root string, at time.Time) []Problem {
+		t.Helper()
+		files := fakeFS{rootFile: root}
+		snap, err := Load(rootFile, LoadOptions{LookupEnv: envMap(nil), ReadFile: files.ReadFile, Glob: files.Glob, Now: func() time.Time { return at }})
+		if err != nil {
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatal(err)
+			}
+			return ve.Problems
+		}
+		return snap.Warnings()
+	}
+	// The output price comes from a change on 2026-11-01.
+	completed := catalogYAML("  - id: m\n    deployments: [{provider: a, upstream_model: up, pricing: {input: 1, changes: [{from: 2026-11-01, output: 2}]}}]\n", "")
+	checkProblems(t, load(completed, before), warnAt("models[0].deployments[0].pricing", MsgPricingUnknown))
+	checkProblems(t, load(completed, after))
+
+	// A judge whose only deployment gets its output price from the change.
+	judge := catalogYAML(chatModel("", "")+
+		"  - id: j\n    deployments: [{provider: a, upstream_model: j, pricing: {input: 1, changes: [{from: 2026-11-01, output: 2}]}}]\n",
+		"policies:\n  - {id: default, baseline_model: m, shadow: {sample_rate: 0.5}}\n"+
+			"evaluation: {judge: {model: j}, shadow: {daily_budget_usd: \"1\"}}\n")
+	checkProblems(t, load(judge, before),
+		errAt("evaluation.judge.model", "has no deployment with input and output prices"),
+		warnAt("models[1].deployments[0].pricing", MsgPricingUnknown))
+	checkProblems(t, load(judge, after))
 }

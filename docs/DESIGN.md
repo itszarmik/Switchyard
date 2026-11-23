@@ -577,7 +577,7 @@ Lookups go to the exact cache, then the semantic cache, then the upstream. Both 
 
 - **Eligibility:** semantic caching is enabled in the policy; the last message is a user message no longer than `max_chars` (default 2,000); there are no images or audio; `n` is 1; and the request hasn't opted out.
 - **Partition, which must match exactly:** a SHA-256 hash of the scope, resolved target, system prompts, every message before the last user message, tools, `response_format` and generation parameters. Only the last user message is compared semantically, so earlier context can never match "approximately".
-- **Vector:** the embedding of the last user message. The index name includes the embedding model and its dimension, so changing the model starts a new index rather than mixing vector spaces.
+- **Vector:** the embedding of the last user message. The index name includes the embedding deployment and its dimension, so changing the model starts a new index rather than mixing vector spaces. An unpinned embedding model resolves to its cheapest deployment that the policies permit; a price change can move that choice, which a running gateway keeps until it restarts, so a restart after the change starts a new, empty index. Pinning `model@provider` keeps it fixed.
 - **Lookup:** a k = 1 nearest-neighbor search within the partition, using Redis's query engine (HNSW index, cosine distance, a TAG filter on the partition). It's a hit only if similarity ≥ `min_similarity`, which defaults to 0.95.
 - **Time budget:** the embedding and search must finish within `lookup_timeout` (default 150 ms). A timeout counts as a miss, and so does any error.
 - **Write:** done asynchronously after a successful response, reusing the embedding from the lookup. The TTL defaults to 72 hours.
@@ -609,6 +609,7 @@ A request's cost is the sum, over each token class, of tokens × the deployment'
 | Usage missing (stream aborted, or omitted by the provider) | Nothing | Estimated from Switchyard's token estimate and the aggregated output, with `usage_estimated = true` |
 
 - The prices used are copied into each usage event, so later catalog edits never rewrite history.
+- **Dated prices.** A deployment's `pricing.changes` give announced prices with the time they take effect. The catalog resolves the prices in force when the gateway's snapshot is built, and the gateway rebuilds the snapshot at each change (§14.8), so a request is costed at the prices in force when it started. A date means 00:00 UTC; for a provider that names no time zone, switching early overstates cost for a few hours, the safer error for budgets. Every consumer (ranking, cost caps, accounting, budgets, the judge and the semantic cache's embedder) reads that one resolved price set.
 - **Money representation:** the ledger uses Postgres `NUMERIC`, which is exact decimal. Budget counters on the hot path use integer micro-USD, rounded up, which is conservative and avoids floating-point drift.
 
 ### 12.2 Usage ledger
@@ -747,8 +748,9 @@ Each deployment can set `max_concurrency`, enforced per replica. The router skip
   - **Staging has no side effects.** Health-tracker changes (new deployments, provider `max_concurrency`, latency hints) are collected while staging and applied only at commit, so a reload rejected after staging leaves nothing behind. Reloads are serialized.
   - **Keys.** The gateway snapshot is committed first, then the keyring. The gateway refuses with `401 invalid_api_key` any caller its snapshot doesn't know, so a key or tenant removed by a reload is never served, not even by a request that authenticated just before the swap.
   - **Restart-only fields** (`config.RestartOnly()`, from which docs/configuration.md is generated) are reported as `restart_required` and not applied: listeners and the other `server.*` fields except `admin_token`, TLS, `storage.*`, `logging.*`, `telemetry.*`, `cache.*`, `semantic_cache.*`, the breaker, cooldown and retry-budget settings, and `evaluation.*`. Everything else applies, including tenants and keys, policies, catalog, routing, budgets and rate limits.
-  - **Startup-only parts.** The semantic cache and the shadow runner keep their startup provider adapters, so a rotated provider key reaches them only after a restart. Deployments removed by a reload stay listed in `/admin/v1/providers` until a restart.
-  - Reloads are counted in `config_reloads_total{result}` and `config_last_reload_success_timestamp_seconds`, and audited (§15.1).
+  - **Startup-only parts.** The semantic cache and the shadow runner keep their startup provider adapters and deployments, so a rotated provider key reaches them only after a restart; their charges use their deployment's prices in force (the last known ones if a reload removes it). An unpinned judge or embedding model whose cheapest permitted deployment changes with prices therefore moves at each replica's next restart, so replicas can differ until they all restart; `switchyard eval`'s default judge makes the live choice at the time it runs. Deployments removed by a reload stay listed in `/admin/v1/providers` until a restart.
+  - **Price changes.** A timer set for the catalog's next dated price change (§12.1), and set again after every switch and reload, wakes the gateway at that time. It stages a new snapshot from the configuration in force, at the time it read, without reading the files, and commits it; health, rate limits and keys are untouched. It does not repeat the reload's judge and embedding-deployment checks: the configuration passed them, and those choices depend on prices only among the deployments the policies permit (the cheapest permitted one is picked), so a price change can never make them fail; the shadow runner and the semantic cache keep their startup deployment anyway. A check once a minute retries a failed switch and catches one the timer missed (a clock jump, a suspended machine); a failure is logged and counted. A reload reads the clock once: when a change is due it still rebuilds, even with the config unchanged, and logs and counts the switch, reporting only the dated change's prices.
+  - Reloads are counted in `config_reloads_total{result}` and `config_last_reload_success_timestamp_seconds`, and audited (§15.1). Price switches are counted in `catalog_price_switches_total{result}`, and `catalog_next_price_change_timestamp_seconds` gives the next one (0 when none is pending).
 
 ## 15. Observability
 
@@ -793,6 +795,8 @@ All metric names are prefixed `switchyard_`.
 | `ratelimit_decisions_total` | counter | kind (`request`, `stream`), result (`allowed`, `limited`, `error`) |
 | `ratelimit_auth_limited_total` | counter | none |
 | `config_reloads_total` | counter | result (`ok`, `error`) |
+| `catalog_price_switches_total` | counter | result (`ok`, `error`) |
+| `catalog_next_price_change_timestamp_seconds` | gauge | none (0 when no change is pending) |
 | `config_last_reload_success_timestamp_seconds` | gauge | none |
 | `tracing_spans_exported_total`, `tracing_spans_dropped_total` | counter | none |
 | `log_lines_dropped_total` | counter | none |
@@ -980,6 +984,8 @@ models:
       - provider: anthropic
         upstream_model: claude-sonnet-5-5
         pricing: { input: 3.00, output: 15.00, cached_input: 0.30, cache_write: 3.75 }
+        # An announced change, in block style: pricing.changes: [{from: "2027-01-01", input: 2.50}].
+        # from is a date (00:00 UTC) or an RFC 3339 time; prices a change omits are inherited.
         latency_hint: { ttft_ms: 900, tokens_per_sec: 70 }
 
   - id: text-embedding-3-small
@@ -998,6 +1004,7 @@ Validation fails fast but reports every error, not just the first. It checks tha
 - there are no unknown keys;
 - every reference resolves: deployments to providers, policies to profiles and models, aliases to targets, and the embedding model whenever any policy enables the semantic cache;
 - numbers are in range: prices ≥ 0, qualities within [0, 1], thresholds within (0, 1];
+- dated price changes have a well-formed `from`, in strictly increasing order, and each sets at least one price;
 - key hashes are well formed and unique;
 - `baseline_model` is set wherever `auto` is allowed;
 - Redis is configured whenever a feature needs it.
@@ -1166,6 +1173,7 @@ CI runs unit and component tests on every push, and integration and conformance 
 | D14 | Gateway endpoints under `/switchyard/v1`, with admin on a separate listener | Adding them under `/v1`; a single listener | Avoids collisions with future OpenAI paths and keeps admin from being exposed by accident. |
 | D15 | No payload logging; the cache is the only content store, and it's opt-in | Logging prompts for debugging | Privacy by default. Storing content is an explicit operator choice. |
 | D16 | Refusals and content filters are never retried on another provider | Treating them as retryable | Prevents policy evasion by refusal shopping. |
+| D17 | Dated prices are resolved when the catalog is built, and the gateway rebuilds its snapshot at each change, on a timer for the next one (P10, 2026-11-23) | Every consumer looking prices up by time; editing the catalog on the day; a fixed once-a-minute check (up to a minute late) | One price set per snapshot keeps ranking, caps, accounting and budgets consistent with each other, and an announced change applies on time without anyone editing the catalog. Price-dependent choices (the judge's and embedder's deployment) pick among permitted deployments only, so no price change can fail a switch or a startup. |
 
 ## 22. Risks & mitigations
 

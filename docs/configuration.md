@@ -154,12 +154,18 @@ Keys at the top level of the file. Sections that hold further keys link to their
 | `models[].deployments[].provider` | string | - | `provider` references `provider.id`. |
 | `models[].deployments[].upstream_model` | string | - | `upstream_model` is the model name sent to the provider. |
 | `models[].deployments[].pricing` | object | - | `pricing` is what this deployment costs. |
-| `models[].deployments[].pricing.input` | decimal | - | `pricing` is in USD per million tokens. A price that is not set is unknown; routing ranks deployments with unknown prices last, and `switchyard catalog lint` reports them. |
-| `models[].deployments[].pricing.output` | decimal | - | `pricing` is in USD per million tokens. A price that is not set is unknown; routing ranks deployments with unknown prices last, and `switchyard catalog lint` reports them. |
-| `models[].deployments[].pricing.cached_input` | decimal | - | `pricing` is in USD per million tokens. A price that is not set is unknown; routing ranks deployments with unknown prices last, and `switchyard catalog lint` reports them. |
-| `models[].deployments[].pricing.cache_write` | decimal | - | `pricing` is in USD per million tokens. A price that is not set is unknown; routing ranks deployments with unknown prices last, and `switchyard catalog lint` reports them. |
+| `models[].deployments[].pricing.input` | decimal | - | `input` is the price of input tokens that are not read from a cache. Every price is in USD per million tokens; one that is not set is unknown. |
+| `models[].deployments[].pricing.output` | decimal | - | `output` is the price of output tokens. |
+| `models[].deployments[].pricing.cached_input` | decimal | - | `cached_input` is the price of input tokens read from the provider's prompt cache (a cache hit). |
+| `models[].deployments[].pricing.cache_write` | decimal | - | `cache_write` is the price of input tokens written to the cache, where the provider charges one per token. |
 | `models[].deployments[].pricing.source` | string | - | `source` is the URL the prices were checked against. |
 | `models[].deployments[].pricing.checked` | string | - | `checked` is the date the prices were last checked, as YYYY-MM-DD. |
+| `models[].deployments[].pricing.changes` | list of objects | - | `changes` are announced price changes, in strictly increasing from order. Each replaces the prices it gives, from its from time on; a price it omits keeps its value from before the change. The catalog resolves the prices in force whenever the gateway builds its snapshot, and the gateway rebuilds it at each change, so costs, budgets and routing switch on time without a reload. `switchyard catalog lint` notes the next change and changes already in force, which belong in the prices above. |
+| `models[].deployments[].pricing.changes[].from` | string | - | `from` is when the change takes effect: a date as YYYY-MM-DD, which means 00:00 UTC, or an RFC 3339 timestamp with its offset, such as 2026-12-01T00:00:00-08:00, for a provider that names a time zone. Required. |
+| `models[].deployments[].pricing.changes[].input` | decimal | - | `input`, when set, is the input price from `from` on; unset keeps the one in force before the change. `output`, `cached_input` and `cache_write` work the same way. |
+| `models[].deployments[].pricing.changes[].output` | decimal | - | `output`, when set, is the output price from `from` on. |
+| `models[].deployments[].pricing.changes[].cached_input` | decimal | - | `cached_input`, when set, is the cache-read price from `from` on. |
+| `models[].deployments[].pricing.changes[].cache_write` | decimal | - | `cache_write`, when set, is the cache-write price from `from` on. |
 | `models[].deployments[].capabilities` | list of strings | - | `capabilities`, when set, replaces the model's list for this deployment (for example a host that lacks parallel tool calls). |
 | `models[].deployments[].tags` | list of strings | - | `tags` are added to the provider's tags for this deployment. |
 | `models[].deployments[].quality_offset` | number | - | `quality_offset` adjusts the model's quality priors for this deployment, e.g. -0.02 for a quantized variant. Must be in [-1, 1]. |

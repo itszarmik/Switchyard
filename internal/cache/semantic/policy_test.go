@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"switchyard/internal/cache/semantic"
 	"switchyard/internal/catalog"
@@ -13,11 +14,13 @@ import (
 	"switchyard/internal/providers/openai"
 )
 
-// TestConfiguredDeployment: the deployment the semantic cache embeds with,
-// as EmbeddingDeployment picks it, must pass the allow, deny and
-// require_tags of every policy that enables the semantic cache, and of
-// every rule whose set.cache enables it, with the rule's filters in place
-// of the policy's (security review M1).
+// TestConfiguredDeployment: the semantic cache embeds with the cheapest
+// deployment, as EmbeddingDeployment ranks them, that passes the allow,
+// deny and require_tags of every policy that enables the semantic cache,
+// and of every rule whose set.cache enables it, with the rule's filters in
+// place of the policy's (security review M1). With none, the error names
+// the cheapest and why (P10 review H1: prices only order the permitted
+// deployments).
 func TestConfiguredDeployment(t *testing.T) {
 	const semOn = "{semantic: {enabled: true}}"
 	tests := []struct {
@@ -29,15 +32,19 @@ func TestConfiguredDeployment(t *testing.T) {
 	}{
 		{"no policy enables it", "emb", `[{id: p, require_tags: [zdr]}]`, "", nil},
 		{"the cheapest deployment is permitted", "emb", `[{id: p, cache: ` + semOn + `}]`, "emb@us", nil},
-		{"the cheapest deployment lacks a required tag", "emb", `[{id: open}, {id: strict, require_tags: [zdr], cache: ` + semOn + `}]`, "",
-			[]string{`"emb" embeds on emb@us`, `policy "strict"`, "lacks required tag zdr", "model@provider"}},
+		{"the cheapest deployment lacks a required tag", "emb", `[{id: open}, {id: strict, require_tags: [zdr], cache: ` + semOn + `}]`, "emb@eu", nil},
+		{"no deployment has a required tag", "emb", `[{id: open}, {id: strict, require_tags: [apac], cache: ` + semOn + `}]`, "",
+			[]string{`"emb" embeds on emb@us`, `policy "strict"`, "lacks required tag apac", "model@provider"}},
 		{"a pinned permitted deployment", "emb@eu", `[{id: strict, require_tags: [zdr], cache: ` + semOn + `}]`, "emb@eu", nil},
-		{"denied", "emb", `[{id: p, deny: ["emb@us"], cache: ` + semOn + `}]`, "", []string{"denied by policy"}},
+		{"the cheapest denied", "emb", `[{id: p, deny: ["emb@us"], cache: ` + semOn + `}]`, "emb@eu", nil},
+		{"every deployment denied", "emb", `[{id: p, deny: ["emb@*"], cache: ` + semOn + `}]`, "", []string{"denied by policy"}},
 		{"not allowed", "emb", `[{id: p, allow: ["chat@*"], cache: ` + semOn + `}]`, "", []string{"not allowed by policy"}},
 		{"a policy without the semantic cache is not checked", "emb", `[{id: p, require_tags: [zdr], cache: {exact: {enabled: true}}}]`, "", nil},
 		{"a rule enabling it, with its own filters", "emb",
-			`[{id: p, rules: [{name: r, match: {key: k}, set: {require_tags: [zdr], cache: ` + semOn + `}}]}]`, "",
-			[]string{`policy "p", rule "r"`, "lacks required tag zdr"}},
+			`[{id: p, rules: [{name: r, match: {key: k}, set: {require_tags: [zdr], cache: ` + semOn + `}}]}]`, "emb@eu", nil},
+		{"a rule enabling it, with its own filters that permit none", "emb",
+			`[{id: p, rules: [{name: r, match: {key: k}, set: {require_tags: [apac], cache: ` + semOn + `}}]}]`, "",
+			[]string{`policy "p", rule "r"`, "lacks required tag apac"}},
 		{"a rule enabling it under the policy's filters", "emb",
 			`[{id: p, deny: ["emb@*"], rules: [{name: r, match: {key: k}, set: {cache: ` + semOn + `}}]}]`, "",
 			[]string{`rule "r"`, "denied by policy"}},
@@ -116,4 +123,33 @@ tenants:
 		adapters[p.ID] = a
 	}
 	return cfg, cat, adapters
+}
+
+// TestConfiguredDeploymentAcrossPriceChange (P10 review H1): a dated change
+// that makes a deployment the policy refuses the cheapest leaves the
+// semantic cache on the cheapest permitted one, so the config stays valid.
+func TestConfiguredDeploymentAcrossPriceChange(t *testing.T) {
+	cfg, _, adapters := loadPolicyConfig(t, "emb", `[{id: p, deny: ["emb@eu"], cache: {semantic: {enabled: true}}}]`)
+	// emb@us goes from 0.01 to 0.05, above emb@eu's 0.02, from 2026-12-01.
+	from := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	us := &cfg.Models[0].Deployments[0].Pricing
+	five, err := config.ParsePrice("0.05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	us.Changes = []config.PriceChange{{From: "2026-12-01", Input: five}}
+	for _, at := range []time.Time{from.Add(-time.Second), from} {
+		cat, err := catalog.NewAt(cfg, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d, _, err := semantic.ConfiguredDeployment(cfg, cat, adapters); err != nil || d.ID != "emb@us" {
+			t.Errorf("at %v: %v, %v; want emb@us", at, d, err)
+		}
+		// Unrestricted, the cheapest embeds.
+		want := map[bool]string{false: "emb@us", true: "emb@eu"}[!at.Before(from)]
+		if d, _, err := semantic.EmbeddingDeployment(cat, adapters, "emb"); err != nil || d.ID != want {
+			t.Errorf("at %v: EmbeddingDeployment %v, %v; want %s", at, d, err, want)
+		}
+	}
 }

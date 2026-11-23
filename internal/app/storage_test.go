@@ -382,7 +382,7 @@ func TestLedgerClosedAtShutdown(t *testing.T) {
 	yaml := storageYAML("", "") + "telemetry: {tracing: {enabled: true, endpoint: 'http://127.0.0.1:9', sample_ratio: 1}}\n"
 	a, err := newApp(loadSnapshot(t, yaml), logs, func(*config.Config, prometheus.Registerer, *slog.Logger) (storage, error) {
 		return storage{ledger: led, budgets: budget.NewMemoryStore()}, nil
-	})
+	}, systemClock)
 	if err != nil {
 		t.Fatal(err)
 	}

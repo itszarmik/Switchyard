@@ -4,6 +4,9 @@
 //
 // A Catalog is built once from a validated configuration and is immutable,
 // so one value can serve every request of a config snapshot concurrently.
+// It holds the prices in force when it was built (see NewAt): a dated
+// price change takes effect in the next catalog built from or after its
+// time, and NextPriceChange says when that is.
 // Resolve maps a client's model field to candidate deployments, and Select
 // applies the hard filters (capabilities, context window) and picks the
 // cheapest eligible candidate.
@@ -41,6 +44,9 @@ type Catalog struct {
 	byID        map[string]*Model
 	deployments map[string]*Deployment // by model@provider
 	aliases     map[string]string
+	// nextChange is the earliest dated price change after the build
+	// time, or zero.
+	nextChange time.Time
 }
 
 // Model is a logical model in the catalog.
@@ -88,10 +94,12 @@ type Deployment struct {
 	// Tags are the provider's tags followed by the deployment's, without
 	// duplicates.
 	Tags []string
-	// Pricing is what the deployment costs, as floats for ranking.
+	// Pricing is what the deployment costs, as floats for ranking: the
+	// prices in force when the catalog was built.
 	Pricing Pricing
 	// Prices are the deployment's exact prices from the config, for cost
-	// accounting.
+	// accounting: the prices in force when the catalog was built, with
+	// every price change up to then applied and no Changes.
 	Prices config.Pricing
 	// LatencyHint is the operator's latency estimate, which seeds the
 	// latency statistics until there are measurements.
@@ -174,12 +182,18 @@ func (e *NoEligibleError) Error() string {
 	return fmt.Sprintf("no eligible deployment for model %q: %s", e.Model, strings.Join(parts, "; "))
 }
 
-// New builds the catalog from cfg, which must already be validated. Each
-// of cfg.QualityOverrides replaces its model's prior for its category. New
+// New builds the catalog from cfg with the prices in force now (see
+// NewAt).
+func New(cfg *config.Config) (*Catalog, error) { return NewAt(cfg, time.Now()) }
+
+// NewAt builds the catalog from cfg, which must already be validated, with
+// each deployment's prices in force at t: its pricing with every change
+// whose from is at or before t applied (config.Pricing.At). Each of
+// cfg.QualityOverrides replaces its model's prior for its category. NewAt
 // returns an error only for inconsistencies that validation rejects, such
 // as a deployment of an undefined provider or an override of an undefined
 // model.
-func New(cfg *config.Config) (*Catalog, error) {
+func NewAt(cfg *config.Config, t time.Time) (*Catalog, error) {
 	providers := make(map[string]*config.Provider, len(cfg.Providers))
 	for i := range cfg.Providers {
 		providers[cfg.Providers[i].ID] = &cfg.Providers[i]
@@ -220,6 +234,10 @@ func New(cfg *config.Config) (*Catalog, error) {
 			if p == nil {
 				return nil, fmt.Errorf("catalog: model %q: unknown provider %q", cm.ID, cd.Provider)
 			}
+			prices := cd.Pricing.At(t)
+			if _, next, ok := cd.Pricing.NextChange(t); ok && (c.nextChange.IsZero() || next.Before(c.nextChange)) {
+				c.nextChange = next
+			}
 			d := &Deployment{
 				ID:            cm.ID + "@" + cd.Provider,
 				Model:         m,
@@ -229,13 +247,13 @@ func New(cfg *config.Config) (*Catalog, error) {
 				Capabilities:  m.Capabilities,
 				Tags:          mergeTags(p.Tags, cd.Tags),
 				Pricing: Pricing{
-					Input:       cd.Pricing.Input.Float64(),
-					Output:      cd.Pricing.Output.Float64(),
-					CachedInput: cd.Pricing.CachedInput.Float64(),
-					CacheWrite:  cd.Pricing.CacheWrite.Float64(),
-					Known:       config.PricingKnown(m.Type, cd.Pricing),
+					Input:       prices.Input.Float64(),
+					Output:      prices.Output.Float64(),
+					CachedInput: prices.CachedInput.Float64(),
+					CacheWrite:  prices.CacheWrite.Float64(),
+					Known:       config.PricingKnown(m.Type, prices),
 				},
-				Prices: cd.Pricing,
+				Prices: prices,
 				LatencyHint: LatencyHint{
 					TTFT:         time.Duration(cd.LatencyHint.TTFTMs) * time.Millisecond,
 					TokensPerSec: cd.LatencyHint.TokensPerSec,
@@ -494,6 +512,15 @@ func lacksReason(caps []schema.Capability) string {
 	}
 	return "lacks capabilities " + strings.Join(names, ", ")
 }
+
+// Deployment returns the deployment with the given id, model@provider, or
+// nil.
+func (c *Catalog) Deployment(id string) *Deployment { return c.deployments[id] }
+
+// NextPriceChange returns the time of the earliest dated price change
+// after the catalog's build time, from which a newly built catalog has
+// the changed prices, or the zero time if none is pending.
+func (c *Catalog) NextPriceChange() time.Time { return c.nextChange }
 
 // Models returns every model in catalog order. The slice belongs to the
 // caller; the models do not.

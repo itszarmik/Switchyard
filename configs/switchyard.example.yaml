@@ -579,10 +579,14 @@ cache:
 # charged to its budgets: pick a provider your data-handling terms allow
 # for prompts. Every policy that enables the semantic cache must permit
 # the deployment by its allow, deny and require_tags. Changing the model
-# (or its dimensions) starts a new, empty vector index.
+# (or its dimensions) starts a new, empty vector index. With a model id,
+# a price change can make another permitted deployment the cheapest; a
+# running gateway keeps its embedder, so the move takes effect at the next
+# restart and starts a new, empty index. Pin model@provider to keep it.
 # semantic_cache:
 #   # An embedding model id, or model@provider to pin one deployment;
-#   # otherwise its cheapest priced deployment embeds.
+#   # otherwise its cheapest priced deployment that every policy enabling
+#   # the semantic cache permits embeds.
 #   embedding_model: text-embedding-3-small
 #   # The embedding and vector search must finish within this, or the
 #   # lookup is a miss. Default 150ms, at most 5s.
@@ -594,7 +598,10 @@ cache:
 evaluation:
   judge:
     # The judge model: a catalog chat model, or model@provider to pin one
-    # deployment; otherwise its cheapest priced deployment judges. Use a
+    # deployment; otherwise its cheapest priced deployment that every
+    # sampling policy permits judges (also for `switchyard eval`). A price
+    # change can move that choice to another permitted deployment at the
+    # next restart; pin model@provider to keep it fixed. Use a
     # strong model, at least as capable as the baselines, with known prices
     # (its calls count against the shadow budget). It receives the prompts
     # and both answers.

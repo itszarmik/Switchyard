@@ -44,8 +44,12 @@ type Options struct {
 	// Adapter calls the judge deployment's provider.
 	Adapter providers.Adapter
 	// Deployment is the judge deployment. Its prices give Verdict.CostNano
-	// and CallCostNano.
+	// and CallCostNano, unless Prices is set.
 	Deployment *catalog.Deployment
+	// Prices, when set, returns the judge deployment's prices in force; it
+	// is read at each call and each estimate, so that new prices (a
+	// reload, a dated price change) reach the judge's charges at once.
+	Prices func() config.Pricing
 	// MaxTokens bounds each judge completion; 0 means DefaultMaxTokens.
 	MaxTokens int64
 	// Timeout bounds each judge call; 0 means DefaultTimeout.
@@ -60,6 +64,7 @@ type Options struct {
 type LLM struct {
 	adapter   providers.Adapter
 	dep       *catalog.Deployment
+	prices    func() config.Pricing
 	maxTokens int64
 	timeout   time.Duration
 }
@@ -80,7 +85,11 @@ func NewLLM(opts Options) (*LLM, error) {
 	case opts.Timeout < 0:
 		return nil, errors.New("judge: Timeout must not be negative")
 	}
-	j := &LLM{adapter: opts.Adapter, dep: opts.Deployment, maxTokens: opts.MaxTokens, timeout: opts.Timeout}
+	j := &LLM{adapter: opts.Adapter, dep: opts.Deployment, prices: opts.Prices, maxTokens: opts.MaxTokens, timeout: opts.Timeout}
+	if j.prices == nil {
+		dep := opts.Deployment
+		j.prices = func() config.Pricing { return dep.Prices }
+	}
 	if j.maxTokens == 0 {
 		j.maxTokens = DefaultMaxTokens
 	}
@@ -276,7 +285,7 @@ func (j *LLM) call(ctx context.Context, req *schema.ChatRequest, acc *costAcc, m
 	case err != nil:
 		charge = est
 	default:
-		charge = callCost(resp.Usage, j.dep.Prices, est)
+		charge = callCost(resp.Usage, j.prices(), est)
 	}
 	acc.add(charge)
 	if m != nil {
@@ -309,7 +318,7 @@ func callCost(u *schema.Usage, p config.Pricing, est int64) int64 {
 
 // estimate is the cost bound of one call with req (see CallCostNano).
 func (j *LLM) estimate(req *schema.ChatRequest) int64 {
-	return EstimateNano(j.dep, router.InputTokenBound(req), j.maxTokens)
+	return estimateNano(j.prices(), router.InputTokenBound(req), j.maxTokens)
 }
 
 // CallCostNano estimates, in nano-USD rounded up, the worst case of one
@@ -331,12 +340,17 @@ func (j *LLM) CallCostNano(p Pair) int64 {
 // price, whichever is higher, plus maxOutput tokens at the output price.
 // It returns -1 when d's prices are unknown.
 func EstimateNano(d *catalog.Deployment, inputTokens, maxOutput int64) int64 {
+	return estimateNano(d.Prices, inputTokens, maxOutput)
+}
+
+// estimateNano is EstimateNano at the prices p.
+func estimateNano(p config.Pricing, inputTokens, maxOutput int64) int64 {
 	in, out := max(inputTokens, 0), max(maxOutput, 0)
-	plain, ok := usage.Cost(usage.Tokens{Input: in, Output: out}, d.Prices)
+	plain, ok := usage.Cost(usage.Tokens{Input: in, Output: out}, p)
 	if !ok {
 		return -1
 	}
-	if written, ok := usage.Cost(usage.Tokens{CacheWrite: in, Output: out}, d.Prices); ok && written.Cmp(plain) > 0 {
+	if written, ok := usage.Cost(usage.Tokens{CacheWrite: in, Output: out}, p); ok && written.Cmp(plain) > 0 {
 		plain = written
 	}
 	return plain.NanoUSDCeil()

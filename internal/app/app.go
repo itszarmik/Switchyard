@@ -42,6 +42,11 @@
 // with semantic_cache.embedding_model called through the gateway's
 // adapters. POST /admin/v1/cache/purge purges a tenant.
 //
+// Dated catalog price changes (pricing.changes) take effect at their time
+// without a reload: a timer for the catalog's next change, with a check
+// once a minute as the retry, rebuilds the gateway's snapshot from the
+// configuration in force (see switchPrices).
+//
 // When a policy sets shadow.sample_rate > 0, a shadow.Runner evaluates the
 // sampled requests in the background, with the judge
 // (evaluation.judge.model) and the comparison deployments called through
@@ -109,6 +114,14 @@ type App struct {
 	rlimiter *ratelimit.RedisLimiter
 	// tracing is the tracer provider, shut down after the server drains.
 	tracing *tracing.Provider
+	// clock is the gateway's clock and the price-change check's ticker;
+	// priceChecked, when set (by tests, before Run), is called after each
+	// check with switchPrices' result.
+	clock        clock
+	priceChecked func(error)
+	// pricesRearm tells the price-change check that a reload replaced the
+	// catalog, so that it sets its timer for the new next change.
+	pricesRearm chan struct{}
 	// logWriter queues the log lines for a background goroutine; Run
 	// closes it last, after everything else has logged.
 	logWriter *telemetry.AsyncWriter
@@ -171,7 +184,7 @@ func cacheRedisIOTimeout(cfg *config.Config) time.Duration {
 // loaded configuration: "config loaded" at INFO, each snapshot warning at
 // WARN and the effective configuration at DEBUG.
 func New(snap *config.Snapshot, logOutput io.Writer, load Loader) (*App, error) {
-	a, err := newApp(snap, logOutput, openStorage)
+	a, err := newApp(snap, logOutput, openStorage, systemClock)
 	if err != nil {
 		return nil, err
 	}
@@ -246,11 +259,11 @@ func openStorage(cfg *config.Config, reg prometheus.Registerer, logger *slog.Log
 	return storage{ledger: led, budgets: budgets, redis: rdb, cache: caches, cacheRedis: cacheRdb}, nil
 }
 
-// newApp is New with the storage opened by open. The log output is
-// wrapped in an asynchronous writer (telemetry.AsyncWriter), so writing
-// the access log never blocks a request; on error newApp closes it, so the
-// lines logged so far are written.
-func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*App, error) {
+// newApp is New with the storage opened by open and the clock clk. The log
+// output is wrapped in an asynchronous writer (telemetry.AsyncWriter), so
+// writing the access log never blocks a request; on error newApp closes
+// it, so the lines logged so far are written.
+func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener, clk clock) (*App, error) {
 	if snap == nil {
 		return nil, errors.New("app: nil config snapshot")
 	}
@@ -259,7 +272,7 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 	}
 	// Audit lines wait for room in a full queue rather than being dropped.
 	logWriter := telemetry.NewAsyncWriter(logOutput, telemetry.AsyncOptions{Durable: server.IsAuditLine})
-	a, err := buildApp(snap, logWriter, open)
+	a, err := buildApp(snap, logWriter, open, clk)
 	if err != nil {
 		closeLogWriter(logWriter)
 		return nil, err
@@ -269,7 +282,7 @@ func newApp(snap *config.Snapshot, logOutput io.Writer, open storageOpener) (*Ap
 }
 
 // buildApp is newApp with the log output wrapped in logWriter.
-func buildApp(snap *config.Snapshot, logWriter *telemetry.AsyncWriter, open storageOpener) (*App, error) {
+func buildApp(snap *config.Snapshot, logWriter *telemetry.AsyncWriter, open storageOpener, clk clock) (*App, error) {
 	cfg := snap.Config()
 
 	level, err := telemetry.ParseLevel(cfg.Logging.Level)
@@ -337,7 +350,8 @@ func buildApp(snap *config.Snapshot, logWriter *telemetry.AsyncWriter, open stor
 		return nil, err
 	}
 	led, rdb := st.ledger, st.redis
-	a := &App{log: logger, srv: srv, ledger: led, redis: rdb, cacheRedis: st.cacheRedis, tracing: tp}
+	a := &App{log: logger, srv: srv, ledger: led, redis: rdb, cacheRedis: st.cacheRedis, tracing: tp, clock: clk,
+		pricesRearm: make(chan struct{}, 1)}
 	a.budgetFailClosed.Store(cfg.Budgets.FailMode == config.BudgetFailClosed)
 	a.limits.Store(ratelimit.NewLimits(cfg))
 	enf, af, err := a.newRateLimits(rdb, registry)
@@ -362,7 +376,7 @@ func buildApp(snap *config.Snapshot, logWriter *telemetry.AsyncWriter, open stor
 
 	gw, err := gateway.New(gateway.Options{
 		Config: cfg, Logger: logger, Registry: registry,
-		Ledger: led, Budgets: st.budgets, BudgetStoreCheck: budgetCheck, ConfigVersion: snap.Version(),
+		Clock: clk.now, Ledger: led, Budgets: st.budgets, BudgetStoreCheck: budgetCheck, ConfigVersion: snap.Version(),
 		Cache: st.cache, Streams: enf, PropagateTrace: cfg.Telemetry.Tracing.Enabled && cfg.Telemetry.Tracing.PropagateUpstream,
 	})
 	if err != nil {
@@ -378,7 +392,7 @@ func buildApp(snap *config.Snapshot, logWriter *telemetry.AsyncWriter, open stor
 		}
 		gw.SetSemanticCache(sc, dep)
 	}
-	if a.shadow, err = newShadowRunner(cfg, gw, st.budgets, led, registry, logger); err != nil {
+	if a.shadow, err = newShadowRunner(cfg, gw, st.budgets, led, registry, logger, clk.now); err != nil {
 		_ = a.closeStorage(context.Background())
 		return nil, fmt.Errorf("app: %w", err)
 	}
@@ -420,10 +434,16 @@ func buildApp(snap *config.Snapshot, logWriter *telemetry.AsyncWriter, open stor
 		_ = a.closeStorage(context.Background())
 		return nil, err
 	}
+	priceSwitches, err := newPriceMetrics(registry, func() time.Time { return gw.Catalog().NextPriceChange() })
+	if err != nil {
+		_ = a.closeStorage(context.Background())
+		return nil, err
+	}
 	a.reload = reloader{
-		start: cfg, running: snap.Version(), secrets: cfg.SecretValues(), keys: keys,
+		start: cfg, cfg: cfg, running: snap.Version(), secrets: cfg.SecretValues(), keys: keys,
+		stage:     gw.StageAt,
 		hasShadow: a.shadow != nil, hasSemantic: semanticEnabled(cfg),
-		now: time.Now, total: total, lastSuccess: lastSuccess,
+		now: time.Now, total: total, lastSuccess: lastSuccess, priceSwitches: priceSwitches,
 	}
 	lastSuccess.Set(float64(time.Now().UnixNano()) / 1e9)
 	srv.HandleAdmin(reloadEndpoint, a.reloadHandler())
@@ -529,11 +549,13 @@ const (
 // evaluation.judge.model, pinned to one deployment (a model@provider, or
 // the model's cheapest priced deployment) that every sampling policy must
 // permit (eval.ShadowJudge), called through the gateway's
-// adapter; the comparison calls use the gateway's adapters too. Shadow
+// adapter; the comparison calls use the gateway's adapters too.
+// The judge's charges use its deployment's prices in force (livePrices). Shadow
 // spend is charged to the budget store (through its circuit, with Redis),
-// and the results go to the usage ledger.
+// in the daily window of now, the App's clock, and the results go to the
+// usage ledger.
 func newShadowRunner(cfg *config.Config, gw *gateway.Gateway, budgets budget.Store, store usage.ShadowStore,
-	reg prometheus.Registerer, logger *slog.Logger) (*shadow.Runner, error) {
+	reg prometheus.Registerer, logger *slog.Logger, now func() time.Time) (*shadow.Runner, error) {
 	dep, err := eval.ShadowJudge(gw.Catalog(), cfg)
 	if err != nil || dep == nil {
 		return nil, err
@@ -545,7 +567,7 @@ func newShadowRunner(cfg *config.Config, gw *gateway.Gateway, budgets budget.Sto
 	}
 	// The judge answers within judge.DefaultMaxTokens, whatever
 	// max_output_tokens caps the comparison answer at.
-	j, err := judge.NewLLM(judge.Options{Adapter: adapter, Deployment: dep})
+	j, err := judge.NewLLM(judge.Options{Adapter: adapter, Deployment: dep, Prices: livePrices(gw, dep)})
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +575,7 @@ func newShadowRunner(cfg *config.Config, gw *gateway.Gateway, budgets budget.Sto
 		Adapters: gw.Adapter, Judge: j, JudgeDeployment: dep,
 		Budgets: budgets, DailyBudgetUSD: s.DailyBudgetUSD, Store: store,
 		Concurrency: s.Concurrency, MaxOutputTokens: s.MaxOutputTokens,
-		Registerer: reg, Logger: logger.With("component", "shadow"),
+		Registerer: reg, Logger: logger.With("component", "shadow"), Now: now,
 	})
 	if err != nil {
 		return nil, err
@@ -703,7 +725,8 @@ func newCacheStorage(cfg *config.Config, state *redis.Client, logger *slog.Logge
 // adapter, and a vector index named after that deployment and its
 // dimensions, in the cache instance when client is set (the query engine
 // indexes only database 0, which validation enforces) and in memory
-// otherwise.
+// otherwise. Embeddings are priced at the embedding deployment's
+// prices in force (livePrices).
 func newSemanticCache(cfg *config.Config, gw *gateway.Gateway, client *redis.Client, logger *slog.Logger) (*semantic.Cache, *catalog.Deployment, error) {
 	adapters := make(map[string]providers.Adapter, len(cfg.Providers))
 	for _, p := range cfg.Providers {
@@ -716,7 +739,7 @@ func newSemanticCache(cfg *config.Config, gw *gateway.Gateway, client *redis.Cli
 		return nil, nil, err
 	}
 	timeout := cfg.SemanticCache.LookupTimeout.Std()
-	e := semantic.NewEmbedder(emb, dep, dep.Model.Dimensions, timeout)
+	e := semantic.NewEmbedder(emb, dep, dep.Model.Dimensions, timeout).WithPrices(livePrices(gw, dep))
 	var idx cache.VectorIndex
 	index := "memory"
 	if client != nil {
@@ -786,7 +809,10 @@ func (a *App) Run(ctx, forceCtx context.Context) error {
 		"date", info.Date,
 		"go_version", info.GoVersion,
 	)
+	// Dated price changes take effect while the server runs.
+	stopPrices := a.watchPrices(ctx)
 	err := a.srv.Run(ctx, forceCtx)
+	stopPrices()
 	// The server has drained: no request records events any more. What
 	// follows is bounded by PostDrainTimeout in all, in this order: the
 	// shadow samples (which charge budgets and record usage events) and

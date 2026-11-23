@@ -65,34 +65,65 @@ func Pin(cat *catalog.Catalog, name string) (*catalog.Deployment, error) {
 	return nil, fmt.Errorf("eval: model %q has no deployment with known prices; name one as model@provider", name)
 }
 
-// ShadowJudge pins the shadow sampling judge, evaluation.judge.model, as
-// the runtime does (Pin), and checks that every policy of cfg that samples
-// (shadow.sample_rate > 0) permits that exact deployment by its allow,
-// deny and require_tags (router.PolicyReason): every sample goes to it,
-// and a policy that refuses it would drop all of its samples. It returns
-// nil and no error when no policy samples. Both `switchyard serve` and
-// `config validate` call it, so a config that would judge nothing is
-// rejected before it runs.
+// ShadowJudge pins the shadow sampling judge, evaluation.judge.model, with
+// JudgeDeployment. It returns nil and no error when no policy samples
+// (shadow.sample_rate > 0). Both `switchyard serve` and `config validate`
+// call it, so a config that would judge nothing is rejected before it
+// runs.
 func ShadowJudge(cat *catalog.Catalog, cfg *config.Config) (*catalog.Deployment, error) {
 	if !slices.ContainsFunc(cfg.Policies, func(p config.Policy) bool { return p.Shadow.SampleRate > 0 }) {
 		return nil, nil
 	}
-	name := cfg.Evaluation.Judge.Model
+	return JudgeDeployment(cat, cfg, cfg.Evaluation.Judge.Model)
+}
+
+// JudgeDeployment pins the judge model name, as evaluation.judge.model, to
+// one deployment that every policy of cfg that samples (shadow.sample_rate
+// > 0) permits by its allow, deny and require_tags (router.PolicyReason):
+// every sample goes to it, and a policy that refuses it would drop all of
+// its samples. A model@provider is that deployment; a model id or alias
+// is its cheapest deployment with known prices among those every sampling
+// policy permits, as Pin ranks them. Prices only order the permitted
+// deployments, so a price change (a dated one included) can move the pick
+// between them but never make the configuration invalid. With no sampling
+// policy it is Pin's choice. Shadow sampling and `switchyard eval`'s
+// default judge both use it, so evaluation.judge.model means the same
+// deployment offline and live.
+func JudgeDeployment(cat *catalog.Catalog, cfg *config.Config, name string) (*catalog.Deployment, error) {
+	refusal := func(d *catalog.Deployment) error {
+		for i := range cfg.Policies {
+			p := &cfg.Policies[i]
+			if !(p.Shadow.SampleRate > 0) {
+				continue
+			}
+			eff := policy.Effective{Allow: p.Allow, Deny: p.Deny, RequireTags: p.RequireTags}
+			if why := router.PolicyReason(&eff, d); why != "" {
+				return fmt.Errorf("evaluation.judge.model: %q runs on %s (the deployment shadow sampling pins it to), "+
+					"which policy %q samples to but does not permit (%s); name a permitted deployment, as evaluation.judge.model: model@provider",
+					name, d.ID, p.ID, why)
+			}
+		}
+		return nil
+	}
+	res, err := cat.Resolve(name)
+	if err == nil && !res.Pinned && res.Model.Type == config.ModelTypeChat {
+		// The cheapest permitted deployment with known prices, ranked as Pin
+		// ranks them.
+		if r, err := cat.Rank(res, schema.CapabilitySet{}, 1000, 500, true); err == nil {
+			for _, c := range r.Candidates {
+				if c.Deployment.Pricing.Known && refusal(c.Deployment) == nil {
+					return c.Deployment, nil
+				}
+			}
+		}
+	}
+	// A pinned judge, or none permitted: Pin's choice and its error.
 	d, err := Pin(cat, name)
 	if err != nil {
 		return nil, fmt.Errorf("evaluation.judge.model: %w", err)
 	}
-	for i := range cfg.Policies {
-		p := &cfg.Policies[i]
-		if !(p.Shadow.SampleRate > 0) {
-			continue
-		}
-		eff := policy.Effective{Allow: p.Allow, Deny: p.Deny, RequireTags: p.RequireTags}
-		if why := router.PolicyReason(&eff, d); why != "" {
-			return nil, fmt.Errorf("evaluation.judge.model: %q runs on %s (the deployment shadow sampling pins it to), "+
-				"which policy %q samples to but does not permit (%s); name a permitted deployment, as evaluation.judge.model: model@provider",
-				name, d.ID, p.ID, why)
-		}
+	if err := refusal(d); err != nil {
+		return nil, err
 	}
 	return d, nil
 }
@@ -105,7 +136,13 @@ type Target struct {
 
 // NewTarget pins name (see Pin) and pairs it with its provider's adapter.
 func NewTarget(cat *catalog.Catalog, adapters map[string]providers.Adapter, name string) (Target, error) {
-	d, err := Pin(cat, name)
+	return NewTargetFor(adapters, func() (*catalog.Deployment, error) { return Pin(cat, name) })
+}
+
+// NewTargetFor pairs the deployment pin returns with its provider's
+// adapter.
+func NewTargetFor(adapters map[string]providers.Adapter, pin func() (*catalog.Deployment, error)) (Target, error) {
+	d, err := pin()
 	if err != nil {
 		return Target{}, err
 	}

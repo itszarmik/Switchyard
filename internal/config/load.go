@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -33,6 +34,10 @@ type LoadOptions struct {
 	// postgres:// URL when the reference is the whole URL). References in
 	// other settings resolve as usual.
 	SecretPlaceholders bool
+	// Now is the time validation resolves dated prices (pricing.changes)
+	// at, to tell whether a deployment's prices are known, as the catalog
+	// built then would. Nil means time.Now.
+	Now func() time.Time
 	// Overrides are applied after the files are merged and defaults are set,
 	// and before validation, so precedence is defaults < files < Overrides.
 	// Supported keys: "server.listen", "server.admin_listen", "logging.level".
@@ -139,6 +144,8 @@ type position struct {
 // loadState carries everything one Load call accumulates.
 type loadState struct {
 	opts LoadOptions
+	// now is LoadOptions.Now, read once.
+	now time.Time
 	// readRefFile reads the file of a ${file:…} reference.
 	readRefFile func(name string) ([]byte, error)
 	root        string // the root path as passed to Load
@@ -183,8 +190,12 @@ func newLoadState(root string, opts LoadOptions) *loadState {
 	if opts.Glob == nil {
 		opts.Glob = filepath.Glob
 	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
 	return &loadState{
 		opts:        opts,
+		now:         opts.Now(),
 		readRefFile: refFile,
 		root:        root,
 		fileOf:      make(map[*yaml.Node]string),

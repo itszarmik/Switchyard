@@ -306,3 +306,38 @@ func TestEvalFitWeights(t *testing.T) {
 	}
 	t.Logf("%s", stdout)
 }
+
+// TestEvalDefaultJudgeIsTheShadowJudge (P10 review N3): eval's default
+// judge, evaluation.judge.model, is the deployment shadow sampling judges
+// on, the cheapest one every sampling policy permits, not the model's
+// cheapest.
+func TestEvalDefaultJudgeIsTheShadowJudge(t *testing.T) {
+	srv := fakejudge.New(equalAnswers)
+	defer srv.Close()
+	cfgText := evalConfig(srv.BaseURL(), "")
+	cfgText = strings.Replace(cfgText, "models:\n", "  - {id: cheap, type: openai, base_url: \""+srv.BaseURL()+"\", api_key: '${FAKE_KEY:-}'}\nmodels:\n", 1)
+	cfgText = strings.Replace(cfgText, `    deployments: [{provider: fake, upstream_model: judge-up, pricing: {input: "1", output: "2"}}]`,
+		`    deployments:
+      - {provider: fake, upstream_model: judge-up, pricing: {input: "1", output: "2"}}
+      - {provider: cheap, upstream_model: judge-up, pricing: {input: "0.5", output: "1"}}`, 1)
+	cfgText = strings.Replace(cfgText, "  judge: {model: judge}\n", "  judge: {model: judge}\n  shadow: {daily_budget_usd: \"1\"}\n", 1)
+	cfgText = strings.Replace(cfgText, "  - {id: default, baseline_model: large}",
+		"  - {id: default, baseline_model: large, allow: [small@fake, large@fake, judge@fake], shadow: {sample_rate: 0.1}}", 1)
+	cfg := filepath.Join(t.TempDir(), "switchyard.yaml")
+	if err := os.WriteFile(cfg, []byte(cfgText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"eval", "run", "-c", cfg, "--prompts", starterPrompts, "--candidates", "small",
+		"--reference", "large", "--max-cost-usd", "5", "--out", filepath.Join(t.TempDir(), "r.jsonl"), "--dry-run"}
+	for _, extra := range [][]string{nil, {"--judge", "judge"}} {
+		code, out, errOut := runCLI(t, env{}, append(args, extra...)...)
+		if code != exitOK || !strings.Contains(out, "; judge judge@fake\n") {
+			t.Errorf("%v: exit %d, want judge judge@fake\n%s\n%s", extra, code, out, errOut)
+		}
+	}
+	// Naming the deployment picks it, as for any target.
+	code, out, errOut := runCLI(t, env{}, append(args, "--judge", "judge@cheap")...)
+	if code != exitOK || !strings.Contains(out, "; judge judge@cheap\n") {
+		t.Errorf("--judge judge@cheap: exit %d\n%s\n%s", code, out, errOut)
+	}
+}

@@ -292,14 +292,51 @@ type Deployment struct {
 // routing ranks deployments with unknown prices last, and `switchyard
 // catalog lint` reports them.
 type Pricing struct {
-	Input       Price `yaml:"input"`
-	Output      Price `yaml:"output"`
+	// Input is the price of input tokens that are not read from a cache.
+	// Every price is in USD per million tokens; one that is not set is
+	// unknown.
+	Input Price `yaml:"input"`
+	// Output is the price of output tokens.
+	Output Price `yaml:"output"`
+	// CachedInput is the price of input tokens read from the provider's
+	// prompt cache (a cache hit).
 	CachedInput Price `yaml:"cached_input"`
-	CacheWrite  Price `yaml:"cache_write"`
+	// CacheWrite is the price of input tokens written to the cache, where
+	// the provider charges one per token.
+	CacheWrite Price `yaml:"cache_write"`
 	// Source is the URL the prices were checked against.
 	Source string `yaml:"source"`
 	// Checked is the date the prices were last checked, as YYYY-MM-DD.
 	Checked string `yaml:"checked"`
+	// Changes are announced price changes, in strictly increasing from
+	// order. Each replaces the prices it gives, from its from time on; a
+	// price it omits keeps its value from before the change. The
+	// catalog resolves the prices in force whenever the gateway builds
+	// its snapshot, and the gateway rebuilds it at each change, so costs,
+	// budgets and routing switch on time without a reload. `switchyard
+	// catalog lint` notes the next change and changes already in force,
+	// which belong in the prices above.
+	Changes []PriceChange `yaml:"changes"`
+}
+
+// PriceChange is a dated change of a deployment's prices, in USD per
+// million tokens. It must set at least one price.
+type PriceChange struct {
+	// From is when the change takes effect: a date as YYYY-MM-DD, which
+	// means 00:00 UTC, or an RFC 3339 timestamp with its offset, such as
+	// 2026-12-01T00:00:00-08:00, for a provider that names a time zone.
+	// Required.
+	From string `yaml:"from"`
+	// Input, when set, is the input price from From on; unset keeps the
+	// one in force before the change. Output, CachedInput and CacheWrite
+	// work the same way.
+	Input Price `yaml:"input"`
+	// Output, when set, is the output price from From on.
+	Output Price `yaml:"output"`
+	// CachedInput, when set, is the cache-read price from From on.
+	CachedInput Price `yaml:"cached_input"`
+	// CacheWrite, when set, is the cache-write price from From on.
+	CacheWrite Price `yaml:"cache_write"`
 }
 
 // Price is a non-negative decimal amount of USD per million tokens, written

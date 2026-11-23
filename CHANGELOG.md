@@ -4,6 +4,33 @@ All notable changes to Switchyard. Versions follow [Semantic
 Versioning](https://semver.org/); before 1.0, a minor version may change
 the configuration or the API.
 
+## Unreleased
+
+### Catalog (P10)
+
+- Dated price changes: `pricing.changes` lists a deployment's announced
+  price changes, each from a date (00:00 UTC) or an RFC 3339 timestamp,
+  inheriting the prices it does not give. The gateway puts each change in
+  force at its time, without a reload or a restart: costs,
+  budgets and routing switch together. New metrics
+  `switchyard_catalog_price_switches_total{result}` and
+  `switchyard_catalog_next_price_change_timestamp_seconds`, and the alert
+  `SwitchyardCatalogPriceSwitchFailed` (runbook: "Catalog price change
+  failed"). The shadow judge and the semantic cache's embedder charge at
+  their deployment's prices in force too.
+- Behaviour change: an unpinned `evaluation.judge.model` or
+  `semantic_cache.embedding_model` whose cheapest deployment a policy
+  refuses now uses the cheapest deployment the policies permit (possibly a
+  pricier provider) instead of failing validation; pin `model@provider` to
+  choose one. `switchyard eval`'s default judge makes the same choice as
+  shadow sampling.
+- `switchyard catalog lint` notes each deployment's next price change and
+  any change already in force (to fold into the base prices); neither
+  fails it.
+- The shipped catalog has Google's announced changes: `gemini-4-carbon`
+  from 2026-12-01 (4.00 / 20.00 / 0.20) and `gemini-3.8-flash` from
+  2027-01-01 (1.50 / 7.50 / 0.15).
+
 ## v0.2.0 (2026-11-21)
 
 Adds a Helm chart for running Switchyard on Kubernetes. The gateway itself

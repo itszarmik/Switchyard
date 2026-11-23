@@ -25,6 +25,7 @@ import (
 type Embedder struct {
 	adapter providers.Embedder
 	dep     *catalog.Deployment
+	prices  func() config.Pricing
 	dims    int
 	timeout time.Duration
 }
@@ -35,7 +36,16 @@ var _ cache.Embedder = (*Embedder)(nil)
 // provider's). Vectors must have dims values. timeout, when positive,
 // bounds each call on top of the caller's context.
 func NewEmbedder(adapter providers.Embedder, dep *catalog.Deployment, dims int, timeout time.Duration) *Embedder {
-	return &Embedder{adapter: adapter, dep: dep, dims: dims, timeout: timeout}
+	return &Embedder{adapter: adapter, dep: dep, prices: func() config.Pricing { return dep.Prices }, dims: dims, timeout: timeout}
+}
+
+// WithPrices makes the embedder price its calls at prices(), read at each
+// call, instead of dep's prices, so that new prices (a reload, a dated
+// price change) reach its costs at once. Call it before the embedder is
+// used. It returns e.
+func (e *Embedder) WithPrices(prices func() config.Pricing) *Embedder {
+	e.prices = prices
+	return e
 }
 
 // Model returns the deployment ID, model@provider.
@@ -118,10 +128,11 @@ func (e *Embedder) estimateTokens(text string) int64 {
 	return max(int64(math.Ceil(float64(len(text))/4*ratio)), 1)
 }
 
-// costNano prices tokens of input at the deployment, in nano-USD rounded
-// up, or returns -1 when the price is unknown.
+// costNano prices tokens of input at the deployment's prices (see
+// WithPrices), in nano-USD rounded up, or returns -1 when the price is
+// unknown.
 func (e *Embedder) costNano(tokens int64) int64 {
-	m, ok := usage.EmbeddingCost(usage.Tokens{Input: tokens}, e.dep.Prices)
+	m, ok := usage.EmbeddingCost(usage.Tokens{Input: tokens}, e.prices())
 	if !ok {
 		return -1
 	}
@@ -147,6 +158,13 @@ func mayHaveBilled(err error) bool {
 // with it the vector index) is stable. The model must be an embedding
 // model with dimensions.
 func EmbeddingDeployment(cat *catalog.Catalog, adapters map[string]providers.Adapter, name string) (*catalog.Deployment, providers.Embedder, error) {
+	return embeddingDeployment(cat, adapters, name, nil)
+}
+
+// embeddingDeployment is EmbeddingDeployment among the deployments that
+// permitted, when set, accepts.
+func embeddingDeployment(cat *catalog.Catalog, adapters map[string]providers.Adapter, name string,
+	permitted func(*catalog.Deployment) bool) (*catalog.Deployment, providers.Embedder, error) {
 	res, err := cat.Resolve(name)
 	if err != nil {
 		return nil, nil, fmt.Errorf("semantic: embedding model %q: %w", name, err)
@@ -166,7 +184,7 @@ func EmbeddingDeployment(cat *catalog.Catalog, adapters map[string]providers.Ada
 		if res.Pinned {
 			return d, emb, nil
 		}
-		if !d.Pricing.Known {
+		if !d.Pricing.Known || (permitted != nil && !permitted(d)) {
 			continue
 		}
 		if best == nil || d.Pricing.Input < best.Pricing.Input {
@@ -186,16 +204,25 @@ func EmbeddingDeployment(cat *catalog.Catalog, adapters map[string]providers.Ada
 
 // ConfiguredDeployment returns the deployment the semantic cache embeds
 // with, and its adapter: semantic_cache.embedding_model resolved by
-// EmbeddingDeployment, and checked against every policy that enables the
-// semantic cache (see CheckPolicies). It returns nil and no error when no
-// policy or rule enables it. Both `switchyard serve` and `config validate`
-// call it, so a config that would send prompts where a policy forbids is
-// rejected before it runs.
+// EmbeddingDeployment among the deployments that every policy enabling the
+// semantic cache permits (see CheckPolicies), or, when it permits none,
+// the error for the one EmbeddingDeployment picks. Prices only order the
+// permitted deployments, so a price change (a dated one included) can move
+// the pick between them but never make the configuration invalid. It
+// returns nil and no error when no policy or rule enables it. Both
+// `switchyard serve` and `config validate` call it, so a config that would
+// send prompts where a policy forbids is rejected before it runs.
 func ConfiguredDeployment(cfg *config.Config, cat *catalog.Catalog, adapters map[string]providers.Adapter) (*catalog.Deployment, providers.Embedder, error) {
 	if !Enabled(cfg) {
 		return nil, nil, nil
 	}
-	d, emb, err := EmbeddingDeployment(cat, adapters, cfg.SemanticCache.EmbeddingModel)
+	name := cfg.SemanticCache.EmbeddingModel
+	if d, emb, err := embeddingDeployment(cat, adapters, name, func(d *catalog.Deployment) bool {
+		return CheckPolicies(cfg, d) == nil
+	}); err == nil {
+		return d, emb, nil
+	}
+	d, emb, err := EmbeddingDeployment(cat, adapters, name)
 	if err != nil {
 		return nil, nil, fmt.Errorf("semantic_cache.embedding_model: %w", err)
 	}

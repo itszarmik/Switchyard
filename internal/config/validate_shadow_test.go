@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // shadowYAML returns a config with chat model m (on provider a), judge
@@ -137,11 +138,11 @@ func TestShadowJudgeMessages(t *testing.T) {
 		{"j@zz", "no deployment of the model is on the provider of"},
 	}
 	for _, tt := range tests {
-		if deps, msg := chatDeployments(tt.ref, models, tags); msg != tt.msg || deps != nil {
+		if deps, msg := chatDeployments(tt.ref, models, tags, time.Now()); msg != tt.msg || deps != nil {
 			t.Errorf("chatDeployments(%q) = %v, %q; want nil, %q", tt.ref, deps, msg, tt.msg)
 		}
 	}
-	deps, msg := chatDeployments("j@a", models, tags)
+	deps, msg := chatDeployments("j@a", models, tags, time.Now())
 	if msg != "" || len(deps) != 1 || deps[0].id != "j@a" || strings.Join(deps[0].tags, ",") != "p,d" {
 		t.Errorf("chatDeployments(j@a) = %+v, %q", deps, msg)
 	}

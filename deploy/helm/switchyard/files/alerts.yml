@@ -114,6 +114,17 @@ groups:
           description: "The new config was rejected and the previous one is still serving. The gateway log line for the reload says why."
           runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#config-reload-failed"
 
+      # A dated catalog price change could not be put in force. The old
+      # prices keep serving; the gateway retries every minute.
+      - alert: SwitchyardCatalogPriceSwitchFailed
+        expr: increase(switchyard_catalog_price_switches_total{result="error"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A catalog price change failed to take effect on {{ $labels.instance }}"
+          description: "A dated price change is due, but rebuilding the gateway's snapshot failed, so requests are still costed at the old prices. The gateway retries every minute; its log line for the failure says why."
+          runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#catalog-price-change-failed"
+
       # §14.7: the state Redis is failing (budgets follow budgets.fail_mode,
       # rate limits rate_limits.fail_mode).
       - alert: SwitchyardStateStoreErrors

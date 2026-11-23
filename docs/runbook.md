@@ -55,6 +55,7 @@ prompts, responses, API keys, the admin token, DSNs or Redis passwords.
 - Money: [Budget exhausted](#budget-exhausted) ·
   [Usage events dropped](#usage-events-dropped)
 - The gateway: [Config reload failed](#config-reload-failed) ·
+  [Catalog price change failed](#catalog-price-change-failed) ·
   [Gateway overhead high](#gateway-overhead-high) ·
   [Log lines dropped](#log-lines-dropped) ·
   [Trace spans dropped](#trace-spans-dropped) ·
@@ -369,6 +370,42 @@ so a provider key rotated by a reload (through `${file:...}`) reaches
 them only after a restart; the request path uses the new key at once. A
 deployment a reload removes stays listed, with its last health state, in
 `GET /admin/v1/providers` until a restart; it is never chosen.
+
+## Catalog price change failed
+
+**Symptom.** A dated price change (`pricing.changes` in the catalog) is
+past its `from` time, but requests are still costed at the old prices:
+usage events and budget spend show the old prices for the deployment.
+
+**Signal.** `SwitchyardCatalogPriceSwitchFailed`;
+`switchyard_catalog_price_switches_total{result="error"}` rising about
+once a minute; `switchyard_catalog_next_price_change_timestamp_seconds`
+stuck at a time in the past; an ERROR log line `msg="catalog price change
+failed; the prices in force keep serving and the change is tried again at
+the next check"` with the error (never secret values). A successful
+switch logs `msg="catalog prices changed"` with the deployments and their
+old and new prices.
+
+**Impact.** Requests keep being served, at the old prices: costs, budgets,
+routing and cost caps lag the provider's billing until the switch
+succeeds. Nothing else changes.
+
+**What to do.**
+
+1. Read the error in the log line. The rebuild stages the configuration
+   in force again, with the new prices, as a reload stages one, but
+   without the reload's judge and embedding-deployment checks, which no
+   price change can fail (the judge and the embedding deployment are the
+   cheapest ones the policies permit). It should not fail; an error here
+   is a bug or a resource problem, such as an adapter that could not be
+   built.
+2. Reload (`POST /admin/v1/reload` or `SIGHUP`), with the file unchanged
+   or fixed. A successful reload after the change's time puts the new
+   prices in force at once; the reload logs `msg="catalog prices changed"`
+   with `trigger="reload"`.
+3. If the reload fails too, restart the replica: it builds its catalog with
+   the prices in force at startup. A price change cannot make a startup
+   fail; if it fails, its error names the config problem.
 
 ## Gateway overhead high
 

@@ -71,8 +71,9 @@ type Options struct {
 	// Registry receives the API and upstream metrics.
 	Registry *prometheus.Registry
 	// Clock is the health tracker's clock, for breakers, cooldowns and
-	// retry budgets, and the budgets' clock, which picks their windows;
-	// nil means time.Now.
+	// retry budgets, the budgets' clock, which picks their windows, and
+	// the catalog's: each snapshot has the prices in force when it is
+	// built (catalog.NewAt). Nil means time.Now.
 	Clock func() time.Time
 	// Ledger receives one usage event per request (DESIGN §12.2). Nil
 	// records none.
@@ -250,7 +251,7 @@ func New(opts Options) (*Gateway, error) {
 	sh.health = health.New(health.Options{Config: trackerConfig(withRoutingDefaults(cfg.Routing)), Observer: met, Now: opts.Clock})
 
 	g := &Gateway{shared: sh}
-	s, err := g.build(cfg, opts.ConfigVersion)
+	s, err := g.build(cfg, opts.ConfigVersion, g.now())
 	if err != nil {
 		met.unregister(opts.Registry)
 		return nil, err
@@ -263,9 +264,10 @@ func New(opts Options) (*Gateway, error) {
 	return g, nil
 }
 
-// build returns the snapshot of cfg over g's long-lived state.
-func (g *Gateway) build(cfg *config.Config, configVersion string) (*snapshot, error) {
-	cat, err := catalog.New(cfg)
+// build returns the snapshot of cfg over g's long-lived state, with the
+// prices in force at at.
+func (g *Gateway) build(cfg *config.Config, configVersion string, at time.Time) (*snapshot, error) {
+	cat, err := catalog.NewAt(cfg, at)
 	if err != nil {
 		return nil, fmt.Errorf("gateway: %w", err)
 	}

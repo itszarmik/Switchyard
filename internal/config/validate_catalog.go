@@ -174,6 +174,7 @@ func (st *loadState) validateDeploymentCatalog(m *Model, d *Deployment, dp strin
 			st.errorAt(pp+".checked", "must be a date as YYYY-MM-DD, got "+st.describe(pp+".checked", c))
 		}
 	}
+	st.validatePriceChanges(d.Pricing.Changes, pp+".changes")
 	if s := d.Pricing.Source; s != "" {
 		// The URL is never echoed: a bad one may embed credentials.
 		u, err := url.Parse(s)
@@ -184,15 +185,54 @@ func (st *loadState) validateDeploymentCatalog(m *Model, d *Deployment, dp strin
 			st.errorAt(pp+".source", "must not embed credentials")
 		}
 	}
-	// A price that failed to decode is already reported.
-	if !PricingKnown(m.Type, d.Pricing) && !st.failed[pp+".input"] && !st.failed[pp+".output"] {
+	// A price that failed to decode is already reported. Known or not is
+	// as of the prices in force now, as the catalog sees them.
+	if !PricingKnown(m.Type, d.Pricing.At(st.now)) && !st.failed[pp+".input"] && !st.failed[pp+".output"] {
 		st.warnAt(pp, MsgPricingUnknown)
+	}
+}
+
+// validatePriceChanges checks a deployment's pricing.changes at path: each
+// change needs a well-formed from, later than every one before it, and at
+// least one price. Prices are checked when they are decoded.
+func (st *loadState) validatePriceChanges(changes []PriceChange, path string) {
+	var prev time.Time
+	prevPath := ""
+	for k := range changes {
+		c := &changes[k]
+		cp := indexPath(path, k)
+		fp := cp + ".from"
+		priceFailed := st.failed[cp+".input"] || st.failed[cp+".output"] ||
+			st.failed[cp+".cached_input"] || st.failed[cp+".cache_write"]
+		if !c.Sets() && !priceFailed {
+			st.errorAt(cp, "sets no price; give at least one of input, output, cached_input and cache_write")
+		}
+		if st.failed[fp] {
+			continue
+		}
+		from, err := ParseChangeFrom(c.From)
+		switch {
+		case c.From == "":
+			st.errorAt(fp, "required; the time the change takes effect, as YYYY-MM-DD (00:00 UTC) or an RFC 3339 timestamp")
+		case err != nil:
+			st.errorAt(fp, err.Error()+", got "+st.describe(fp, c.From))
+		case prevPath != "" && from.Equal(prev):
+			st.errorAt(fp, "duplicates "+prevPath+"; each change needs a time of its own")
+		case prevPath != "" && from.Before(prev):
+			st.errorAt(fp, "must be later than "+prevPath+"; list changes in increasing order")
+		}
+		if err == nil && (prevPath == "" || from.After(prev)) {
+			prev, prevPath = from, fp
+		}
 	}
 }
 
 // PricingKnown reports whether p has the prices routing needs for a model of
 // the given type: input and output for a chat model, input for an embedding
-// model.
+// model. Callers pass the prices in force (Pricing.At) at the time they
+// care about: the catalog its build time, validation the load time
+// (LoadOptions.Now) and `switchyard catalog lint` its clock. Changes only
+// ever set prices, so a set that is known stays known after every change.
 func PricingKnown(modelType string, p Pricing) bool {
 	if modelType == ModelTypeEmbedding {
 		return p.Input.IsSet()

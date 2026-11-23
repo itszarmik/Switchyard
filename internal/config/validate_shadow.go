@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Upper bounds of the evaluation.shadow settings.
@@ -71,7 +72,7 @@ func (st *loadState) validateShadow(c *Config, models map[string]*Model) {
 		st.errorAt(pathJudgeModel, why)
 	} else {
 		var msg string
-		judgeDeps, msg = chatDeployments(judge, models, tags)
+		judgeDeps, msg = chatDeployments(judge, models, tags, st.now)
 		// validateEvaluation may have reported the judge model already.
 		switch {
 		case msg != "" && !st.hasProblemAt(pathJudgeModel):
@@ -88,7 +89,7 @@ func (st *loadState) validateShadow(c *Config, models map[string]*Model) {
 		rate := pp + ".shadow.sample_rate"
 		if p.BaselineModel == "" {
 			st.errorAt(pp+".baseline_model", "required when shadow.sample_rate > 0: the baseline model gives the comparison answer in enforce mode")
-		} else if deps, msg := chatDeployments(p.BaselineModel, models, tags); msg == "" && !anyPermitted(p, deps) {
+		} else if deps, msg := chatDeployments(p.BaselineModel, models, tags, st.now); msg == "" && !anyPermitted(p, deps) {
 			// An unknown or non-chat baseline is reported by policy
 			// validation.
 			st.errorAt(rate, "the policy's allow, deny and require_tags permit no deployment of its baseline_model "+
@@ -103,7 +104,7 @@ func (st *loadState) validateShadow(c *Config, models map[string]*Model) {
 
 // namedDeployment is a deployment's id (model@provider), its tags (the
 // provider's followed by the deployment's own), and whether its chat
-// prices are known.
+// prices in force at load time are known.
 type namedDeployment struct {
 	id     string
 	tags   []string
@@ -111,8 +112,9 @@ type namedDeployment struct {
 }
 
 // chatDeployments returns the deployments that ref, a chat model id or
-// model@provider, names; or, when ref names none, a message saying why.
-func chatDeployments(ref string, models map[string]*Model, providerTags map[string][]string) ([]namedDeployment, string) {
+// model@provider, names, with whether their prices in force at now are
+// known; or, when ref names none, a message saying why.
+func chatDeployments(ref string, models map[string]*Model, providerTags map[string][]string, now time.Time) ([]namedDeployment, string) {
 	id, provider, pinned := strings.Cut(ref, "@")
 	m := models[id]
 	switch {
@@ -129,7 +131,7 @@ func chatDeployments(ref string, models map[string]*Model, providerTags map[stri
 		out = append(out, namedDeployment{
 			id:     m.ID + "@" + d.Provider,
 			tags:   append(slices.Clone(providerTags[d.Provider]), d.Tags...),
-			priced: PricingKnown(ModelTypeChat, d.Pricing),
+			priced: PricingKnown(ModelTypeChat, d.Pricing.At(now)),
 		})
 	}
 	if len(out) == 0 {

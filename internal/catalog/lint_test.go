@@ -86,6 +86,52 @@ func TestLint(t *testing.T) {
 			},
 		},
 		{
+			name: "price changes",
+			models: "  - id: m\n    capabilities: [streaming]\n    deployments:\n" +
+				"      - provider: a\n        upstream_model: u\n        pricing:\n          input: 1\n          output: 2\n" +
+				"          source: 'https://a.example/pricing'\n          checked: 2026-11-01\n          changes:\n" +
+				"            - {from: 2026-11-01, input: 1.5}\n" +
+				"            - {from: '2026-11-11T15:04:05Z', output: 3}\n" +
+				"            - {from: 2026-12-01, input: 4, output: \"20.00\", cached_input: 0.2}\n" +
+				"            - {from: 2027-01-01, output: 25}\n" +
+				"      - {provider: b, upstream_model: u, pricing: {input: 1, output: 2, " + documented + ", changes: [{from: '2026-12-01T00:00:00-08:00', cache_write: 1.25}]}}\n" +
+				"  - id: n\n    capabilities: [streaming]\n    deployments:\n" +
+				"      - {provider: a, upstream_model: u, pricing: {input: 1, output: 2, " + documented + ", changes: [{from: 2026-11-11T15:04:06Z, input: 2}]}}\n",
+			want: []string{
+				"17: notice: models[0].deployments[0].pricing.changes[0].from: in force since 2026-11-01 00:00 UTC; fold it into the base prices and remove it when convenient",
+				"18: notice: models[0].deployments[0].pricing.changes[1].from: in force since 2026-11-11 15:04:05 UTC; fold it into the base prices and remove it when convenient",
+				"19: notice: models[0].deployments[0].pricing.changes[2]: next price change at 2026-12-01 00:00 UTC: input 4, output 20.00, cached_input 0.2",
+				"21: notice: models[0].deployments[1].pricing.changes[0]: next price change at 2026-12-01 08:00 UTC: cache_write 1.25",
+				"25: notice: models[1].deployments[0].pricing.changes[0]: next price change at 2026-11-11 15:04:06 UTC: input 2",
+			},
+		},
+		{
+			// P10 review M2: known or not is as of the prices in force at
+			// now.
+			name: "a change completes the prices",
+			models: "  - id: m\n    capabilities: [streaming]\n    deployments:\n" +
+				"      - {provider: a, upstream_model: u, pricing: {input: 1, " + documented + ", changes: [{from: 2026-11-01, output: 2}]}}\n" +
+				"      - {provider: b, upstream_model: u, pricing: {input: 1, " + documented + ", changes: [{from: 2026-12-01, output: 2}]}}\n",
+			want: []string{
+				"9: notice: models[0].deployments[0].pricing.changes[0].from: in force since 2026-11-01 00:00 UTC; fold it into the base prices and remove it when convenient",
+				"10: warning: models[0].deployments[1].pricing: " + config.MsgPricingUnknown,
+				"10: notice: models[0].deployments[1].pricing.changes[0]: next price change at 2026-12-01 00:00 UTC: output 2",
+			},
+		},
+		{
+			// P10 review L2: every dated price set is checked.
+			name: "a change makes output cheaper than input",
+			models: "  - id: m\n    capabilities: [streaming]\n    deployments:\n" +
+				"      - {provider: a, upstream_model: u, pricing: {input: 1, output: 2, " + documented + ", changes: [{from: 2026-12-01, output: 0.5}]}}\n" +
+				"      - {provider: b, upstream_model: u, pricing: {input: 2, output: 1, " + documented + ", changes: [{from: 2026-12-01, cached_input: 0.1}]}}\n",
+			want: []string{
+				"9: notice: models[0].deployments[0].pricing.changes[0]: next price change at 2026-12-01 00:00 UTC: output 0.5",
+				"9: notice: models[0].deployments[0].pricing.changes[0]: unusual: output cheaper than input from 2026-12-01 00:00 UTC",
+				"10: notice: models[0].deployments[1].pricing.changes[0]: next price change at 2026-12-01 00:00 UTC: cached_input 0.1",
+				"10: notice: models[0].deployments[1].pricing.output: unusual: output cheaper than input",
+			},
+		},
+		{
 			name: "an override with streaming silences the model notice",
 			models: "  - id: m\n    deployments:\n" +
 				"      - {provider: a, upstream_model: u, capabilities: [streaming], pricing: {input: 1, output: 1, " + documented + "}}\n",

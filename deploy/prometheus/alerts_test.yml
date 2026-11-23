@@ -87,6 +87,10 @@ tests:
         values: '0 0 1 1'
       - series: 'switchyard_config_reloads_total{result="ok",instance="gw:9090",job="switchyard"}'
         values: '1 1 1 1'
+      - series: 'switchyard_catalog_price_switches_total{result="error",instance="gw:9090",job="switchyard"}'
+        values: '0 0 0 2'
+      - series: 'switchyard_catalog_price_switches_total{result="ok",instance="gw:9090",job="switchyard"}'
+        values: '0 0 0 0'
     alert_rule_test:
       - eval_time: 1m
         alertname: SwitchyardBudgetAbove90Percent
@@ -121,6 +125,20 @@ tests:
               summary: "A config reload failed on gw:9090"
               description: "The new config was rejected and the previous one is still serving. The gateway log line for the reload says why."
               runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#config-reload-failed"
+      - eval_time: 2m
+        alertname: SwitchyardCatalogPriceSwitchFailed
+      - eval_time: 3m
+        alertname: SwitchyardCatalogPriceSwitchFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              result: error
+              instance: gw:9090
+              job: switchyard
+            exp_annotations:
+              summary: "A catalog price change failed to take effect on gw:9090"
+              description: "A dated price change is due, but rebuilding the gateway's snapshot failed, so requests are still costed at the old prices. The gateway retries every minute; its log line for the failure says why."
+              runbook_url: "https://github.com/itszarmik/Switchyard/blob/main/docs/runbook.md#catalog-price-change-failed"
 
   # Overhead p99 at about 50 ms for 15 minutes.
   - interval: 1m

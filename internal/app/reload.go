@@ -19,8 +19,10 @@ import (
 	"switchyard/internal/apierror"
 	"switchyard/internal/auth"
 	"switchyard/internal/cache/semantic"
+	"switchyard/internal/catalog"
 	"switchyard/internal/config"
 	"switchyard/internal/eval"
+	"switchyard/internal/gateway"
 	"switchyard/internal/providers"
 	"switchyard/internal/ratelimit"
 	"switchyard/internal/server"
@@ -70,7 +72,8 @@ type ReloadResult struct {
 	// restart. It is never nil, so it encodes as [].
 	RestartRequired []string `json:"restart_required"`
 	// Unchanged is set when the configuration was identical to the one in
-	// force, which was then kept.
+	// force, which was then kept. It is not set when a dated price change
+	// had taken effect: the snapshot was then rebuilt with the new prices.
 	Unchanged bool `json:"unchanged,omitempty"`
 }
 
@@ -80,12 +83,17 @@ type reloader struct {
 	mu   sync.Mutex
 	load Loader
 	// start is the configuration the process started with, for the
-	// restart-required diff; running is the version in force, and secrets
-	// the secret values of the configuration in force, scrubbed from
-	// reload errors.
+	// restart-required diff; cfg is the configuration in force, which a
+	// price switch builds the snapshot from again, running its version,
+	// and secrets the secret values of the configuration in force,
+	// scrubbed from reload errors.
 	start   *config.Config
+	cfg     *config.Config
 	running string
 	secrets []string
+	// stage stages a gateway snapshot with the prices in force at a time
+	// (gateway.Gateway.StageAt); tests replace it.
+	stage func(cfg *config.Config, configVersion string, at time.Time) (*gateway.Staged, error)
 	// keys is the API key store the auth middleware reads.
 	keys *auth.Keyring
 	// hasShadow and hasSemantic are whether the shadow runner and the
@@ -95,6 +103,8 @@ type reloader struct {
 	now         func() time.Time
 	total       *prometheus.CounterVec
 	lastSuccess prometheus.Gauge
+	// priceSwitches counts the price switches (see switchPrices).
+	priceSwitches *prometheus.CounterVec
 }
 
 // newReloadMetrics registers the reload metrics.
@@ -159,30 +169,23 @@ func (a *App) doReload() (ReloadResult, error) {
 		return ReloadResult{}, errors.New("server.admin_token: required while the admin listener is bound to a non-loopback address (a change of server.admin_listen needs a restart)")
 	}
 	res := ReloadResult{Fingerprint: snap.Version(), RestartRequired: a.restartRequired(cfg)}
-	if snap.Version() == r.running {
+	// The same configuration is kept, unless a dated price change has
+	// taken effect since its snapshot was built: then the snapshot is
+	// rebuilt, as the next price check would. The clock is read once, so
+	// the change counted as due is the one the staged catalog applies.
+	now := a.clock.now()
+	pricesDue := a.priceChangeDue(now)
+	if snap.Version() == r.running && !pricesDue {
 		res.Unchanged = true
 		return res, nil
 	}
-	staged, err := a.gw.Stage(cfg, snap.Version())
+	previous, previousCfg := a.gw.Catalog(), r.cfg
+	staged, err := r.stage(cfg, snap.Version(), now)
 	if err != nil {
 		return ReloadResult{}, err
 	}
-	// The checks startup makes with the catalog: the judge must suit every
-	// sampling policy, and the embedding deployment every policy that
-	// enables the semantic cache.
-	if _, err := eval.ShadowJudge(staged.Catalog(), cfg); err != nil {
+	if err := a.checkStaged(staged, cfg); err != nil {
 		return ReloadResult{}, err
-	}
-	if semantic.Enabled(cfg) {
-		adapters := make(map[string]providers.Adapter, len(cfg.Providers))
-		for _, p := range cfg.Providers {
-			if ad := staged.Adapter(p.ID); ad != nil {
-				adapters[p.ID] = ad
-			}
-		}
-		if _, _, err := semantic.ConfiguredDeployment(cfg, staged.Catalog(), adapters); err != nil {
-			return ReloadResult{}, err
-		}
 	}
 	keys := auth.NewStore(cfg.Tenants)
 
@@ -196,9 +199,43 @@ func (a *App) doReload() (ReloadResult, error) {
 	a.budgetFailClosed.Store(cfg.Budgets.FailMode == config.BudgetFailClosed)
 	a.srv.SetConfigVersion(snap.Version())
 	a.srv.SetAdminToken(cfg.Server.AdminToken.Value())
+	r.cfg = cfg
 	r.running = snap.Version()
 	r.secrets = cfg.SecretValues()
+	if pricesDue {
+		// The switch the reload made: the configuration in force before
+		// it at now, so that prices the reload itself edits are not
+		// reported as the dated change (they are the reload's).
+		switched := staged.Catalog()
+		if c, err := catalog.NewAt(previousCfg, now); err == nil {
+			switched = c
+		}
+		a.logPriceSwitch(previous, switched, priceTriggerReload)
+	}
+	a.rearmPrices()
 	return res, nil
+}
+
+// checkStaged makes the checks startup makes with the catalog on a staged
+// snapshot of cfg, before a reload or a price switch commits it: the
+// judge must suit every sampling policy, and the embedding deployment
+// every policy that enables the semantic cache.
+func (a *App) checkStaged(staged *gateway.Staged, cfg *config.Config) error {
+	if _, err := eval.ShadowJudge(staged.Catalog(), cfg); err != nil {
+		return err
+	}
+	if semantic.Enabled(cfg) {
+		adapters := make(map[string]providers.Adapter, len(cfg.Providers))
+		for _, p := range cfg.Providers {
+			if ad := staged.Adapter(p.ID); ad != nil {
+				adapters[p.ID] = ad
+			}
+		}
+		if _, _, err := semantic.ConfiguredDeployment(cfg, staged.Catalog(), adapters); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // reloadAndAudit runs a reload, then logs its outcome and writes its audit

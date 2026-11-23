@@ -3,6 +3,7 @@ package gateway
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"switchyard/internal/catalog"
 	"switchyard/internal/config"
@@ -29,13 +30,27 @@ type Staged struct {
 // (routing.breaker, routing.rate_limit_cooldown and
 // routing.fallback.retry_budget_ratio and retry_budget_min) and to the
 // cache limits (cache.*) are not applied: they need a restart.
+//
+// The staged catalog has the prices in force at the gateway's clock, so
+// staging the configuration in force again, with its version, once the
+// catalog's NextPriceChange has passed puts dated price changes in force
+// (the model list keeps its created time).
 func (g *Gateway) Stage(cfg *config.Config, configVersion string) (*Staged, error) {
+	return g.StageAt(cfg, configVersion, g.now())
+}
+
+// StageAt is Stage with the catalog's prices those in force at t, for a
+// caller that has already read the clock and must see the same time.
+func (g *Gateway) StageAt(cfg *config.Config, configVersion string, t time.Time) (*Staged, error) {
 	if cfg == nil {
 		return nil, errors.New("gateway: reload: missing Config")
 	}
-	s, err := g.build(cfg, configVersion)
+	s, err := g.build(cfg, configVersion, t)
 	if err != nil {
 		return nil, fmt.Errorf("gateway: reload: %w", err)
+	}
+	if cur := g.current(); cur != nil && cur.configVersion == configVersion {
+		s.created = cur.created
 	}
 	return &Staged{g: g, s: s}, nil
 }

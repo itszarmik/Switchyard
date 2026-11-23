@@ -30,17 +30,25 @@ tenants:
 `, judge)
 }
 
-// TestValidateShadowJudgePin: config validate checks the exact deployment
-// shadow sampling pins the judge to, with the runtime's own pin, against
-// every sampling policy, and names it (both reviews' M1).
+// TestValidateShadowJudgePin: shadow sampling pins the judge to its
+// cheapest deployment that every sampling policy permits, so a price
+// change can never make the config invalid; config validate rejects a
+// judge none of whose deployments a sampling policy permits, naming the
+// cheapest one and why (both reviews' M1, P10 review H1).
 func TestValidateShadowJudgePin(t *testing.T) {
-	code, out, errOut := runCLI(t, env{}, "config", "validate", "-c", writeConfig(t, shadowJudgeConfig("judge")))
+	for _, judge := range []string{"judge", "judge@eu"} {
+		if code, out, errOut := runCLI(t, env{}, "config", "validate", "-c", writeConfig(t, shadowJudgeConfig(judge))); code != exitOK {
+			t.Errorf("%s: exit %d\n%s\n%s", judge, code, out, errOut)
+		}
+	}
+	// Each sampling policy permits a judge deployment, but none permits
+	// both.
+	refused := strings.Replace(shadowJudgeConfig("judge"), "shadow: {sample_rate: 0.1}}\n",
+		"shadow: {sample_rate: 0.1}}\n  - {id: other, baseline_model: big, deny: [judge@eu], shadow: {sample_rate: 0.1}}\n", 1)
+	code, out, errOut := runCLI(t, env{}, "config", "validate", "-c", writeConfig(t, refused))
 	if code != exitError || !strings.Contains(errOut, "judge@us") || !strings.Contains(errOut, `policy "default"`) ||
 		!strings.Contains(errOut, "lacks required tag eu") || !strings.Contains(errOut, "evaluation.judge.model: model@provider") {
-		t.Errorf("judge pinned to a deployment the policy refuses: exit %d\n%s\n%s", code, out, errOut)
-	}
-	if code, out, errOut := runCLI(t, env{}, "config", "validate", "-c", writeConfig(t, shadowJudgeConfig("judge@eu"))); code != exitOK {
-		t.Errorf("judge@eu: exit %d\n%s\n%s", code, out, errOut)
+		t.Errorf("no permitted judge deployment: exit %d\n%s\n%s", code, out, errOut)
 	}
 }
 
@@ -69,17 +77,23 @@ tenants:
 `, model)
 }
 
-// TestValidateSemanticEmbeddingPolicy: config validate checks the exact
-// deployment the semantic cache embeds with, as the runtime picks it,
-// against every policy that enables the semantic cache, and names it
-// (security review M1).
+// TestValidateSemanticEmbeddingPolicy: the semantic cache embeds with the
+// cheapest deployment that every policy enabling it permits; config
+// validate rejects an embedding model none of whose deployments such a
+// policy permits, naming the cheapest one and why (security review M1,
+// P10 review H1).
 func TestValidateSemanticEmbeddingPolicy(t *testing.T) {
-	code, out, errOut := runCLI(t, env{}, "config", "validate", "-c", writeConfig(t, semanticPolicyConfig("emb")))
+	for _, model := range []string{"emb", "emb@eu"} {
+		if code, out, errOut := runCLI(t, env{}, "config", "validate", "-c", writeConfig(t, semanticPolicyConfig(model))); code != exitOK {
+			t.Errorf("%s: exit %d\n%s\n%s", model, code, out, errOut)
+		}
+	}
+	// Each policy permits an embedding deployment, but none permits both.
+	refused := strings.Replace(semanticPolicyConfig("emb"), "cache: {semantic: {enabled: true}}}\n",
+		"cache: {semantic: {enabled: true}}}\n  - {id: other, deny: [emb@eu], cache: {semantic: {enabled: true}}}\n", 1)
+	code, out, errOut := runCLI(t, env{}, "config", "validate", "-c", writeConfig(t, refused))
 	if code != exitError || !strings.Contains(errOut, "emb@us") || !strings.Contains(errOut, `policy "default"`) ||
 		!strings.Contains(errOut, "lacks required tag eu") {
-		t.Errorf("embedding deployment the policy refuses: exit %d\n%s\n%s", code, out, errOut)
-	}
-	if code, out, errOut := runCLI(t, env{}, "config", "validate", "-c", writeConfig(t, semanticPolicyConfig("emb@eu"))); code != exitOK {
-		t.Errorf("emb@eu: exit %d\n%s\n%s", code, out, errOut)
+		t.Errorf("no permitted embedding deployment: exit %d\n%s\n%s", code, out, errOut)
 	}
 }

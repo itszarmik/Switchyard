@@ -532,9 +532,14 @@ func TestAPIRequestsCounted(t *testing.T) {
 // config says, so that the tests need no Postgres or Redis.
 // When logOutput is a *logBuffer, it is attached to the app.
 func testNew(snap *config.Snapshot, logOutput io.Writer) (*App, error) {
+	return testNewWith(snap, logOutput, storage{ledger: usage.NewMemoryLedger(), budgets: budget.NewMemoryStore()}, systemClock)
+}
+
+// testNewWith is testNew with the given storage and clock.
+func testNewWith(snap *config.Snapshot, logOutput io.Writer, st storage, clk clock) (*App, error) {
 	a, err := newApp(snap, logOutput, func(*config.Config, prometheus.Registerer, *slog.Logger) (storage, error) {
-		return storage{ledger: usage.NewMemoryLedger(), budgets: budget.NewMemoryStore()}, nil
-	})
+		return st, nil
+	}, clk)
 	if lb, ok := logOutput.(*logBuffer); ok && err == nil {
 		lb.attach(a)
 	}

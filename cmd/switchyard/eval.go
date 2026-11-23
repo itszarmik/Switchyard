@@ -166,11 +166,14 @@ func runEvalRun(args []string, stdout, stderr io.Writer, lookupEnv func(string) 
 	if judgeModel == "" {
 		judgeModel = cfg.Evaluation.Judge.Model
 	}
+	// evaluation.judge.model resolves as shadow sampling resolves it; a
+	// --judge naming another model is pinned as any target is.
+	configJudge := judgeModel == cfg.Evaluation.Judge.Model
 	if judgeModel == "" {
 		return usageError(fset, stderr, "--judge is required when the config sets no evaluation.judge.model")
 	}
 
-	opts, err := buildRun(cfg, judgeModel, reference, candidates)
+	opts, err := buildRun(cfg, judgeModel, configJudge, reference, candidates)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: eval run: %v\n", err)
 		return exitError
@@ -249,7 +252,10 @@ func runEvalRun(args []string, stdout, stderr io.Writer, lookupEnv func(string) 
 }
 
 // buildRun builds the run's catalog, targets, judge and assessor from cfg.
-func buildRun(cfg *config.Config, judgeModel, reference, candidates string) (eval.Options, error) {
+// configJudge says judgeModel is evaluation.judge.model, which is pinned as
+// shadow sampling pins it (eval.JudgeDeployment), so offline and live
+// verdicts come from the same deployment.
+func buildRun(cfg *config.Config, judgeModel string, configJudge bool, reference, candidates string) (eval.Options, error) {
 	cat, err := catalog.New(cfg)
 	if err != nil {
 		return eval.Options{}, err
@@ -273,7 +279,12 @@ func buildRun(cfg *config.Config, judgeModel, reference, candidates string) (eva
 		}
 		opts.Candidates = append(opts.Candidates, t)
 	}
-	jt, err := eval.NewTarget(cat, adapters, judgeModel)
+	var jt eval.Target
+	if configJudge {
+		jt, err = eval.NewTargetFor(adapters, func() (*catalog.Deployment, error) { return eval.JudgeDeployment(cat, cfg, judgeModel) })
+	} else {
+		jt, err = eval.NewTarget(cat, adapters, judgeModel)
+	}
 	if err != nil {
 		return eval.Options{}, fmt.Errorf("judge: %w", err)
 	}

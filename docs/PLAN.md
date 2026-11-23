@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P9 complete** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P9 complete; P10 (dated catalog prices) built and verified locally, not yet committed; then P11 (native Gemini adapter)** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -58,6 +58,8 @@
 | P7 | Production hardening and v0.1 | M | P5, P6 |
 | P8 | Quality feedback loop (the first post-MVP phase) | M | P5 |
 | P9 | Helm chart for Kubernetes | M | P7 |
+| P10 | Dated catalog prices | S | P4 |
+| P11 | Native Gemini adapter | L | P2, P10 |
 
 Sizes are relative (S < M < L), not calendar estimates.
 
@@ -619,6 +621,72 @@ All three criteria pass against fake upstreams. No real provider has been called
 
 **Not yet run:** the chart against a real HPA with metrics-server and against the Prometheus Operator's CRDs, and Helm 3.
 
+## P10: Dated catalog prices
+
+**Goal:** an announced price change takes effect on its date without anyone editing the catalog that day, so costs, budgets and routing stay exact. Google has announced two: Gemini 4 Carbon from 2026-12-01 and Gemini 3.8 Flash from 2027-01-01.
+
+**Decisions (2026-11-23)**
+
+- **Released on its own, before 2026-12-01**, ahead of P11, so the Carbon change applies on time.
+- **The catalog resolves prices when it is built.** Every consumer (ranking, the router's cost caps, cost accounting, budgets, the judge) keeps reading one price set per deployment; none of them learns about dates.
+- **The gateway rebuilds its snapshot at each boundary** from the configuration in force, the same staging a hot reload uses, without rereading the files. Requests in flight finish at the prices they started with.
+
+**Scope**
+
+- **Catalog format.** `pricing.changes`: a list of `{from, input, output, cached_input, cache_write}` in increasing `from` order. A change inherits any price it doesn't give from the one before it. `from` is a date (`YYYY-MM-DD`, meaning 00:00 UTC) or an RFC 3339 timestamp, for a provider that announces a time zone.
+- **Validation.** `from` well formed and strictly increasing; prices valid as today. `switchyard catalog lint` reports changes already in force (fold them into the base prices) and shows the next change per deployment.
+- **Runtime.** The gateway checks once a minute whether the next boundary has passed and rebuilds; a log line and a metric record each price switch. `switchyard route explain` and `switchyard eval` use the prices in force now.
+- **Catalog data.** The two Gemini changes, in the shipped catalog and its bundled copies (compose, Helm chart).
+- **Docs.** The catalog README, the configuration reference, DESIGN, the CHANGELOG.
+
+**Acceptance**
+
+- [x] A deployment with a change resolves to the base prices before `from` and to the changed prices from it, with inheritance, for both date and timestamp forms (unit tests with a fixed clock).
+- [x] Invalid changes are rejected with the file, line and path: a malformed `from`, out of order or duplicate dates, an invalid price.
+- [x] A running gateway switches prices at the boundary without a reload or restart: requests before it are costed at the old prices and after it at the new ones, in the ledger and in budget spend (a test with a controlled clock).
+- [x] `catalog lint` lists the next change per deployment and flags changes already in force.
+- [x] The shipped catalog carries both Gemini changes, and its bundled copies match it.
+
+**Outcome (2026-11-23)**
+
+All five criteria pass, each with automated tests (`TestNewAtResolvesPriceChanges`, `TestPriceChangeValidation`, `TestPriceSwitchAtBoundary`, `TestLint/price_changes`, `TestShippedCatalogPriceChanges` and others). `make check`, `make helm-lint` and the docs check pass; the new app tests pass with `-race -count=50`.
+
+- **Exact switch time.** A timer is set for the next change; a check once a minute retries a failed rebuild and catches a missed timer (clock jumps, sleep). In the test, a request 1 ms after the boundary is costed at the new prices: in the ledger 3 USD before and 8 USD after, in budget spend 3 then 14.
+- **Every charge follows.** The shadow judge and the semantic cache's embedder now charge at their deployment's prices in force (before, they kept their startup prices across reloads too).
+- **Lint never fails on a date.** The next change and a change already in force are notices, so the shipped catalog keeps passing on and after both dates.
+- **Alert.** `SwitchyardCatalogPriceSwitchFailed`, with a runbook entry, and two metrics.
+- **Time zone.** Google names none, so changes take effect at 00:00 UTC. If Google switches at Pacific midnight, costs are overstated for about 8 hours, the safer error for budgets.
+
+**Review.** An independent review found 1 high, 2 medium and 3 low defects, all fixed and verified; the fixes' verification found 2 medium and 2 low more, also fixed. The high one: a price change that made a policy-refused deployment the cheapest would have failed every later price switch and any restart.
+
+**Behaviour change.** An unpinned judge or embedding model whose cheapest deployment a policy refuses now uses the cheapest permitted deployment instead of failing validation, and `switchyard eval` makes the same choice. With an unpinned model id, a price change can move that choice at the next restart (a moved embedder starts a new semantic index); pin `model@provider` to keep it fixed.
+
+**Not yet run:** the switch on GitHub CI and in a release; the Postgres ledger and Redis paths in the price-switch tests (the tests use the memory ledger).
+
+## P11: Native Gemini adapter
+
+**Goal:** a `gemini` provider type that talks to Google's native `generateContent` API, so Gemini requests get what Google's OpenAI-compatible endpoint lacks: reported cached tokens, thinking-token accounting, multi-turn tool calls that keep Gemini 3/4's thought signatures, and long Gemini 4 output.
+
+**Decisions (2026-11-23)**
+
+- **The native `generateContent` API (v1beta)**, which is stateless and fully supported. Google now recommends its Interactions API for new work, but that keeps state on Google's side.
+- **Thought signatures ride inside the tool-call id** returned to the client, so multi-turn tool use works with every OpenAI client and no state is kept. A tool call with no signature (history from another provider or model) gets Google's documented skip value.
+- **Native becomes the default** for the `google` provider in the example configs, the compose stack and the Helm chart. `type: openai` with the compatibility endpoint keeps working.
+- **In scope:** chat, streaming, tools, JSON output, images, thinking control and long Gemini 4 output. **Deferred:** embeddings and safety settings.
+- **Privacy.** Every request sends `store: false`, since new paid projects store requests by default.
+
+**Scope**
+
+- **Requests.** Messages to `contents` and `systemInstruction`; consecutive tool results merged into one turn with the calls' names and ids; tools to `parametersJsonSchema`, `tool_choice` to `functionCallingConfig`; `json_object` and `json_schema` to JSON output; images from base64 data URLs (https image URLs are not fetched, so such a request falls back to another deployment); `max_tokens`, `stop`; `reasoning_effort` to `thinkingLevel`. Parameters the models ignore or reject (`n` > 1, sampling on Gemini 3.6+ and 4, logprobs) are handled through capabilities like any other provider.
+- **Responses and streams.** Parts to content and tool calls; finish reasons (including blocked prompts) to OpenAI's; usage with cached tokens and thinking tokens (billed as output) as `reasoning_tokens`; SSE without a `[DONE]` marker, errors mid-stream, cumulative usage.
+- **Long output.** A non-streaming Gemini 4 request above 32,768 output tokens is served by streaming internally, up to the catalog's 65,536.
+- **Errors.** Google's error body and statuses mapped to the gateway's error kinds, so retries, fallback and breakers behave as for other providers.
+- **Catalog and config.** The Gemini entries' capabilities rechecked for the native API.
+
+**Acceptance**
+
+To be written when P11 starts.
+
 ## Post-MVP backlog
 
 - **SaaS:**
@@ -628,7 +696,8 @@ All three criteria pass against fake upstreams. No real provider has been called
   - A principal cache with revocation over pub/sub.
   - A control-plane UI, billing export, and a ClickHouse usage sink.
 - **Platform:**
-  - A native Gemini adapter, and the Responses API (a stateless subset).
+  - The Responses API (a stateless subset).
+  - Gemini embeddings and safety settings through the native adapter (deferred from P11).
   - Normalizing reasoning parameters across providers.
   - Conversation stickiness and prefix affinity, and automatic Anthropic `cache_control`.
   - Hedged requests for latency profiles, and request coalescing across replicas.

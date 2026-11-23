@@ -97,6 +97,24 @@ func TestCatalogLint(t *testing.T) {
 			},
 		},
 		{
+			name: "a pending price change is a notice",
+			models: "models:\n  - id: m\n    capabilities: [streaming]\n    deployments:\n" +
+				"      - {provider: a, upstream_model: u, pricing: {input: 1, output: 2, " + documented + ", changes: [{from: 2026-12-01, input: 1.5}]}}\n",
+			wantOut: []string{
+				"FILE:11: notice: models[0].deployments[0].pricing.changes[0]: next price change at 2026-12-01 00:00 UTC: input 1.5",
+				"FILE: catalog lint OK (1 model, 0 aliases; 0 warnings, 1 notice)",
+			},
+		},
+		{
+			name: "a price change in force is a notice",
+			models: "models:\n  - id: m\n    capabilities: [streaming]\n    deployments:\n" +
+				"      - {provider: a, upstream_model: u, pricing: {input: 1, output: 2, " + documented + ", changes: [{from: 2026-11-11, input: 1.5}]}}\n",
+			wantOut: []string{
+				"FILE:11: notice: models[0].deployments[0].pricing.changes[0].from: in force since 2026-11-11 00:00 UTC; fold it into the base prices and remove it when convenient",
+				"FILE: catalog lint OK (1 model, 0 aliases; 0 warnings, 1 notice)",
+			},
+		},
+		{
 			name: "quality out of range is a config error",
 			models: "models:\n  - id: m\n    capabilities: [streaming]\n    quality: {coding: 1.2}\n    deployments:\n" +
 				"      - {provider: a, upstream_model: u, pricing: {input: 1, output: 2, " + documented + "}}\n",
@@ -198,5 +216,33 @@ func TestCatalogLintUsage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCatalogLintShippedAfterPriceChanges: once both of the shipped
+// catalog's Gemini changes are in force, lint still passes and reports
+// them as notices to fold into the base prices.
+func TestCatalogLintShippedAfterPriceChanges(t *testing.T) {
+	e := env{
+		"DATABASE_URL": "postgres://localhost:5433/switchyard", "OPENAI_API_KEY": "dummy-openai",
+		"ANTHROPIC_API_KEY": "dummy-anthropic", "GEMINI_API_KEY": "dummy-gemini", "TOGETHER_API_KEY": "dummy-together",
+	}
+	path := filepath.Join("..", "..", "configs", "switchyard.example.yaml")
+	// Within 90 days of the catalog's pricing.checked, so that only the
+	// price changes are reported.
+	after := func() time.Time { return time.Date(2027, 1, 15, 0, 0, 0, 0, time.UTC) }
+	var out, errOut bytes.Buffer
+	code := runCatalog([]string{"lint", "-c", path}, &out, &errOut, e.lookup, after)
+	if code != exitOK || errOut.Len() != 0 {
+		t.Fatalf("exit %d, want 0\nstdout: %s\nstderr: %s", code, out.String(), errOut.String())
+	}
+	for _, want := range []string{
+		"notice: models[8].deployments[0].pricing.changes[0].from: in force since 2027-01-01 00:00 UTC; fold it into the base prices",
+		"notice: models[9].deployments[0].pricing.changes[0].from: in force since 2026-12-01 00:00 UTC; fold it into the base prices",
+		"catalog lint OK (11 models, 4 aliases; 0 warnings, 2 notices)",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("stdout lacks %q:\n%s", want, out.String())
+		}
 	}
 }

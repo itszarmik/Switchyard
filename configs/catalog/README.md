@@ -2,7 +2,7 @@
 
 `models.yaml` is the curated Phase 2 catalog that `configs/switchyard.example.yaml` includes. Every model ID, price, context window and output limit in it was checked against the provider's official pages on **2026-11-11**. Each deployment's `pricing.source` and `pricing.checked` record where and when.
 
-Re-check prices at least every 90 days. `switchyard catalog lint` reports older entries. Two Gemini prices change sooner than that (see below).
+Re-check prices at least every 90 days. `switchyard catalog lint` reports older entries. Two Gemini prices change sooner than that; both changes are in the catalog as dated price changes (see below).
 
 ## Sources
 
@@ -33,7 +33,31 @@ Re-check prices at least every 90 days. `switchyard catalog lint` reports older 
   - Claude Haiku 5.5 prompts over 100,000 tokens cost 0.50 input and 2.50 output.
   - Batch, flex and fast/priority tiers, regional uplifts, and Anthropic's 1-hour cache writes.
 
-## Prices to update soon
+## Dated price changes
+
+A provider that announces a price change gets it in `pricing.changes`, so the change takes effect on its date without anyone editing the catalog that day:
+
+```yaml
+pricing:
+  input: "2.00"
+  output: "10.00"
+  cached_input: "0.10"
+  source: https://aistudio.google.com/docs/pricing
+  checked: "2026-11-11"
+  changes:
+    - from: "2026-12-01"
+      input: "4.00"
+      output: "20.00"
+      cached_input: "0.20"
+```
+
+- **Format.** Each change has a `from` and at least one of `input`, `output`, `cached_input` and `cache_write`. Changes are listed in strictly increasing `from` order.
+- **Inheritance.** A change replaces the prices it gives. A price it leaves out keeps its value from before the change: the base prices, or the earlier changes'.
+- **Time zone.** `from` is a date, `YYYY-MM-DD`, which means 00:00 UTC, or an RFC 3339 timestamp with an offset, such as `2026-12-01T00:00:00-08:00`, for a provider that names a time zone. Google names none for its changes, so they take effect at 00:00 UTC: if Google switches later in the day, the gateway overstates cost for those hours, which is the safer error for budgets.
+- **When it applies.** Prices are resolved when the gateway builds its snapshot: at startup, on each reload, and at each change's time, without a reload (a timer wakes the gateway then; a check once a minute retries a failed switch). Costs in the usage ledger, budget spend, routing and cost caps all switch then; requests in flight finish at the prices they started with. `switchyard route explain` and `switchyard eval` use the prices in force when they run.
+- **Lint.** `switchyard catalog lint` shows each deployment's next change as a notice, and a change already in force as a notice too, so lint keeps passing on the day a change takes effect. Fold such a change into the base prices and remove it when convenient, and update `checked` once you have verified them.
+
+The two changes in the catalog:
 
 - `gemini-4-carbon`: Google lists 2.00 / 10.00 / 0.10 "through November 30, 2026", then 4.00 / 20.00 / 0.20 from December 1, 2026.
 - `gemini-3.8-flash`: Google lists 0.75 / 3.75 / 0.075 through December 31, 2026, then 1.50 / 7.50 / 0.15 from January 1, 2027.

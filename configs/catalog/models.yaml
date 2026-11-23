@@ -12,6 +12,11 @@
 #   - cached_input is the provider's cache-read (cache hit) price.
 #     cache_write is the price of writing tokens to the cache, set only
 #     where the provider charges one per token.
+#   - pricing.changes lists announced price changes. From its `from` date
+#     (00:00 UTC, unless an RFC 3339 timestamp names a time zone) a change
+#     replaces the prices it gives; the others stay. Once a change is in
+#     force, `switchyard catalog lint` notes it (without failing): fold it
+#     into the base prices and remove it when convenient.
 #   - Where a provider has several price tiers, the default tier is used
 #     (standard tier, shortest prompt band, default cache lifetime). The
 #     comment on each deployment names the tiers that are not modelled.
@@ -268,14 +273,20 @@ models:
       - provider: google
         upstream_model: gemini-3.8-flash
         # Paid tier, standard. PRICE CHANGE: Google lists these prices
-        # "through December 31, 2026"; from January 1, 2027 they are
-        # input 1.50, output 7.50, context caching 0.15. Update then.
+        # "through December 31, 2026" and the changed ones from January 1,
+        # 2027. Google names no time zone, so the change takes effect at
+        # 00:00 UTC.
         pricing:
           input: "0.75"
           output: "3.75"
           cached_input: "0.075"
           source: https://aistudio.google.com/docs/pricing
           checked: "2026-11-11"
+          changes:
+            - from: "2027-01-01"
+              input: "1.50"
+              output: "7.50"
+              cached_input: "0.15"
 
   - id: gemini-4-carbon
     context_window: 1048576   # unified input and output limit
@@ -286,15 +297,20 @@ models:
       - provider: google
         upstream_model: gemini-4-carbon
         # Paid tier only, standard. PRICE CHANGE: Google lists these prices
-        # "through November 30, 2026"; from December 1, 2026 they are
-        # input 4.00, output 20.00, context caching 0.20. Update then.
-        # Implicit caching only.
+        # "through November 30, 2026" and the changed ones from December 1,
+        # 2026. Google names no time zone, so the change takes effect at
+        # 00:00 UTC. Implicit caching only.
         pricing:
           input: "2.00"
           output: "10.00"
           cached_input: "0.10"
           source: https://aistudio.google.com/docs/pricing
           checked: "2026-11-11"
+          changes:
+            - from: "2026-12-01"
+              input: "4.00"
+              output: "20.00"
+              cached_input: "0.20"
 
   # ------------------------------------------------------------ Open weight
   # Qwen3.5 9B: Apache-2.0 weights at https://huggingface.co/Qwen/Qwen3.5-9B,
