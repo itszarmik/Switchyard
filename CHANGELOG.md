@@ -4,7 +4,10 @@ All notable changes to Switchyard. Versions follow [Semantic
 Versioning](https://semver.org/); before 1.0, a minor version may change
 the configuration or the API.
 
-## Unreleased
+## v0.3.0 (2026-11-23)
+
+Adds dated catalog prices, so that Google's announced Gemini price changes
+(2026-12-01 and 2027-01-01) take effect on time in a running gateway.
 
 ### Catalog (P10)
 
