@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P9 complete; P10 (dated catalog prices) built and verified locally, not yet committed; then P11 (native Gemini adapter)** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P10 complete; next P11 (native Gemini adapter)** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 and v0.3.0 (dated catalog prices) on 2026-11-23 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -661,7 +661,9 @@ All five criteria pass, each with automated tests (`TestNewAtResolvesPriceChange
 
 **Behaviour change.** An unpinned judge or embedding model whose cheapest deployment a policy refuses now uses the cheapest permitted deployment instead of failing validation, and `switchyard eval` makes the same choice. With an unpinned model id, a price change can move that choice at the next restart (a moved embedder starts a new semantic index); pin `model@provider` to keep it fixed.
 
-**Not yet run:** the switch on GitHub CI and in a release; the Postgres ledger and Redis paths in the price-switch tests (the tests use the memory ledger).
+**Released** as v0.3.0 on 2026-11-23: CI passed on the P10 commit (d5c0ded) and the release commit, and the release workflow's read-only check job (lint, kubeconform, kind install) passed before publishing.
+
+**Not yet run:** the Postgres ledger and Redis paths in the price-switch tests (the tests use the memory ledger), and a live switch on 2026-12-01.
 
 ## P11: Native Gemini adapter
 
