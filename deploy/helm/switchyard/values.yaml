@@ -14,7 +14,7 @@ image:
   # imagePullSecrets, or build the image (make docker) and push it to your
   # own registry (docs/kubernetes.md).
   repository: ghcr.io/itszarmik/switchyard
-  # The image tag. Empty means v<the chart's appVersion>, for example v0.3.0.
+  # The image tag. Empty means v<the chart's appVersion>, for example v0.4.0.
   tag: ""
   # An image digest (sha256:...) to pin the image; the tag is then only
   # informative. Empty pulls by tag.

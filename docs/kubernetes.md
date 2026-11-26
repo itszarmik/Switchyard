@@ -95,7 +95,7 @@ cluster can pull from. For both common node architectures in one image:
 
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -f deploy/Dockerfile -t registry.example.com/platform/switchyard:v0.3.0 --push .
+  -f deploy/Dockerfile -t registry.example.com/platform/switchyard:v0.4.0 --push .
 ```
 
 then set `image.repository` (and `image.tag` if it is not `v<appVersion>`).
@@ -118,7 +118,7 @@ You need an admin token and a first gateway API key:
 
 ```sh
 openssl rand -base64 32               # the admin token (at least 32 characters)
-docker run --rm ghcr.io/itszarmik/switchyard:v0.3.0 keys generate
+docker run --rm ghcr.io/itszarmik/switchyard:v0.4.0 keys generate
                                       # or: switchyard keys generate
 ```
 

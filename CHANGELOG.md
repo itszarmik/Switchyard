@@ -4,7 +4,11 @@ All notable changes to Switchyard. Versions follow [Semantic
 Versioning](https://semver.org/); before 1.0, a minor version may change
 the configuration or the API.
 
-## Unreleased
+## v0.4.0 (2026-11-26)
+
+Adds a native Gemini adapter and makes it the default for the shipped
+`google` provider, with thought signatures kept across multi-turn tool
+calls.
 
 ### Providers (P11)
 
