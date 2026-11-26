@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P10 complete; P11 (native Gemini adapter) built and verified locally, not yet committed** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 and v0.3.0 (dated catalog prices) on 2026-11-23 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P11 complete** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 and v0.3.0 (dated catalog prices) on 2026-11-23 and v0.4.0 (the native Gemini adapter) on 2026-11-26 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -724,6 +724,8 @@ All ten criteria pass with automated tests. Key ones: `TestConformanceThroughGat
 **Review.** An independent review found 1 high, 5 medium and 8 low defects. All were fixed except one low (`parallel_tool_calls: false` is ignored, as documented). The high one: a conversation that moved from Gemini to OpenAI failed on OpenAI's 40-character id limit. My own check of the fixes found the malformed-answer attempts uncharged. Verifying the fixes found 1 medium and 3 low more, also fixed; the medium one undercharged a stream that failed after it had started.
 
 **Not yet run:** anything against the live Gemini API (no key on this machine): the smoke test, the fixture recorder, real SSE framing, real signature sizes, implicit-cache reporting, and whether Google accepts consecutive user contents and uppercase thinking levels. The fixtures are handcrafted from Google's docs. Follow-ups: a validation warning when a provider's `total` exceeds `routing.request_timeout`, and the router's wall-clock `TestDecideLatencyP99`, which can fail on a loaded machine.
+
+**Released** as v0.4.0 on 2026-11-26: CI passed on the P11 commit (026e7c5) and the release commit (5127a71). The release workflow's check job first failed on `TestAcceptanceDropUnsupportedParams`, a Phase 2 test that read the gateway's logs once, before the access-log line had arrived; it passed on a rerun, and the test now waits for the line.
 
 ## Post-MVP backlog
 

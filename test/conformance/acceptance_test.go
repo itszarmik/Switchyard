@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"switchyard/test/conformance/harness"
 	"switchyard/test/fakeanthropic"
@@ -332,22 +333,31 @@ func TestAcceptanceDropUnsupportedParams(t *testing.T) {
 }
 
 // checkRequestLines checks that some access-log line names deployment and
-// has dropped as its dropped_params.
+// has dropped as its dropped_params. The gateway writes the line after the
+// response, and the harness reads stdout in the background, so it waits
+// for the line.
 func checkRequestLines(t *testing.T, g *harness.Gateway, deployment, dropped string) {
 	t.Helper()
-	for _, line := range g.Logs() {
-		var m map[string]any
-		if json.Unmarshal([]byte(line), &m) != nil || m["msg"] != "request" || m["deployment"] != deployment {
-			continue
-		}
-		if m["dropped_params"] == dropped {
-			if _, ok := m["excluded"]; !ok {
-				t.Errorf("request line has no excluded count: %s", line)
+	deadline := time.Now().Add(callTimeout)
+	for {
+		for _, line := range g.Logs() {
+			var m map[string]any
+			if json.Unmarshal([]byte(line), &m) != nil || m["msg"] != "request" || m["deployment"] != deployment {
+				continue
 			}
+			if m["dropped_params"] == dropped {
+				if _, ok := m["excluded"]; !ok {
+					t.Errorf("request line has no excluded count: %s", line)
+				}
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("no request line for %s dropping %s", deployment, dropped)
 			return
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	t.Errorf("no request line for %s dropping %s", deployment, dropped)
 }
 
 func TestAcceptanceCheapestAndPinned(t *testing.T) {
