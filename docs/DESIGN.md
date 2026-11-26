@@ -182,7 +182,7 @@ Dependencies point downward:
 transport        server · api/openaiapi · api/syapi · api/adminapi
 application      gateway          per-endpoint pipeline; the only code that knows the order of steps
 domain           policy · quality · router · executor · cache · budget · ratelimit · usage · catalog · health
-infrastructure   providers/{openai,anthropic} · store/{redis,postgres,memory} · sse · telemetry
+infrastructure   providers/{openai,anthropic,gemini} · store/{redis,postgres,memory} · sse · telemetry
 shared kernel    schema           canonical OpenAI-shaped types, used by every layer
 composition      app              builds every component from a config snapshot; no globals
 ```
@@ -202,7 +202,7 @@ Domain packages own their interfaces, adapters and stores implement them, and on
 | `quality` | The `Assessor` (category, difficulty, signals) and the `Estimator` (a quality estimate per candidate). |
 | `router` | Builds the candidate set, applies hard filters, computes estimates, ranks, and produces a `Plan` with an explanation. |
 | `executor` | Runs the attempt loop over a plan: timeouts, retries with backoff, the retry budget, breakers, concurrency limits, and the stream commit point. |
-| `providers` | One adapter per wire protocol. `openai` covers every OpenAI-compatible upstream; `anthropic` speaks the Messages API. Adapters normalize errors and usage. |
+| `providers` | One adapter per wire protocol. `openai` covers every OpenAI-compatible upstream; `anthropic` speaks the Messages API; `gemini` speaks Google's native generateContent API. Adapters normalize errors and usage. |
 | `sse` | A robust SSE reader and writer, an aggregator that turns chunks into a full response, and replay that turns a full response back into chunks. |
 | `cache` | The exact and semantic caches, key derivation, `Embedder` and `VectorIndex`. |
 | `budget` | Atomic admission of estimated cost, then settlement with the actual cost. |
@@ -269,7 +269,7 @@ type UsageSink interface {
 
 ### 6.2 Provider adapters
 
-**`openai` adapter.** It serves OpenAI and every OpenAI-compatible upstream: Together, Fireworks, Groq, vLLM, Ollama, TGI, and Gemini through Google's OpenAI-compatible endpoint. These upstreams differ in what they support, such as usage reporting in streams, parallel tool calls, `json_schema`, `seed` and `logprobs`. Each deployment declares those differences as capabilities in the catalog, so they live in data rather than in code branches.
+**`openai` adapter.** It serves OpenAI and every OpenAI-compatible upstream: Together, Fireworks, Groq, vLLM, Ollama, TGI, and, if configured so, Gemini through Google's OpenAI-compatible endpoint. The body is forwarded losslessly, with one exception: a tool-call id longer than OpenAI's 40 characters (such as the gemini adapter's, below) is replaced by `call_` + the first 32 characters of the unpadded base64url SHA-256 of the id, the same in the assistant call and the tool message, so a conversation can move from Gemini to an OpenAI-wire deployment. A request without such an id is still forwarded byte for byte. These upstreams differ in what they support, such as usage reporting in streams, parallel tool calls, `json_schema`, `seed` and `logprobs`. Each deployment declares those differences as capabilities in the catalog, so they live in data rather than in code branches.
 
 **`anthropic` adapter (Messages API).** Anthropic positions its OpenAI-compatible endpoint for testing and comparison, not production, and that endpoint doesn't expose every feature, so the MVP speaks the native Messages API.
 
@@ -293,7 +293,46 @@ type UsageSink interface {
 | `chat.completion.chunk` deltas for content and `tool_calls[i].function.arguments`, a finish chunk and a usage chunk | `message_start`, `content_block_start/delta/stop` (`text_delta`, `input_json_delta`), `message_delta`, `message_stop`. `ping` is dropped or becomes a keep-alive comment; `error` becomes an error event. |
 | Retryable errors | 429 rate limited, 529 overloaded, 5xx |
 
-**Gemini** goes through Google's OpenAI-compatible endpoint in the MVP. A native adapter is a post-MVP item, built only if that endpoint's gaps start to matter, for example in reporting cached tokens or in safety settings.
+**`gemini` adapter (native `generateContent` API, P11).** Google's OpenAI-compatible endpoint is beta and drops what matters for cost and tool use: cached-token and thinking-token reporting, forced tool choice, JSON mode, long Gemini 4 output, and the thought signatures that Gemini 3 and 4 require back on multi-turn function calls (standard OpenAI clients drop the field the compat endpoint uses). So the `google` provider speaks the native, stateless v1beta API: `POST {base_url}/models/{model}:generateContent`, or `:streamGenerateContent?alt=sse`, with `base_url` such as `https://generativelanguage.googleapis.com/v1beta`. The key goes only in the `x-goog-api-key` header, never in the URL. `type: openai` with the compatibility endpoint still works.
+
+| OpenAI (canonical) | Gemini generateContent |
+|---|---|
+| `system` and `developer` messages | `systemInstruction` text parts, in order |
+| `user` / `assistant` messages | `user` / `model` contents. Consecutive user messages are merged; an assistant message merges into the one before only if that one has no function calls, so each model content with calls is one step |
+| `tool` messages | One `user` content of `functionResponse{id, name, response}` parts per run of tool messages, in order, never interleaved with the calls. The name comes from the matching assistant tool call (none matching: 400). A JSON-object result is the `response`; other text becomes `{"result": text}` |
+| Assistant `tool_calls[]` | `functionCall{id, name, args}` parts, with the thought signature as the `thoughtSignature` sibling of each step's first call (see below) |
+| `tools[].function{name, description, parameters}` | `tools[].functionDeclarations[]{name, description, parametersJsonSchema}`, the JSON Schema as is; none without parameters |
+| `tool_choice`: `auto`, `none`, `required`, `{function}` | `functionCallingConfig.mode` `AUTO`, `NONE`, `ANY`, `ANY` with `allowedFunctionNames`. Without `tool_choice`, no `toolConfig` |
+| `parallel_tool_calls` | Not sent: Gemini calls in parallel and has no switch, so `false` is not honored |
+| `image_url` as a base64 data URL (png, jpeg, webp, heic, heif) | `inlineData{mimeType, data}`. The gateway does not fetch https URLs. Routing cannot see the difference (both need `vision`), so the adapter refuses such a request at call time: it falls back to the next deployment of the plan, and a plan of only Gemini deployments answers 400 |
+| `response_format`: `json_object`, `json_schema` | `generationConfig.responseMimeType: application/json`, plus `responseJsonSchema` for `json_schema` |
+| `max_tokens` / `max_completion_tokens` | `maxOutputTokens` (thinking included); not sent when absent |
+| `stop` | `stopSequences` (at most 5) |
+| `reasoning_effort` `none`, `minimal`, `low`, `medium`, `high`, `xhigh` | `thinkingConfig.thinkingLevel` `LOW`, `LOW`, `LOW`, `MEDIUM`, `HIGH`, `HIGH`: clamped to the levels every current model accepts. Gemini 3.8 Flash and 4 cannot turn thinking off and reject `MINIMAL`; `XHIGH` exists only on Gemini 4 Neon and Hydrogen, and elsewhere is a 400 that does not fall back, which under `auto` the client could not avoid. Never `thinkingBudget` or `includeThoughts` |
+| (always) | `store: false` |
+| `n > 1`, `logprobs`, `seed`, `temperature`/`top_p`, penalties | Never sent. The catalog lists none of these capabilities, so the gateway excludes the deployment or drops them; the adapter refuses any that still reach it (unsupported). `user` is not sent |
+| A trailing assistant message (prefill) | Unsupported |
+| `choices[0].message`: `content`, `tool_calls` with arguments as a JSON string | Candidate 0's text parts concatenated (`thought` parts skipped), `functionCall` parts; a missing `functionCall.id` is made up |
+| `finish_reason` `stop`, `tool_calls`, `length`, `content_filter` | `STOP` (`tool_calls` when there are calls), `MAX_TOKENS` and `CONTINUATION`, `SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `ESCALATION`, `IMAGE_*`. `OTHER`, `LANGUAGE`, `NO_IMAGE`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS` and unknown values are `stop` (or `tool_calls`). `MALFORMED_FUNCTION_CALL` and `MALFORMED_RESPONSE` are unsupported: they depend on the request, so they fall back to another deployment but are not retried, and count neither toward the breaker nor the provider error-rate alert (a 502 if nothing else serves it). `MISSING_THOUGHT_SIGNATURE` is a 400 client error. Google billed all three answers: the error says so (`Billed`) and carries the answer's usage, which the gateway charges (§12.2), and so do the shadow runner, the judge, `switchyard eval` and the embedder's spend caps |
+| A blocked prompt | `promptFeedback.blockReason`, no candidates, HTTP 200: empty content, `finish_reason: content_filter` |
+| `id`, `model` | `chatcmpl-` + `responseId`; `modelVersion` (else the upstream model). `responseId` is also the upstream request id |
+| `usage.prompt_tokens`, `cached_tokens`, `completion_tokens`, `reasoning_tokens` | `promptTokenCount` (cached included) + `toolUsePromptTokenCount`; `cachedContentTokenCount`; `candidatesTokenCount` + `thoughtsTokenCount`; `thoughtsTokenCount`. The ledger charges cached at `cached_input` and thinking once, at `output` |
+| `chat.completion.chunk` deltas, a finish chunk and a usage chunk | SSE `data: <GenerateContentResponse>` events, no `[DONE]` (the body's end ends the stream); usage is cumulative, the last counts; text deltas as they arrive, function calls when the finish reason arrives (a call split over events, same id, is merged); a `data:` object with a top-level `error` ends the stream with an error of its code's kind |
+| Errors | 400 `INVALID_ARGUMENT` client error, except ErrorInfo `API_KEY_INVALID` (auth) and an input-token-limit message (context length); 400 `FAILED_PRECONDITION`, 401, 402, 403 auth; 404 not found; 408, 504 timeout; 413 context length; 429 rate limited, with `RetryInfo.retryDelay` (else `Retry-After`); 500, 503 and other 5xx server error. Bodies are kept, as OpenAI envelopes, only for the client-visible kinds and never when they contain the key |
+
+**Thought signatures in tool-call ids.** Gemini returns a `thoughtSignature` on the first `functionCall` part of each step and rejects the next request (400) if the current turn's steps lack them. The adapter keeps no state: the tool-call id it returns is `gm1_` + unpadded base64url of a flags byte, the first 6 bytes of SHA-256 of the upstream model, the uvarint length of Gemini's id, the id, the signature (its decoded bytes when standard base64 gives the same text back, else the text) and a 4-byte SHA-256 check. The id uses only `[A-Za-z0-9_-]`. On the way back each assistant `tool_calls[].id` and `tool_call_id` is decoded:
+
+- An id the adapter made for the same upstream model: Gemini's id goes in `functionCall.id` and `functionResponse.id`, and the step's first call gets its signature back byte for byte.
+- An id the adapter made for another Gemini model: its decoded Gemini id is sent, but never the signature, which only the model that made it accepts.
+- Any other id (another provider's, hand-written, cut short or edited, which the check catches): sent as the client wrote it.
+
+The first call of every step that does not get its own signature (the last two cases, and a call Gemini returned unsigned) gets Google's documented skip value `skip_thought_signature_validator`, since a current-turn step without a signature is a 400 that does not fall back; no other call ever gets one. Signatures on text parts are dropped: Google recommends returning them but does not check them, so a long text-only conversation may lose a little quality.
+
+A signature of n bytes makes an id of about 4n/3 + 30 bytes (374 bytes for 256, 1,398 for 1 KiB, 5,494 for 4 KiB). Other providers cap tool-call ids: OpenAI rejects one over 40 characters with a 400 (`string_above_max_length`), which would fail every later turn of a conversation that moved there through `auto`, substitution or fallback. So the `openai` adapter shortens ids over 40 characters, and the `anthropic` adapter ids over 64 (Anthropic documents no limit; the bound is defensive), each to the same 37-character hash in the call and its result. Nothing maps them back: the client keeps the original ids, which still decode if the conversation returns to Gemini. A client that itself cuts long ids gets the skip value, not an error. Long ids also count toward the gateway's input estimate (body bytes / 4).
+
+**Long output.** Google refuses `maxOutputTokens` above 32,768 on non-streaming calls to Gemini 4 Carbon, and without one caps them at 32,768, thinking included. A non-streaming request whose output limit is above 32,768 is therefore sent to `streamGenerateContent` and the stream aggregated into the normal JSON response (for every model; it is harmless elsewhere). The limit is the client's `max_tokens` or `max_completion_tokens`, else the catalog's `max_output_tokens`; without a client limit no `maxOutputTokens` is sent, so the stream gets the model's default. Only the provider's total timeout bounds the call, as for any non-streaming call, and its TTFT is the time to the first event. Google advises timeouts of at least 15 minutes for long Gemini 4 Carbon output; the shipped configs keep the google provider's `total` at 10m, the default `routing.request_timeout`, which caps every call, and say to raise both to serve it.
+
+Deferred: embeddings, safety settings, explicit caches, continuation tokens, service tiers.
 
 ## 7. Request data flow
 
@@ -618,6 +657,7 @@ Every request appends one event, including cache hits and failures:
 
 `id (UUIDv7) · ts · tenant · key · endpoint · requested_model · profile · served_deployment · provider · cache_status · status · attempts · fallback_reason · input / cached / cache_write / output tokens · usage_estimated · cost_usd · baseline_model · baseline_cost_usd · overhead_cost_usd · latency_ms · ttft_ms · tags (jsonb) · route_reason · matched_rule · shadow_deployment (observe mode) · config_version`
 
+- **Failed attempts that were billed.** `cost_usd` is the served deployment's tokens at its prices. An attempt the upstream answered and billed but the adapter failed (Gemini's `MALFORMED_FUNCTION_CALL`, `MALFORMED_RESPONSE`, or `MISSING_THOUGHT_SIGNATURE` on a 200; `providers.Error.Billed` with its usage) is charged its exact usage at its own deployment's prices into `overhead_cost_usd`, whether or not a fallback then served the request, and into the budgets' settlement and `cost_usd_total` for that deployment. Its tokens are not added to the event's token counts, which stay the served deployment's. **Attribution differs by view:** the ledger records the cost on the request's one event, so reports grouped by model or provider count it under the deployment that served the request (for example Anthropic after a Gemini attempt), while `switchyard_cost_usd_total` counts it under the deployment that billed it. Totals agree. A request no upstream served is otherwise charged its estimate when an attempt may have been billed (a timeout, a 5xx, a cancellation), as before.
 - The Postgres table is partitioned by month, so retention is cheap (drop old partitions), and indexed on `(tenant, ts)`.
 - **Writer:** a bounded in-memory queue feeds batches of 500 events, or whatever has arrived after 1 s, written with `COPY`. If the database is down, the writer buffers and retries with backoff. If the buffer overflows, the oldest events are dropped, `usage_events_dropped_total` increments, and an alert fires; a disk spool is a post-MVP option. Graceful shutdown flushes the queue.
 - In the MVP, reports read the event table directly. A daily rollup table can be added when volume calls for it, and the sink interface allows ClickHouse in a SaaS deployment.
@@ -635,7 +675,7 @@ Every request appends one event, including cache hits and failures:
 - **`baseline_cost`:** the same token counts priced at the baseline model's cheapest deployment. This is an approximation, since another model would tokenize and answer differently, and every report says so.
 - **Routing savings** = `baseline_cost − actual_cost`. This can be negative, for example when a fallback costs more, and it's reported as is.
 - **Cache savings** = the `baseline_cost` of the call the cache avoided.
-- **Net savings** = gross savings − overhead. Overhead covers embedding calls now, and assessor and shadow calls later.
+- **Net savings** = gross savings − overhead. Overhead covers the gateway's own spend (embedding calls, shadow and judge calls) and provider spend on attempts an upstream billed without serving the request (§12.2), so a failed Gemini answer lowers the net savings of the request that then succeeded elsewhere.
 - **In observe mode**, projected savings = `baseline_cost` − the estimated cost of the deployment Switchyard would have chosen. Projected savings are reported separately and marked unverified until Phase 8's shadow evaluation checks quality.
 
 ### 12.5 Reporting API
@@ -660,7 +700,7 @@ Every request appends one event, including cache hits and failures:
 }
 ```
 
-`cost_usd` includes overhead, so `net = baseline − cost`. Money is serialized as decimal strings. Supported groupings are day, model, provider, key, tag, profile and cache status.
+`cost_usd` includes overhead, so `net = baseline − cost`. Money is serialized as decimal strings. Supported groupings are day, model, provider, key, tag, profile and cache status. A billed failed attempt's cost (§12.2) is overhead on its request's event, so a model or provider group counts it under the deployment that served the request; `switchyard_cost_usd_total` counts it under the deployment that billed it.
 
 ## 13. Policies & rule engine
 
@@ -887,9 +927,10 @@ providers:
     api_key: ${ANTHROPIC_API_KEY}
     forward_headers: [anthropic-beta]  # client headers are not forwarded unless listed
   - id: google
-    type: openai                       # Gemini via Google's OpenAI-compatible endpoint (MVP)
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    type: gemini                       # Google's native API; type openai with .../v1beta/openai also works
+    base_url: https://generativelanguage.googleapis.com/v1beta
     api_key: ${GEMINI_API_KEY}
+    timeouts: { first_token: 2m, total: 10m }
   - id: together
     type: openai
     base_url: https://api.together.xyz/v1
@@ -1086,7 +1127,8 @@ switchyard/
 │   ├── executor/              # attempts, retries, fallback, breakers, deadlines
 │   ├── providers/             # Adapter interface, error kinds, registry
 │   │   ├── openai/            # OpenAI and every OpenAI-compatible upstream
-│   │   └── anthropic/         # Messages API, including SSE translation
+│   │   ├── anthropic/         # Messages API, including SSE translation
+│   │   └── gemini/            # generateContent, SSE translation, signature-carrying ids
 │   ├── sse/                   # reader, writer, aggregator, replay
 │   ├── cache/                 # exact, semantic, key derivation, embedder client
 │   ├── budget/
@@ -1168,12 +1210,13 @@ CI runs unit and component tests on every push, and integration and conformance 
 | D9 | Upstream calls use the same stream mode as the client | Always stream upstream and aggregate | Keeps non-streaming responses byte-faithful. The aggregator still exists for caching. |
 | D10 | Budgets via atomic admission of the estimate, then settlement, in integer micro-USD | Check-then-act; reservations with expiry | No overshoot from concurrency; a crash errs toward over-counting; one key per window. |
 | D11 | YAML with `${…}` secret references, strict decoding and atomic reload | TOML; env vars only; viper or koanf | YAML fits ops tooling such as Helm and Kubernetes, strict decoding catches typos, and the approach needs few dependencies. |
-| D12 | A native Anthropic adapter; Gemini through Google's OpenAI-compatible endpoint for the MVP | Native adapters for every provider; the compatibility endpoints for all of them | Anthropic positions its compatibility endpoint for testing rather than production, and it lacks some features. Google's endpoint is good enough to start with. |
+| D12 | A native Anthropic adapter; Gemini through Google's OpenAI-compatible endpoint for the MVP (the Gemini half is superseded by D18) | Native adapters for every provider; the compatibility endpoints for all of them | Anthropic positions its compatibility endpoint for testing rather than production, and it lacks some features. Google's endpoint is good enough to start with. |
 | D13 | First-match declarative rules now, CEL later | CEL now; a custom DSL | It's the simplest thing that covers the stated needs, and CEL fits the same rule shape later. |
 | D14 | Gateway endpoints under `/switchyard/v1`, with admin on a separate listener | Adding them under `/v1`; a single listener | Avoids collisions with future OpenAI paths and keeps admin from being exposed by accident. |
 | D15 | No payload logging; the cache is the only content store, and it's opt-in | Logging prompts for debugging | Privacy by default. Storing content is an explicit operator choice. |
 | D16 | Refusals and content filters are never retried on another provider | Treating them as retryable | Prevents policy evasion by refusal shopping. |
 | D17 | Dated prices are resolved when the catalog is built, and the gateway rebuilds its snapshot at each change, on a timer for the next one (P10, 2026-11-23) | Every consumer looking prices up by time; editing the catalog on the day; a fixed once-a-minute check (up to a minute late) | One price set per snapshot keeps ranking, caps, accounting and budgets consistent with each other, and an announced change applies on time without anyone editing the catalog. Price-dependent choices (the judge's and embedder's deployment) pick among permitted deployments only, so no price change can fail a switch or a startup. |
+| D18 | A native Gemini adapter (generateContent v1beta) as the default for `google`, carrying thought signatures in the tool-call id (`gm1_` + base64url of a model hash, Gemini's id, the signature and a check), with Google's skip value for ids without a signature for the model; the `openai` and `anthropic` adapters shorten tool-call ids over 40 and 64 characters to a hash (P11, 2026-11-25) | Keeping the OpenAI-compatible endpoint; emitting and accepting `extra_content.google.thought_signature` as that endpoint does; caching signatures in the gateway by id (Redis, with a TTL); the Interactions API | The compatibility endpoint is beta and lacks cached and thinking token reporting, forced tools, JSON mode and long output, and standard OpenAI clients drop its signature field, which breaks multi-turn tools on Gemini 3 and 4. The id is the one field every client echoes, so the design needs no state, no TTL and no client changes. The cost is long ids (about 4/3 of the signature), which other providers' limits make the gateway shorten when a conversation moves on. The Interactions API keeps state on Google's side. |
 
 ## 22. Risks & mitigations
 

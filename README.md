@@ -130,7 +130,7 @@ routing:
 
 **Choosing a deployment.** The candidates that pass the hard filters (capabilities, and context window ≥ estimated input + output tokens) are ranked by estimated cost. Unknown prices rank last, and ties keep config order. If nothing is eligible, the error names every deployment and why it was excluded.
 
-**Stream usage.** For a streamed request to a deployment with `stream_usage`, the gateway sets `stream_options.include_usage` so it can log the usage. A deployment without it gets the client's `stream_options` unchanged (or none), because some hosts reject the option; usage may then be missing, and the request line omits `prompt_tokens` and `completion_tokens` instead of logging 0. They are logged as 0 only when no tokens were spent: the request was rejected before or by the provider. When a provider repeats usage on several chunks (Gemini's endpoint may), the last one is kept.
+**Stream usage.** For a streamed request to a deployment with `stream_usage`, the gateway sets `stream_options.include_usage` so it can log the usage. A deployment without it gets the client's `stream_options` unchanged (or none), because some hosts reject the option; usage may then be missing, and the request line omits `prompt_tokens` and `completion_tokens` instead of logging 0. They are logged as 0 only when no tokens were spent: the request was rejected before or by the provider. When a provider repeats usage on several chunks (Gemini's OpenAI-compatible endpoint may, and Gemini's native stream does), the last one is kept.
 
 **The curated catalog.** [configs/catalog/models.yaml](configs/catalog/models.yaml) lists current OpenAI, Anthropic, Gemini, Together and self-hosted models with prices checked on 2026-11-11, each with its source, and Google's announced Gemini price changes as dated changes (`pricing.changes`), which the gateway puts in force at their time, without a reload. [configs/catalog/README.md](configs/catalog/README.md) explains every price and capability decision and the format of price changes. The self-hosted vLLM deployment is commented out until you set its amortized price.
 
@@ -143,8 +143,8 @@ It prints notices, which don't fail it, for each deployment's next price change,
 
 ```sh
 $ bin/switchyard catalog lint -c configs/switchyard.example.yaml   # with the provider keys set
-configs/catalog/models.yaml:286: notice: models[8].deployments[0].pricing.changes[0]: next price change at 2027-01-01 00:00 UTC: input 1.50, output 7.50, cached_input 0.15
-configs/catalog/models.yaml:310: notice: models[9].deployments[0].pricing.changes[0]: next price change at 2026-12-01 00:00 UTC: input 4.00, output 20.00, cached_input 0.20
+configs/catalog/models.yaml:298: notice: models[8].deployments[0].pricing.changes[0]: next price change at 2027-01-01 00:00 UTC: input 1.50, output 7.50, cached_input 0.15
+configs/catalog/models.yaml:322: notice: models[9].deployments[0].pricing.changes[0]: next price change at 2026-12-01 00:00 UTC: input 4.00, output 20.00, cached_input 0.20
 configs/switchyard.example.yaml: catalog lint OK (11 models, 4 aliases; 0 warnings, 2 notices)
 ```
 
@@ -152,18 +152,19 @@ configs/switchyard.example.yaml: catalog lint OK (11 models, 4 aliases; 0 warnin
 
 Each provider has a `type`, its wire protocol.
 
-- **`openai`**: OpenAI and every OpenAI-compatible host (Together, Fireworks, Groq, vLLM, Ollama and others). Requests are forwarded losslessly: the body reaches the provider unchanged except for `model` and the parameters the gateway removes (see [Model catalog](#model-catalog)). `base_url` is the API root that ends in `/v1`. Declare each host's capabilities per deployment; a host that accepts fewer parameters than the model's list says gets a deployment-level `capabilities` list.
+- **`openai`**: OpenAI and every OpenAI-compatible host (Together, Fireworks, Groq, vLLM, Ollama and others). Requests are forwarded losslessly: the body reaches the provider unchanged except for `model` and the parameters the gateway removes (see [Model catalog](#model-catalog)), and tool-call ids longer than OpenAI's 40 characters (Gemini's, which carry thought signatures), which are replaced by a 37-character hash so a conversation can move from Gemini to OpenAI. `base_url` is the API root that ends in `/v1`. Declare each host's capabilities per deployment; a host that accepts fewer parameters than the model's list says gets a deployment-level `capabilities` list.
 - **`anthropic`**: the Messages API at `{base_url}/v1/messages`, with `base_url: https://api.anthropic.com`. The adapter translates the OpenAI request into a Messages request and the answer (or every stream event) back into `chat.completion` objects, following DESIGN §6.2: system and developer messages become the system prompt, tools and tool results map one to one, images must be data URLs, `max_tokens` defaults to the model's `max_output_tokens`, `stop` becomes `stop_sequences`, and `user` becomes `metadata.user_id`. `response_format: json_schema` uses native structured outputs, so only a deployment with `json_schema` gets it; the schema is reduced to the subset Anthropic supports, as Anthropic's SDKs do (unsupported keywords such as `minimum` or `maxLength` move into the field's description, and every object gets `additionalProperties: false`), whether or not the client set `strict`. `json_object` is a system-prompt instruction. Tool-call ids that don't match Anthropic's pattern are mapped to valid ones. Usage is normalized (cache reads into `prompt_tokens_details.cached_tokens`), and errors map to OpenAI envelopes, with 529 `overloaded_error` as a 502. Fields without a Messages API equivalent are never forwarded, so the catalog must not declare `n`, `logprobs`, `seed`, `penalties` or `temperature_2` for Anthropic deployments. Client headers such as `anthropic-beta` pass only when listed in `forward_headers`.
-- **Gemini** uses Google's OpenAI-compatible endpoint with `type: openai`:
+- **`gemini`**: Google's native Gemini API, `{base_url}/models/{model}:generateContent` and `:streamGenerateContent?alt=sse`, with `base_url: https://generativelanguage.googleapis.com/v1beta`. The key is sent only in the `x-goog-api-key` header. The adapter translates both ways, following DESIGN §6.2: system and developer messages become `systemInstruction`, tools become function declarations with your JSON Schema as is, `tool_choice` maps to `AUTO`, `NONE` and `ANY` (with a named function), `json_object` and `json_schema` use Google's JSON output, `reasoning_effort` becomes `thinkingLevel`, images must be data URLs, and every request sends `store: false`. Usage reports cached tokens and thinking tokens (`reasoning_tokens`, billed as output). Gemini 3 and 4 need their thought signatures back on multi-turn tool calls: the gateway carries them inside the tool-call ids it returns, so any OpenAI client that sends the ids back unchanged keeps them, with no state in the gateway. A non-streaming request is streamed internally and returned as normal JSON when its output limit is above 32,768 tokens, Google's non-streaming cap on Gemini 4 Carbon: the client's `max_tokens` (or `max_completion_tokens`), else the catalog's `max_output_tokens`. With the shipped catalog (65,536 for both Gemini models) that is every non-streaming request without a `max_tokens` of 32,768 or less. `temperature` and `top_p` are removed, as for every deployment without `sampling`, and the request is served; `n` > 1, `logprobs`, `seed` and penalties need capabilities the Gemini models don't list, so they exclude the deployment (or are removed with `drop_unsupported_params`). Requests the API can't express (an https image URL, a trailing assistant message) go to another deployment or get a 400 that names the reason. `reasoning_effort` is clamped to the levels every current model accepts (`minimal` → low, `xhigh` → high), and `parallel_tool_calls: false` is not honored (Gemini has no switch). The shipped configs use it for the `google` provider:
 
   ```yaml
   - id: google
-    type: openai
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    type: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
     api_key: ${GEMINI_API_KEY}
+    timeouts: { first_token: 2m, total: 10m }   # = routing.request_timeout; raise both (Google advises >= 15m) for long Gemini 4 Carbon output
   ```
 
-  Google calls this endpoint beta. The curated catalog declares only what Google's compatibility page documents (see [configs/catalog/README.md](configs/catalog/README.md)).
+  Google's OpenAI-compatible endpoint (`type: openai`, `base_url: https://generativelanguage.googleapis.com/v1beta/openai`, which Google calls beta) still works, but it lacks forced tool choice, JSON mode, cached-token reporting and thought signatures that standard clients keep; give its deployments the narrower capability list in [configs/catalog/README.md](configs/catalog/README.md).
 
 ## API keys
 
@@ -461,7 +462,7 @@ Log lines about the ledger carry event IDs and counts, never event contents.
 
 - `requests`, `errors` (status 400 and above) and `unpriced_requests`;
 - token counts per class;
-- `cost_usd` (the known cost plus overhead), `baseline_cost_usd`, `overhead_usd` (the gateway's own spend, shadow sampling's included; see [Shadow sampling and feedback](#shadow-sampling-and-feedback)), and `savings_usd` with `routing`, `cache` and `net` (`net = baseline_cost_usd − cost_usd`); money is an exact decimal string;
+- `cost_usd` (the known cost plus overhead), `baseline_cost_usd`, `overhead_usd` (the gateway's own spend, shadow sampling's included, see [Shadow sampling and feedback](#shadow-sampling-and-feedback), plus provider spend on attempts an upstream billed without serving the request, such as a Gemini `MALFORMED_FUNCTION_CALL` before a fallback; grouped by model or provider, that cost appears under the deployment that served the request, while `switchyard_cost_usd_total` counts it under the one that billed it), and `savings_usd` with `routing`, `cache` and `net` (`net = baseline_cost_usd − cost_usd`); money is an exact decimal string;
 - `projected_savings_usd`: what observe mode estimates routing would have saved, `baseline − shadow` over the observe-mode events whose cost and shadow cost are known. It is **projected, not realized**: the shadow deployment never served those requests and its quality is unverified, so it is never part of `savings_usd`;
 - `cache_hit_rate` and `fallback_rate`.
 

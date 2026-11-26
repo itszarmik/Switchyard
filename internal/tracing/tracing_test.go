@@ -284,3 +284,11 @@ func TestStartUntracedAllocs(t *testing.T) {
 		}
 	}
 }
+
+func TestGenAISystem(t *testing.T) {
+	for typ, want := range map[string]string{"openai": "openai", "anthropic": "anthropic", "gemini": "gcp.gemini"} {
+		if got := GenAISystem(typ); got != want {
+			t.Errorf("GenAISystem(%q) = %q, want %q", typ, got, want)
+		}
+	}
+}

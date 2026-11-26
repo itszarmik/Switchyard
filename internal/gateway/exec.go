@@ -20,6 +20,7 @@ import (
 	"switchyard/internal/reqctx"
 	"switchyard/internal/schema"
 	"switchyard/internal/tracing"
+	"switchyard/internal/usage"
 )
 
 // Route reasons, for the X-Switchyard-Route-Reason header and the logs.
@@ -348,8 +349,10 @@ func (g *snapshot) sleep(ctx context.Context, rec *record, d time.Duration) bool
 // panic goes on: neither may leak.
 //
 // It also notes whether the attempt reached the upstream (see sentTrace)
-// and may have been billed without serving the request (see billable):
-// such a request is charged its estimate (see record.account).
+// and was or may have been billed without serving the request (see
+// record.noteBilled): such an attempt is charged its exact usage when the
+// upstream reported it, and a request no upstream served is otherwise
+// charged its estimate (see record.account).
 //
 // The attempt is traced as a tracing.SpanUpstreamAttempt span (see
 // endAttemptSpan), the parent of the adapter's HTTP call; retryReason is
@@ -371,8 +374,8 @@ func (g *snapshot) runAttempt(ctx context.Context, rec *record, e *planEntry, ad
 	dur := time.Since(start)
 	ended = true
 	e.prov.Release()
-	if !rec.served && sent.Load() && billable(a.kind) {
-		rec.sentTo = e.d
+	if !rec.served && sent.Load() {
+		rec.noteBilled(e.d, a)
 	}
 	g.recordAttempt(ctx, rec, e, a, dur)
 	endAttemptSpan(span, rec.attempts, e.d, a, retryReason)
@@ -399,7 +402,7 @@ func endAttemptSpan(span trace.Span, n int, d *catalog.Deployment, a attempt, re
 		if retryReason != "" {
 			span.SetAttributes(tracing.AttrRetryReason.String(retryReason))
 		}
-		ga := tracing.GenAI{System: d.ProviderType, RequestModel: d.UpstreamModel}
+		ga := tracing.GenAI{System: tracing.GenAISystem(d.ProviderType), RequestModel: d.UpstreamModel}
 		if u := a.usage; u != nil {
 			ga.InputTokens, ga.OutputTokens = u.PromptTokens, u.CompletionTokens
 		}
@@ -424,12 +427,36 @@ func sentTrace(ctx context.Context, sent *atomic.Bool) context.Context {
 	})
 }
 
+// noteBilled records attempt a on d, which reached the upstream without
+// serving the request, when it was or may have been billed. An answer the
+// upstream billed and the adapter failed (providers.Error.Billed, such as
+// Gemini's MALFORMED_FUNCTION_CALL) with its usage reported, at known
+// prices, is charged exactly, whether or not a later attempt serves the
+// request (see record.billed). Any other billed or billable failure makes
+// d the deployment a request no upstream served is charged its estimate
+// at (sentTo).
+func (r *record) noteBilled(d *catalog.Deployment, a attempt) {
+	var pe *providers.Error
+	isErr := errors.As(a.err, &pe)
+	if u := providers.BilledUsage(a.err); u != nil {
+		t := usage.FromUsage(u)
+		if c, ok := usage.CostFor(d.Model.Type, t, d.Prices); ok {
+			r.billed = append(r.billed, billedAttempt{d: d, tokens: t, cost: c})
+			return
+		}
+	}
+	if billable(a.kind) || (isErr && pe.Billed) {
+		r.sentTo = d
+	}
+}
+
 // billable reports whether an attempt that reached the upstream and ended
 // with kind, without serving the request, may have been billed: anything
 // but an upstream refusal (a 4xx answer), which is not, and the adapter's
 // own rejection, which never reaches the upstream. A cancellation, a
 // timeout, a broken connection and a 5xx may all come after the upstream
-// did the work.
+// did the work. An *Error whose Billed is set was billed whatever its kind
+// (see noteBilled).
 func billable(k providers.Kind) bool {
 	switch k {
 	case providers.KindClientError, providers.KindAuth, providers.KindNotFound, providers.KindContextLength,
@@ -608,8 +635,14 @@ func (g *snapshot) streamAttempt(ctx context.Context, ex Exchange, rec *record, 
 
 	kind, serr := pump(ex, rec, s, *info, wantUsage, &wait, conv)
 	// A stream that did not complete may have reported only part of its
-	// usage, such as Anthropic's message_start (see record.account).
+	// usage, such as Anthropic's message_start (see record.account). One
+	// that ended with an answer the upstream billed (providers.Error.Billed,
+	// such as Gemini's MALFORMED_FUNCTION_CALL) reported its final usage,
+	// which is charged as is, once, as the served deployment's.
 	rec.usage, rec.usagePartial = s.Usage(), kind != ""
+	if u := providers.BilledUsage(serr); u != nil {
+		rec.usage, rec.usagePartial = u, false
+	}
 	rec.upstreamWait += wait
 	return attempt{kind: kind, err: serr, committed: true, ttft: s.TTFT(), usage: rec.usage}
 }

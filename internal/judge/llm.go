@@ -280,7 +280,10 @@ func (j *LLM) call(ctx context.Context, req *schema.ChatRequest, acc *costAcc, m
 	})
 	var charge int64
 	switch {
-	case err != nil && !providers.Kind(providers.Outcome(err)).MayHaveBilled():
+	case err != nil && providers.BilledUsage(err) != nil:
+		// An answer the upstream billed although the adapter failed it.
+		charge = callCost(providers.BilledUsage(err), j.prices(), est)
+	case err != nil && !providers.MayHaveBilled(err):
 		charge = 0
 	case err != nil:
 		charge = est

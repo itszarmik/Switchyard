@@ -2,7 +2,10 @@ package providers
 
 import (
 	"errors"
+	"fmt"
 	"testing"
+
+	"switchyard/internal/schema"
 )
 
 // TestKindPolicy is the error taxonomy of DESIGN §14.1.
@@ -86,5 +89,35 @@ func TestRetryable(t *testing.T) {
 				t.Errorf("Retryable = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestMayHaveBilled checks the package helpers: an *Error that says the
+// upstream billed it was billed whatever its kind, and carries its usage;
+// otherwise the kind decides, and a non-*Error counts as transport.
+func TestMayHaveBilled(t *testing.T) {
+	u := &schema.Usage{PromptTokens: 3, CompletionTokens: 4, TotalTokens: 7}
+	tests := []struct {
+		name   string
+		err    error
+		billed bool
+		usage  *schema.Usage
+	}{
+		{"billed answer with usage", &Error{Kind: KindUnsupported, Billed: true, BilledUsage: u}, true, u},
+		{"wrapped", fmt.Errorf("call: %w", &Error{Kind: KindClientError, Billed: true, BilledUsage: u}), true, u},
+		{"billed answer without usage", &Error{Kind: KindUnsupported, Billed: true}, true, nil},
+		{"usage without Billed is ignored", &Error{Kind: KindUnsupported, BilledUsage: u}, false, nil},
+		{"unsupported", &Error{Kind: KindUnsupported}, false, nil},
+		{"client error", &Error{Kind: KindClientError}, false, nil},
+		{"server error", &Error{Kind: KindServerError}, true, nil},
+		{"not an *Error", errors.New("boom"), true, nil},
+	}
+	for _, tt := range tests {
+		if got := MayHaveBilled(tt.err); got != tt.billed {
+			t.Errorf("%s: MayHaveBilled = %v, want %v", tt.name, got, tt.billed)
+		}
+		if got := BilledUsage(tt.err); got != tt.usage {
+			t.Errorf("%s: BilledUsage = %v, want %v", tt.name, got, tt.usage)
+		}
 	}
 }

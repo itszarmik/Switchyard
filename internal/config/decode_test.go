@@ -298,7 +298,7 @@ func TestAliasProblemLocations(t *testing.T) {
 		root := `version: 1
 providers:
   - id: a
-    type: &t gemini
+    type: &t bedrock
     base_url: https://a.example
   - id: b
     type: *t

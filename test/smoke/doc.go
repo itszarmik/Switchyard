@@ -1,7 +1,8 @@
-// Package smoke holds the opt-in live smoke test: it runs the gateway
-// against a real OpenAI-compatible provider. The test is behind the smoke
-// build tag and skips when OPENAI_API_KEY is unset, so CI never calls a
-// provider.
+// Package smoke holds the opt-in live smoke tests: they run the gateway
+// against a real OpenAI-compatible provider (TestSmoke) and against
+// Google's native Gemini API (TestSmokeGemini, see its doc). The tests are
+// behind the smoke build tag and each skips when its key (OPENAI_API_KEY,
+// GEMINI_API_KEY) is unset, so CI never calls a provider.
 //
 //	OPENAI_API_KEY=sk-... make smoke
 //	OPENAI_API_KEY=sk-... SMOKE_MODEL=gpt-5-nano go test -tags smoke -count=1 -v ./test/smoke

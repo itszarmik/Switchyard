@@ -497,3 +497,49 @@ func TestNewLLMValidation(t *testing.T) {
 		})
 	}
 }
+
+// billedFailure is an adapter whose calls fail with err.
+type billedFailure struct{ err error }
+
+func (b billedFailure) Chat(context.Context, *providers.Request) (*providers.Response, error) {
+	return nil, b.err
+}
+
+func (b billedFailure) ChatStream(context.Context, *providers.Request) (providers.Stream, error) {
+	return nil, b.err
+}
+
+// TestBilledFailure: an answer the upstream billed but the adapter failed
+// (Gemini's MALFORMED_FUNCTION_CALL, an unsupported kind) is charged its
+// billed usage at the judge's prices, or its estimate without usage,
+// although its kind alone says it was not billed.
+func TestBilledFailure(t *testing.T) {
+	// 1,000 prompt and 100 completion tokens at 1 input / 2 output per 1M:
+	// 1,200 per 1M = 1,200,000 nano-USD.
+	u := &schema.Usage{PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100}
+	d, _ := testDeployment(t, "openai", "http://127.0.0.1:1/v1", "")
+	p := testPair(t)
+	for _, tt := range []struct {
+		name string
+		err  *providers.Error
+		want func(j *judge.LLM) int64
+	}{
+		{"with usage", &providers.Error{Kind: providers.KindUnsupported, Billed: true, BilledUsage: u},
+			func(*judge.LLM) int64 { return 1_200_000 }},
+		{"without usage", &providers.Error{Kind: providers.KindUnsupported, Billed: true},
+			func(j *judge.LLM) int64 { return j.CallCostNano(p) }},
+		{"not billed", &providers.Error{Kind: providers.KindUnsupported},
+			func(*judge.LLM) int64 { return 0 }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			j, err := judge.NewLLM(judge.Options{Adapter: billedFailure{tt.err}, Deployment: d})
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err := j.Judge(context.Background(), p)
+			if err == nil || v.CostNano != tt.want(j) {
+				t.Errorf("verdict %+v, error %v: want CostNano %d", v, err, tt.want(j))
+			}
+		})
+	}
+}

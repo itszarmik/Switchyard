@@ -22,7 +22,8 @@
 #     comment on each deployment names the tiers that are not modelled.
 #   - A capability is listed only when the provider documents it for this
 #     model on the endpoint Switchyard calls (Chat Completions for the
-#     openai adapter, the Messages API for the anthropic adapter).
+#     openai adapter, the Messages API for the anthropic adapter,
+#     generateContent for the gemini adapter).
 #     Undocumented means not listed.
 #   - Quality priors are STARTING ESTIMATES (DESIGN §10.2), not
 #     measurements. Only `general` is set; the other categories fall back
@@ -235,30 +236,41 @@ models:
           checked: "2026-11-11"
 
   # ---------------------------------------------------------------- Google
-  # Gemini through the OpenAI-compatible endpoint (provider type openai).
-  # Limits and features from https://aistudio.google.com/docs/models/<id>.
-  # Endpoint behavior from https://aistudio.google.com/docs/openai, which
-  # says OpenAI library support "is still in beta".
+  # Gemini through Google's native generateContent API (provider type
+  # gemini). Limits and features from https://aistudio.google.com/docs/models/<id>.
+  # Capabilities rechecked for the native API on 2026-11-21 against the
+  # generateContent reference
+  # (https://aistudio.google.com/api-reference/generate-content/generate-content)
+  # and the function-calling, structured-output, thinking, caching and
+  # long-decode guides under https://aistudio.google.com/docs/.
   #
-  # stream_usage: listed. Google's compatibility page passes
-  # stream_options={'include_usage': True} in its streaming example, and the
-  # compatibility reference documents StreamOptions.includeUsage. Forum
-  # reports say usage may appear on every chunk, not only the last, so the
-  # gateway should keep the last usage it sees rather than summing (it
-  # does: the openai adapter keeps the last usage of a stream).
-  # sampling: NOT listed. Google's model guides say Gemini 3.6+ and
-  # Gemini 4 ignore custom temperature, top_p and top_k (the Gemini 4
-  # Carbon guide: remove them, "which are ignored"; Google warns they may
-  # return 400 in a future release), so the gateway removes them.
-  # forced_tools: NOT listed. The AI Studio compatibility page shows only
-  # tool_choice "auto". Google's Vertex (Agent Platform) OpenAI endpoint
-  # documents "required" (mode ANY) but not a named function, and it is a
-  # different endpoint from the one configured here.
-  # Not listed because the compatibility page does not document them:
-  # parallel_tools, json_mode (json_object), n, logprobs, seed, penalties,
-  # temperature_2, completions, and prompt_caching (cached-token reporting
-  # through this endpoint is not documented, although the native API
-  # caches implicitly).
+  # streaming, stream_usage: streamGenerateContent?alt=sse; every event
+  # carries cumulative usageMetadata, so a stream always reports usage.
+  # tools, parallel_tools: functionDeclarations; the model returns several
+  # functionCall parts in one turn (the function-calling guide). Google
+  # documents no switch to turn parallel calls off, so parallel_tool_calls:
+  # false is not honored.
+  # forced_tools: functionCallingConfig mode ANY, with allowedFunctionNames
+  # for a named function.
+  # vision: inline image data (png, jpeg, webp, heic, heif). The gateway
+  # does not fetch https image URLs, so such a request goes to another
+  # deployment.
+  # json_mode, json_schema: responseMimeType application/json, with
+  # responseJsonSchema (plain JSON Schema) for json_schema.
+  # prompt_caching: implicit caching is on by default (minimum 4,096 input
+  # tokens on these models) and hits are reported as
+  # cachedContentTokenCount.
+  # sampling: NOT listed. Google's guides say Gemini 3.6+ and Gemini 4
+  # ignore temperature, top_p and top_k (and may return 400 in a future
+  # release), so the gateway removes them.
+  # Not listed: n (candidateCount is unsupported on Gemini 3 and later),
+  # logprobs, seed and penalties (not documented for these models),
+  # temperature_2 and completions.
+  #
+  # With a google provider of type openai (Google's OpenAI-compatible
+  # endpoint) these lists claim too much: give each deployment
+  # capabilities: [streaming, stream_usage, tools, vision, json_schema]
+  # (see README.md).
   #
   # cache_write is unset: Gemini does not charge per token to write a
   # cache. Explicit caches are billed for storage per token-hour, which the
@@ -267,7 +279,7 @@ models:
   - id: gemini-3.8-flash
     context_window: 1048576   # input limit; output limit is 65,536
     max_output_tokens: 65536
-    capabilities: [streaming, stream_usage, tools, vision, json_schema]
+    capabilities: [streaming, stream_usage, tools, parallel_tools, forced_tools, vision, json_mode, json_schema, prompt_caching]
     quality: { general: 0.44 }   # starting estimate: AA index 31 (high; default not documented)
     deployments:
       - provider: google
@@ -290,8 +302,8 @@ models:
 
   - id: gemini-4-carbon
     context_window: 1048576   # unified input and output limit
-    max_output_tokens: 65536  # synchronous default; up to 1,048,576 with long decode
-    capabilities: [streaming, stream_usage, tools, vision, json_schema]
+    max_output_tokens: 65536  # per response; non-streaming requests above 32,768 are streamed internally
+    capabilities: [streaming, stream_usage, tools, parallel_tools, forced_tools, vision, json_mode, json_schema, prompt_caching]
     quality: { general: 0.86 }   # starting estimate: AA index 60 (high; default not documented)
     deployments:
       - provider: google

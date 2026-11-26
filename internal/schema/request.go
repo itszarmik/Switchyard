@@ -395,6 +395,17 @@ func (r *ChatRequest) Without(fields ...string) (*ChatRequest, []string) {
 	return &c, removed
 }
 
+// WithMessages returns a copy of r whose messages field is raw, encoded as
+// is. raw must hold the same messages in the same order, with the same
+// roles and content: only members Messages does not decode, such as
+// tool-call ids, may differ. r itself is unchanged.
+func (r *ChatRequest) WithMessages(raw json.RawMessage) *ChatRequest {
+	c := *r
+	c.obj = r.obj.clone()
+	c.obj.set(fieldMessages, raw)
+	return &c
+}
+
 // without returns a copy of obj without fields, except those in keep, and
 // the fields that were present. When none was, it returns obj itself.
 func without(obj *object, fields []string, keep ...string) (*object, []string) {

@@ -180,7 +180,11 @@ const (
 	// upstream call, because it cannot translate it to its provider's API
 	// (a content part, a tool type or a parameter the API cannot express).
 	// Another deployment may serve the request, so it falls back; if none
-	// does, the client gets the adapter's 400.
+	// does, the client gets the adapter's 400. The gemini adapter also uses
+	// it for an answer the model could not produce for this request
+	// (finish reason MALFORMED_FUNCTION_CALL), with status 502: it falls
+	// back the same way, without a retry or a breaker count. That answer
+	// was billed, which Error.Billed says: the kind alone does not.
 	KindUnsupported Kind = "unsupported"
 	// KindCanceled means the caller's context was canceled, usually
 	// because the client went away.
@@ -190,8 +194,10 @@ const (
 // MayHaveBilled reports whether an upstream call that failed with kind k
 // may still have been billed: the upstream may have generated before the
 // failure (a transport failure, a timeout, a 5xx, or a cancellation). The
-// refusals (4xx statuses and the adapter's own rejections) were not.
-// Callers that cap spending charge such a call its estimate.
+// refusals (4xx statuses and the adapter's own rejections) were not. An
+// *Error can say more: use the package's MayHaveBilled and BilledUsage,
+// which also honor Error.Billed. Callers that cap spending charge such a
+// call its estimate, or its BilledUsage when known.
 func (k Kind) MayHaveBilled() bool {
 	switch k {
 	case KindTransport, KindTimeout, KindServerError, KindCanceled:
@@ -317,6 +323,37 @@ type Error struct {
 	// Err is the underlying cause, if any. It may contain URLs (never
 	// credentials) and is meant for logs, not clients.
 	Err error
+	// Billed is set when the upstream answered, and billed, a call the
+	// adapter failed anyway because the answer is not one: Gemini's
+	// MALFORMED_FUNCTION_CALL, MALFORMED_RESPONSE or
+	// MISSING_THOUGHT_SIGNATURE finish reasons on a 200. The kind then
+	// says how the gateway routes the failure, not whether it cost money.
+	Billed bool
+	// BilledUsage is the normalized usage that answer reported, or nil if
+	// it reported none. It is set only with Billed.
+	BilledUsage *schema.Usage
+}
+
+// MayHaveBilled reports whether the failed upstream call err may have
+// been billed: when it is an *Error that says the upstream billed it
+// (Billed), or whose kind may have (Kind.MayHaveBilled); and for any other
+// error, as for a transport failure.
+func MayHaveBilled(err error) bool {
+	var e *Error
+	if !errors.As(err, &e) {
+		return KindTransport.MayHaveBilled()
+	}
+	return e.Billed || e.Kind.MayHaveBilled()
+}
+
+// BilledUsage returns the usage of the answer the upstream billed for the
+// failed call err (see Error.BilledUsage), or nil.
+func BilledUsage(err error) *schema.Usage {
+	var e *Error
+	if errors.As(err, &e) && e.Billed {
+		return e.BilledUsage
+	}
+	return nil
 }
 
 // Error returns "provider <id>: <kind>: <message>".

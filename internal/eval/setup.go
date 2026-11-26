@@ -10,6 +10,7 @@ import (
 	"switchyard/internal/policy"
 	"switchyard/internal/providers"
 	"switchyard/internal/providers/anthropic"
+	"switchyard/internal/providers/gemini"
 	"switchyard/internal/providers/openai"
 	"switchyard/internal/router"
 	"switchyard/internal/schema"
@@ -29,6 +30,8 @@ func Adapters(cfg *config.Config) (map[string]providers.Adapter, error) {
 			a, err = openai.New(p, providers.Options{})
 		case "anthropic":
 			a, err = anthropic.New(p, providers.Options{})
+		case "gemini":
+			a, err = gemini.New(p, providers.Options{})
 		default:
 			continue
 		}

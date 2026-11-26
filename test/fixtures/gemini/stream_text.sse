@@ -1,0 +1,19 @@
+data: {"candidates":[{"content":{"parts":[{"text":"The "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":1,"totalTokenCount":34,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"quick "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":2,"totalTokenCount":35,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"brown "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":36,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"fox "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":4,"totalTokenCount":37,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"jumps "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":5,"totalTokenCount":38,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"over "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":6,"totalTokenCount":39,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"the "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":7,"totalTokenCount":40,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"lazy "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":8,"totalTokenCount":41,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"dog."}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":9,"totalTokenCount":42,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"w3s48CdmzIv7aGNzfkmMtiY8DK60JSxZEm92r/MW/BBQUvYdWwn+oFzBrdboCjbNgj/abbhT7Eys1n2Fm+o2Va/7J9aV9qgFmj+uJiZ9boO84k4qKC1Nfxa79x1mz3Ns"}],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":9,"totalTokenCount":42,"thoughtsTokenCount":25,"promptTokensDetails":[{"modality":"TEXT","tokenCount":8}]},"modelVersion":"gemini-3.8-flash","responseId":"gf9KaW7rT8-ihMIP9_aZ-Ag"}

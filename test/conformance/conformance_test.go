@@ -14,6 +14,7 @@ import (
 
 	"switchyard/test/conformance/harness"
 	"switchyard/test/fakeanthropic"
+	"switchyard/test/fakegemini"
 	"switchyard/test/fakeupstream"
 )
 
@@ -56,6 +57,11 @@ var (
 	anthropicCapabilities = []string{
 		"streaming", "stream_usage", "tools", "parallel_tools", "vision", "json_mode", "json_schema", "prompt_caching",
 	}
+	// geminiCapabilities are what the curated catalog declares for Gemini
+	// on the native API.
+	geminiCapabilities = []string{
+		"streaming", "stream_usage", "tools", "parallel_tools", "forced_tools", "vision", "json_mode", "json_schema", "prompt_caching",
+	}
 )
 
 // newAnthropicUpstream starts a fake Messages API that knows the upstream
@@ -63,6 +69,15 @@ var (
 func newAnthropicUpstream(t *testing.T) *fakeanthropic.OpenAIUpstream {
 	t.Helper()
 	u := fakeanthropic.New(fakeanthropic.Options{Models: []string{upstreamModel}, APIKey: providerKey}).OpenAI()
+	t.Cleanup(u.Close)
+	return u
+}
+
+// newGeminiUpstream starts a fake Gemini API that knows the upstream model
+// and requires the provider key, in its conformance view.
+func newGeminiUpstream(t *testing.T) *fakegemini.OpenAIUpstream {
+	t.Helper()
+	u := fakegemini.New(fakegemini.Options{Models: []string{upstreamModel}, APIKey: providerKey}).OpenAI()
 	t.Cleanup(u.Close)
 	return u
 }
@@ -76,8 +91,11 @@ func startGateway(t *testing.T, baseURL, wire string) (*harness.Gateway, string)
 		t.Fatal(err)
 	}
 	caps := openAICapabilities
-	if wire == wireAnthropic {
+	switch wire {
+	case wireAnthropic:
 		caps = anthropicCapabilities
+	case wireGemini:
+		caps = geminiCapabilities
 	}
 	g := harness.Run(t, harness.Config{
 		ProviderBaseURL: baseURL,
@@ -136,6 +154,23 @@ func TestConformanceThroughGatewayAnthropic(t *testing.T) {
 	upstream := newAnthropicUpstream(t)
 	g, key := startGateway(t, upstream.BaseURL(), wireAnthropic)
 	runSuite(t, g.PublicURL+"/v1", key, upstream, wireAnthropic)
+
+	t.Run("logs", func(t *testing.T) { checkLogs(t, g, key) })
+	t.Run("metrics", func(t *testing.T) { checkMetrics(t, g) })
+}
+
+// TestConformanceThroughGatewayGemini runs the suite through the gateway
+// binary against a Gemini-backed deployment: gateway, gemini adapter, then
+// the fake Gemini API, which checks thought signatures as Google does. The
+// same SDK calls must give the same answers, streaming tool calls
+// included. The skips and adjusted cases are named in runSuite.
+func TestConformanceThroughGatewayGemini(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs the gateway; skipped with -short")
+	}
+	upstream := newGeminiUpstream(t)
+	g, key := startGateway(t, upstream.BaseURL(), wireGemini)
+	runSuite(t, g.PublicURL+"/v1", key, upstream, wireGemini)
 
 	t.Run("logs", func(t *testing.T) { checkLogs(t, g, key) })
 	t.Run("metrics", func(t *testing.T) { checkMetrics(t, g) })
@@ -287,6 +322,16 @@ func TestStreamDisconnectThroughGatewayAnthropic(t *testing.T) {
 	g, key := startGateway(t, upstream.BaseURL(), wireAnthropic)
 	// Five Messages API events make three chunks (see testMidStreamError).
 	checkDisconnect(t, g.PublicURL+"/v1", key, upstream, 5)
+}
+
+func TestStreamDisconnectThroughGatewayGemini(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs the gateway; skipped with -short")
+	}
+	upstream := newGeminiUpstream(t)
+	g, key := startGateway(t, upstream.BaseURL(), wireGemini)
+	// Two Gemini events make three chunks (see testMidStreamError).
+	checkDisconnect(t, g.PublicURL+"/v1", key, upstream, 2)
 }
 
 // checkDisconnect streams from baseURL, cancels after two chunks, and checks

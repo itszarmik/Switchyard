@@ -385,8 +385,8 @@ func (r *Runner) settle(ctx context.Context, adm budget.Admission, cost usage.Mo
 // compare asks the comparison deployment for its answer to creq, whose
 // worst case est is admitted. It fills row's deployments, or its error
 // kind, and returns what the call cost (the actual cost where the usage is
-// known, est where the call may have been billed without it) and, when ok,
-// the answer text.
+// known, a failed call's billed usage included, est where the call may
+// have been billed without it) and, when ok, the answer text.
 func (r *Runner) compare(ctx context.Context, s *Sample, creq *schema.ChatRequest, est usage.Money, row *usage.ShadowEval) (cost usage.Money, text string, ok bool) {
 	row.CandidateDeployment, _, row.ReferenceDeployment, _ = s.roles("")
 	d := s.Comparison
@@ -405,7 +405,14 @@ func (r *Runner) compare(ctx context.Context, s *Sample, creq *schema.ChatReques
 		if r.ctx.Err() != nil {
 			row.ErrorKind = ErrorCanceled
 		}
-		if kind.MayHaveBilled() {
+		switch u := providers.BilledUsage(err); {
+		case u != nil:
+			// An answer the upstream billed although the adapter failed it.
+			if c, ok := usage.Cost(usage.FromUsage(u), d.Prices); ok {
+				return c, "", false
+			}
+			return est, "", false
+		case providers.MayHaveBilled(err):
 			return est, "", false
 		}
 		return usage.Money{}, "", false

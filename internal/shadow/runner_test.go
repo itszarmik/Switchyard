@@ -638,6 +638,20 @@ func TestRunnerFailures(t *testing.T) {
 		}, nil,
 			"comparison_timeout", "estimate"},
 		{"no usage", func(a *fakeAdapter) { a.usage = nil }, nil, "", "estimate+judge"},
+		// An answer the upstream billed but the adapter failed (Gemini's
+		// MALFORMED_FUNCTION_CALL): its kind says unsupported, but it is
+		// charged its billed usage (100 + 50 tokens, 0.0002), or the
+		// estimate without usage.
+		{"billed failure with usage", func(a *fakeAdapter) {
+			a.err = &providers.Error{Kind: providers.KindUnsupported, Provider: "p", Message: "malformed",
+				Billed: true, BilledUsage: &schema.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}}
+		}, nil, "comparison_unsupported", "0.0002"},
+		{"billed failure without usage", func(a *fakeAdapter) {
+			a.err = &providers.Error{Kind: providers.KindUnsupported, Provider: "p", Message: "malformed", Billed: true}
+		}, nil, "comparison_unsupported", "estimate"},
+		{"unsupported, not billed", func(a *fakeAdapter) {
+			a.err = &providers.Error{Kind: providers.KindUnsupported, Provider: "p", Message: "image URL"}
+		}, nil, "comparison_unsupported", "0"},
 		{"judge failed", nil, func(j *fakeJudge) { j.err = errors.New("judge: unparseable " + secretComparison) },
 			ErrorJudge, "0.0002+judge-estimate"},
 		{"judge cost unknown", nil, func(j *fakeJudge) { j.verdict.CostNano = -1 }, "", "0.0002+judge-estimate"},

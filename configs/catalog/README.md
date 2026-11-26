@@ -10,7 +10,7 @@ Re-check prices at least every 90 days. `switchyard catalog lint` reports older 
 |---|---|---|
 | OpenAI | <https://developers.openai.com/api/docs/pricing> | Model pages under <https://developers.openai.com/api/docs/models/>, the GPT-6 guide <https://developers.openai.com/api/docs/guides/latest-model>, the prompt caching guide, the Chat Completions API reference, and <https://developers.openai.com/api/docs/guides/embeddings> |
 | Anthropic | <https://platform.claude.com/docs/en/about-claude/pricing> | <https://platform.claude.com/docs/en/about-claude/models/overview> and the structured outputs page. Cross-checked with the `claude-api` skill's model table (cached 2026-11-03), which agrees. |
-| Google | <https://aistudio.google.com/docs/pricing> (where `ai.google.dev/gemini-api/docs/pricing` now redirects) | `https://aistudio.google.com/docs/models/<id>`, the OpenAI compatibility page <https://aistudio.google.com/docs/openai> |
+| Google | <https://aistudio.google.com/docs/pricing> (where `ai.google.dev/gemini-api/docs/pricing` now redirects) | `https://aistudio.google.com/docs/models/<id>`; for the native API (rechecked 2026-11-21) the generateContent reference <https://aistudio.google.com/api-reference/generate-content/generate-content> and the function-calling, structured-output, thinking, caching and long-decode guides under <https://aistudio.google.com/docs/>; the OpenAI compatibility page <https://aistudio.google.com/docs/openai> |
 | Together | <https://docs.together.ai/docs/serverless/models>, which matches <https://www.together.ai/pricing> | The same table (context length, function calling, structured outputs), plus the chat completions reference, the parameters page and the OpenAI compatibility page |
 | Self-hosted | none (see below) | Model card <https://huggingface.co/Qwen/Qwen3.5-9B>, plus vLLM's request schema in `vllm/entrypoints/openai/chat_completion/protocol.py` and `vllm/sampling_params.py` on `main` |
 
@@ -74,17 +74,29 @@ For example, with made-up numbers that are **not a price**: one GPU at $2.00/hou
 
 ## Capabilities
 
-A capability is listed only when the provider documents it for that model, on the endpoint Switchyard calls. The comments in `models.yaml` say why each capability is listed or left out. The main gaps:
+A capability is listed only when the provider documents it for that model, on the endpoint Switchyard calls (Chat Completions, the Messages API, or Gemini's generateContent). The comments in `models.yaml` say why each capability is listed or left out. The main gaps:
 
 - **GPT-6 has no `tools` capability.** OpenAI says Astra and Sol support tool calling only through the Responses API. Luna supports function calling in Chat Completions only with `reasoning_effort: "none"`, and its default is `medium`.
 - **json_schema** means native structured outputs everywhere; no adapter emulates it. On Claude, the adapter reduces the client's schema to the subset Anthropic supports, as Anthropic's SDKs do: unsupported keywords (`minimum`, `maxLength`, `maxItems` and so on) move into the field's description and every object gets `additionalProperties: false`.
 - **json_mode on Claude.** Listed for all four models. The anthropic adapter emulates `json_object` with a system-prompt instruction, never with a forced tool, so it works on the models that reject forced tools. It is best effort: the output is not constrained to valid JSON. Use `json_schema` (native structured outputs) when validity matters.
 - **forced_tools on Claude.** Fable 5.2, Opus 5.5 and Sonnet 5.5 return 400 for a forced `tool_choice` (`any` or `tool`), so only Haiku 5.5 lists `forced_tools`. The gateway never sends `tool_choice: "required"` or a named function to the others.
 - **sampling.** Not listed for any Claude model (Opus 5.5 and Fable reject `temperature` and `top_p`; Sonnet 5.5 and Haiku 5.5 reject non-default values), for GPT-6 (the GPT-6 guide says to remove them when reasoning is on, which is the default), or for Gemini (Google's guides say Gemini 3.6+ and Gemini 4 ignore them). The gateway always removes `temperature` and `top_p` for a deployment without `sampling`. Listed for Qwen on Together and vLLM.
-- **Gemini's OpenAI endpoint.**
-  - `stream_usage` is listed, because Google's own streaming example sends `stream_options.include_usage`.
-  - Everything the compatibility page doesn't document is left out: parallel tool calls, json_object, n, logprobs, seed, penalties and cached-token reporting.
-  - `forced_tools` is left out: the AI Studio compatibility page shows only `tool_choice: "auto"`. Google's Vertex OpenAI endpoint documents `required`, but not a named function, and it is a different endpoint.
+- **Gemini on the native API** (provider type `gemini`, the shipped default). Both models list `streaming`, `stream_usage`, `tools`, `parallel_tools`, `forced_tools`, `vision`, `json_mode`, `json_schema` and `prompt_caching`:
+  - `parallel_tools`: the model returns several function calls in one turn. Google has no switch to turn that off, so `parallel_tool_calls: false` is not honored.
+  - `forced_tools`: `tool_choice: "required"` and a named function map to mode `ANY`, with `allowedFunctionNames` for the name.
+  - `json_mode` and `json_schema`: `responseMimeType: application/json`, plus `responseJsonSchema` with the client's JSON Schema as is (Google ignores keywords it does not support rather than rejecting them).
+  - `prompt_caching`: implicit caching is on by default from 4,096 input tokens on these models, and hits are reported as `cachedContentTokenCount`, which the gateway prices at `cached_input`.
+  - `vision`: base64 data URLs only. The gateway does not fetch https image URLs, so such a request goes to another deployment.
+  - Left out: `n` (`candidateCount` is unsupported on Gemini 3 and later), `logprobs`, `seed` and `penalties` (not documented for these models), `sampling` (see above), `temperature_2` and `completions`.
+- **Gemini through Google's OpenAI-compatible endpoint** (provider type `openai`, `base_url: https://generativelanguage.googleapis.com/v1beta/openai`). The catalog's lists then claim more than that endpoint documents: it shows only `tool_choice: "auto"`, does not document `json_object`, parallel tool calls or cached-token reporting, and standard OpenAI clients drop the thought signatures it sends. Give each Gemini deployment a deployment-level list in your copy of the catalog:
+
+  ```yaml
+  deployments:
+    - provider: google
+      upstream_model: gemini-4-carbon
+      capabilities: [streaming, stream_usage, tools, vision, json_schema]
+  ```
+
 - **Together vs vLLM.** The vLLM deployment is commented out until you set its price (see above). It gets a deployment-level override, because it accepts more than Together documents: `stream_usage`, `n`, `logprobs`, `temperature_2` (it validates temperature in [0, 2]) and `completions`. Tool calling on vLLM needs `--enable-auto-tool-choice --tool-call-parser qwen3_coder`. `prompt_caching` needs `--enable-prompt-tokens-details`.
 
 ## Quality priors

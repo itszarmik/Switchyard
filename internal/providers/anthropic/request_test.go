@@ -369,4 +369,34 @@ func TestToolUseID(t *testing.T) {
 	if a, b := toolUseID("a.b"), toolUseID("a:b"); a == b {
 		t.Errorf("distinct ids a.b and a:b both map to %q", a)
 	}
+	// A valid id over 64 bytes, such as the gemini adapter's (a thought
+	// signature inside), becomes a 37-byte hash.
+	long := "gm1_" + strings.Repeat("Ab0-_", 80)
+	if got := toolUseID(long); len(got) != 37 || !strings.HasPrefix(got, "call_") || !pattern.MatchString(got) || toolUseID(long) != got {
+		t.Errorf("toolUseID of a %d-byte id = %q", len(long), got)
+	}
+	// The bound is on the id sent: 80 bytes of é map to 49 valid bytes,
+	// which are kept.
+	if got := toolUseID(strings.Repeat("é", 40)); len(got) != 49 || !pattern.MatchString(got) {
+		t.Errorf("toolUseID of 40 é = %q (%d bytes), want the 49-byte mapped form", got, len(got))
+	}
+	if exact := strings.Repeat("a", 64); toolUseID(exact) != exact {
+		t.Error("a valid 64-byte id was mapped")
+	}
+	// Ids of 56 to 64 bytes with an invalid character: the mapped form
+	// (the id plus a 9-byte hash suffix) would pass 64 bytes from 56 on,
+	// so the bound applies to the id sent.
+	for n := 50; n <= 64; n++ {
+		id := strings.Repeat("a", n-1) + "."
+		got := toolUseID(id)
+		if len(got) > 64 || !pattern.MatchString(got) || toolUseID(id) != got {
+			t.Errorf("toolUseID of a %d-byte id with a dot = %q (%d bytes)", n, got, len(got))
+		}
+		if mappedLen := n + 9; mappedLen <= 64 && len(got) != mappedLen {
+			t.Errorf("a %d-byte id with a dot was not mapped in place: %q", n, got)
+		}
+	}
+	if a, b := toolUseID(strings.Repeat("a", 59)+"."), toolUseID(strings.Repeat("a", 59)+":"); a == b {
+		t.Errorf("distinct long invalid ids both map to %q", a)
+	}
 }

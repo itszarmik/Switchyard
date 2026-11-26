@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design approved. **P0–P10 complete; next P11 (native Gemini adapter)** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 and v0.3.0 (dated catalog prices) on 2026-11-23 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
+| Status | Design approved. **P0–P10 complete; P11 (native Gemini adapter) built and verified locally, not yet committed** (P8 was done ahead of P6/P7 at the user's request). v0.1.0 released on 2026-11-19 and v0.2.0 (the Helm chart) on 2026-11-21 and v0.3.0 (dated catalog prices) on 2026-11-23 (github.com/itszarmik/Switchyard); CI and the release workflow pass on GitHub. The live smoke tests, a live judge-quality check, a live semantic-cache check (`make semantic-eval`) and a quickstart with a real provider key have not run yet (no provider keys on the build machine). |
 | Version | 0.1, 2026-11-09 |
 | Companion | [DESIGN.md](DESIGN.md) |
 
@@ -685,9 +685,45 @@ All five criteria pass, each with automated tests (`TestNewAtResolvesPriceChange
 - **Errors.** Google's error body and statuses mapped to the gateway's error kinds, so retries, fallback and breakers behave as for other providers.
 - **Catalog and config.** The Gemini entries' capabilities rechecked for the native API.
 
-**Acceptance**
+**Acceptance** (written 2026-11-24)
 
-To be written when P11 starts.
+- [x] The P1 conformance suite passes against the `gemini` adapter, through the binary and a fake Gemini upstream that replays fixtures, streaming tool calls included. Each skip is named, with the reason.
+- [x] Golden tests cover every row of the Gemini mapping table in DESIGN §6.2: requests, responses, stream events, errors and usage.
+- [x] Multi-turn tool use keeps thought signatures with no state in the gateway:
+  - a signature returned inside a tool-call id goes back on the matching `functionCall` part byte for byte, for sequential and parallel calls;
+  - a tool-call id from another provider or another Gemini model gets Google's skip value on the first call of each step;
+  - the ids use only `[A-Za-z0-9_-]`, and the Anthropic adapter accepts them in a conversation that moves to Claude.
+- [x] Cached tokens and thinking tokens are reported and costed, in JSON responses and in streams: cached tokens at the cached-input price, and thinking tokens at the output price as `reasoning_tokens`.
+- [x] Every request sends `store: false`, never sends sampling parameters, and maps `reasoning_effort` to `thinkingLevel`.
+- [x] A non-streaming request for more than 32,768 output tokens is served by streaming internally and comes back as a normal JSON response.
+- [x] Google's errors map to the gateway's error kinds:
+  - 429, 503 and other 5xx are retried and fall back;
+  - 400 and 403 are not, and an invalid API key counts as an auth failure;
+  - an error in the middle of a stream ends it with an error event;
+  - a blocked prompt comes back with `finish_reason: content_filter`.
+- [x] A request the native API can't express is never sent: for example an https image URL, `n` > 1 or a trailing assistant message. It goes to another deployment or fails with a 400 that names the reason.
+- [x] Native is the default for `google` in the example config, the compose stack and the Helm chart, and `type: openai` with the compatibility endpoint still validates and serves. The catalog's Gemini capabilities are rechecked against the native API, with sources.
+- [x] A live smoke test (skipped without `GEMINI_API_KEY`) and an opt-in fixture recorder exist. They are not run on this machine, which has no provider keys.
+
+**Outcome (2026-11-25)**
+
+All ten criteria pass with automated tests. Key ones: `TestConformanceThroughGatewayGemini`, the golden tests in `internal/providers/gemini`, `TestSignaturesThroughFake`, `TestGeminiToClaude`, `TestGeminiToOpenAI`, `TestGeminiUsageCost`, `TestLongOutput`, `TestStatusErrors`, `TestGeminiUnsupportedFallsBack`, `TestShippedConfigsUseNativeGemini` and `TestSmokeGemini`, which skips without a key. `make check` passes (44 packages, 0 lint issues, no vulnerabilities), and so do `make helm-lint`, the docs check, `config validate` and `catalog lint`. The new tests pass with `-race -count=10`.
+
+- **Tool-call ids.** Each id is `gm1_` plus unpadded base64url of: flags, a 6-byte model hash, Gemini's id, the signature, and a 4-byte check.
+  - Size: a 1 KiB signature gives an id of about 1.4 KB, a 16 KiB one about 22 KB.
+  - The first call of each step carries its own signature only when the id is the adapter's own, for the same model, with a signature. Any other first call gets Google's skip value.
+- **Ids leaving Gemini.** OpenAI rejects tool-call ids over 40 characters.
+  - The openai adapter replaces each such id with `call_` plus 32 hash characters, the same in the call and its tool message. A request with no long id is still sent byte for byte.
+  - The anthropic adapter bounds ids at 64 bytes.
+- **Defaults.** `reasoning_effort` none and minimal become `LOW`, and xhigh becomes `HIGH`. A non-streaming request whose output limit is above 32,768 (the client's `max_tokens`, else the catalog's) is served by streaming internally.
+- **Malformed answers.** `MALFORMED_FUNCTION_CALL` and `MALFORMED_RESPONSE` fall back without a retry or a breaker count, but Google bills them.
+  - Errors now carry the billed usage, so the attempt is charged exactly: as request overhead in the ledger and budgets, and under its own deployment in `switchyard_cost_usd_total`.
+  - Per-provider ledger rows show that overhead under the deployment that served the request.
+- **Configs.** The `google` provider is native in the example, compose and Helm configs, with `total: 10m`, the same as `routing.request_timeout`. Long Gemini 4 Carbon output needs both raised.
+
+**Review.** An independent review found 1 high, 5 medium and 8 low defects. All were fixed except one low (`parallel_tool_calls: false` is ignored, as documented). The high one: a conversation that moved from Gemini to OpenAI failed on OpenAI's 40-character id limit. My own check of the fixes found the malformed-answer attempts uncharged. Verifying the fixes found 1 medium and 3 low more, also fixed; the medium one undercharged a stream that failed after it had started.
+
+**Not yet run:** anything against the live Gemini API (no key on this machine): the smoke test, the fixture recorder, real SSE framing, real signature sizes, implicit-cache reporting, and whether Google accepts consecutive user contents and uppercase thinking levels. The fixtures are handcrafted from Google's docs. Follow-ups: a validation warning when a provider's `total` exceeds `routing.request_timeout`, and the router's wall-clock `TestDecideLatencyP99`, which can fail on a loaded machine.
 
 ## Post-MVP backlog
 

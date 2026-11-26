@@ -3,6 +3,7 @@ package anthropic
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -434,28 +435,41 @@ func (a *Adapter) assistantBlocks(m openAIMessage, where string) ([]block, error
 	return out, nil
 }
 
+// maxToolUseIDLen bounds the tool_use ids the adapter sends. Anthropic
+// documents only the pattern, no maximum length; the bound is defensive,
+// for ids such as the gemini adapter's, which carry thought signatures and
+// run to kilobytes.
+const maxToolUseIDLen = 64
+
 // toolUseID maps an OpenAI tool-call id onto Anthropic's id pattern,
-// ^[a-zA-Z0-9_-]+$. A valid id is kept. Any other has each invalid
+// ^[a-zA-Z0-9_-]+$. A valid id is kept; an invalid one has each invalid
 // character replaced by _ and a short hash of the original appended, so
-// that distinct ids stay distinct; the mapping is deterministic, so an
+// that distinct ids stay distinct. Either result longer than
+// maxToolUseIDLen bytes becomes "call_" and the first 32 characters of the
+// unpadded base64url SHA-256 of the id instead. The mapping is deterministic, so an
 // assistant tool call and the tool message answering it get the same id.
 // Response ids need no mapping back: the client gets Anthropic's own,
 // which are already valid.
 func toolUseID(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	out := id
 	valid := func(r rune) bool {
 		return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-'
 	}
-	if !strings.ContainsFunc(id, func(r rune) bool { return !valid(r) }) {
-		return id
+	if strings.ContainsFunc(id, func(r rune) bool { return !valid(r) }) {
+		out = strings.Map(func(r rune) rune {
+			if valid(r) {
+				return r
+			}
+			return '_'
+		}, id) + "_" + hex.EncodeToString(sum[:4])
 	}
-	mapped := strings.Map(func(r rune) rune {
-		if valid(r) {
-			return r
-		}
-		return '_'
-	}, id)
-	sum := sha256.Sum256([]byte(id))
-	return mapped + "_" + hex.EncodeToString(sum[:4])
+	// The bound applies to the id sent, so a mapped id that the hash
+	// suffix takes past it gets the short form too.
+	if len(out) > maxToolUseIDLen {
+		return "call_" + base64.RawURLEncoding.EncodeToString(sum[:])[:32]
+	}
+	return out
 }
 
 // argumentsObject parses a tool call's arguments string into a compact

@@ -61,6 +61,39 @@ type chatRequest struct {
 	promptBytes  int
 }
 
+// MaxToolCallIDLen is the longest tool-call id OpenAI accepts in a
+// request's messages.
+const MaxToolCallIDLen = 40
+
+// checkToolCallIDs rejects an assistant tool_calls[].id or a tool message's
+// tool_call_id longer than MaxToolCallIDLen, as OpenAI does.
+func checkToolCallIDs(messages []json.RawMessage) *apiError {
+	tooLong := func(param string, n int) *apiError {
+		return &apiError{status: http.StatusBadRequest, typ: typeInvalidRequest, param: param, code: "string_above_max_length",
+			message: fmt.Sprintf("Invalid '%s': string too long. Expected a string with maximum length %d, but got a string with length %d instead.", param, MaxToolCallIDLen, n)}
+	}
+	for i, raw := range messages {
+		var m struct {
+			ToolCallID string `json:"tool_call_id"`
+			ToolCalls  []struct {
+				ID string `json:"id"`
+			} `json:"tool_calls"`
+		}
+		if json.Unmarshal(raw, &m) != nil {
+			continue
+		}
+		if n := len(m.ToolCallID); n > MaxToolCallIDLen {
+			return tooLong(fmt.Sprintf("messages[%d].tool_call_id", i), n)
+		}
+		for j, tc := range m.ToolCalls {
+			if n := len(tc.ID); n > MaxToolCallIDLen {
+				return tooLong(fmt.Sprintf("messages[%d].tool_calls[%d].id", i, j), n)
+			}
+		}
+	}
+	return nil
+}
+
 // parseChatRequest decodes and validates body the way OpenAI does for the
 // fields the fake uses.
 func parseChatRequest(body []byte) (chatRequest, *apiError) {
@@ -93,6 +126,9 @@ func parseChatRequest(body []byte) (chatRequest, *apiError) {
 		return req, bad("messages", "empty_array", "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead.")
 	}
 	req.promptBytes = len(raw["messages"])
+	if aerr := checkToolCallIDs(messages); aerr != nil {
+		return req, aerr
+	}
 
 	if present("stream") && json.Unmarshal(raw["stream"], &req.stream) != nil {
 		return req, bad("stream", "invalid_type", "Invalid type for 'stream': expected a boolean.")

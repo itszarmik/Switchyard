@@ -92,8 +92,13 @@ type Event struct {
 	// without Switchyard's routing (DESIGN §12.4): the requested model for
 	// a concrete model name, or the policy's baseline_model for auto, with
 	// the same tokens priced at its cheapest priced deployment.
-	// OverheadCost is the gateway's own spend on the request (0 until the
-	// gateway makes calls of its own).
+	// OverheadCost is the request's spend besides the deployment that
+	// served it: the gateway's own (the semantic cache's embedding), and
+	// provider spend on attempts an upstream answered and billed but that
+	// failed (an answer the adapter rejected, such as Gemini's
+	// MALFORMED_FUNCTION_CALL), at their exact usage and their own
+	// deployments' prices (DESIGN §12.2). It is recorded on this event, so
+	// reports grouped by model or provider attribute it to Deployment.
 	BaselineModel string
 	BaselineCost  Money
 	OverheadCost  Money
@@ -247,8 +252,12 @@ type Totals struct {
 	CostUSD Money
 	// BaselineCostUSD sums the baseline cost of events with a known cost.
 	BaselineCostUSD Money
-	// OverheadUSD sums the gateway's own spend: the events' overhead and
-	// ShadowCostUSD.
+	// OverheadUSD sums the spend besides what served the requests: the
+	// events' overhead, which is the gateway's own spend (the semantic
+	// cache's embeddings) and provider spend on attempts an upstream billed
+	// without serving the request (DESIGN §12.2), and ShadowCostUSD. In a
+	// report grouped by model or provider, a billed attempt's overhead
+	// falls in the group of the deployment that served its request.
 	OverheadUSD Money
 	// SavingsUSD splits the savings (DESIGN §12.4). Routing is baseline
 	// minus cost over priced events that were not cache hits, and can be

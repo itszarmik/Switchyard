@@ -193,7 +193,9 @@ type Provider struct {
 	// ID names the provider in deployment IDs (model@provider).
 	ID string `yaml:"id"`
 	// Type is the wire protocol: openai (OpenAI and every OpenAI-compatible
-	// upstream) or anthropic.
+	// upstream), anthropic (the Messages API) or gemini (Google's native
+	// generateContent API; base_url is the API version root, such as
+	// https://generativelanguage.googleapis.com/v1beta).
 	Type string `yaml:"type"`
 	// BaseURL is the API root, e.g. https://api.openai.com/v1. It must be an
 	// absolute http(s) URL and must not embed credentials.

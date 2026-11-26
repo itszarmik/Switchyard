@@ -4,6 +4,77 @@ All notable changes to Switchyard. Versions follow [Semantic
 Versioning](https://semver.org/); before 1.0, a minor version may change
 the configuration or the API.
 
+## Unreleased
+
+### Providers (P11)
+
+- New provider type `gemini`: Google's native Gemini API
+  (`{base_url}/models/{model}:generateContent` and
+  `:streamGenerateContent?alt=sse`, `base_url`
+  `https://generativelanguage.googleapis.com/v1beta`), with the key only in
+  the `x-goog-api-key` header. It reports cached tokens
+  (`cached_tokens`, priced at `cached_input`) and thinking tokens
+  (`reasoning_tokens`, priced once as output), supports forced and named
+  `tool_choice`, `json_object` and `json_schema`, maps `reasoning_effort`
+  to `thinkingLevel`, and sends `store: false` on every request.
+- Multi-turn tool calls keep Gemini 3 and 4's thought signatures with no
+  state in the gateway: the signature travels inside the tool-call id
+  (`gm1_…`, only `[A-Za-z0-9_-]`), which clients send back unchanged. Ids
+  from other providers or models get Google's skip value. The ids are
+  long (about 4/3 of the signature), so the `openai` adapter now shortens
+  tool-call ids over OpenAI's 40-character limit, and the `anthropic`
+  adapter ids over 64 characters, to a 37-character hash (same in the call
+  and its result), and a conversation can move from Gemini to OpenAI or
+  Claude. Requests without such ids are forwarded as before.
+- Traces name Gemini's provider `gcp.gemini` (`gen_ai.system`,
+  `gen_ai.provider.name`), the OpenTelemetry GenAI value.
+- A non-streaming request whose output limit is above 32,768 tokens (its
+  `max_tokens`, else the catalog's `max_output_tokens`) is served by
+  streaming internally, so Gemini 4 Carbon's full 65,536 works without
+  streaming on the client, even when the client sets no limit.
+- `MALFORMED_FUNCTION_CALL` and `MALFORMED_RESPONSE` fall back to another
+  deployment without a retry and without counting toward the breaker or
+  the error-rate alert: they depend on the request. Google billed them, so
+  the attempt is charged its exact usage (in the usage event's overhead,
+  the budgets and `switchyard_cost_usd_total` for that deployment) on top
+  of the deployment that then serves the request. A failed upstream answer
+  that was billed now carries its usage (`providers.Error.Billed`,
+  `BilledUsage`), which shadow sampling, the judge, `switchyard eval` and
+  the semantic cache's embedder also charge.
+- `temperature` and `top_p` are removed for Gemini, as for every
+  deployment without `sampling`, and the request is served; `n` > 1,
+  logprobs, seed and penalties exclude Gemini deployments (or are removed
+  with `drop_unsupported_params`). Requests the native API cannot express
+  (an https image URL, a trailing assistant message) are never sent: they
+  go to another deployment, or get a 400 naming the reason.
+  `reasoning_effort` maps to the nearest level every current model
+  accepts (`minimal` to low, `xhigh` to high). Google's errors map to the usual kinds: 429, 5xx and 503 retry
+  and fall back; 400 and 403 do not; an invalid key is an auth failure;
+  a blocked prompt is `finish_reason: content_filter`.
+- Catalog: the Gemini models' capabilities are rechecked for the native
+  API and now also list `parallel_tools`, `forced_tools`, `json_mode` and
+  `prompt_caching`. Prices are unchanged.
+- Behaviour change: the example config, the compose stack
+  (`deploy/config/switchyard.yaml`) and the Helm chart's bundled config
+  now define the `google` provider as `type: gemini` with the native
+  `base_url`, with `first_token: 2m` (Gemini 4 thinks before its first
+  token) and `total: 10m`, the default `routing.request_timeout`, which caps
+  every call. Google advises at least 15 minutes for long Gemini 4 Carbon
+  output: raise both if you serve it. On upgrade, compose and Helm
+  users with the bundled config talk to the native API with the same
+  `GEMINI_API_KEY`; tool-call ids from Gemini change format, so a
+  conversation started before the upgrade continues with the skip value on
+  its old calls. A config of your own keeps working: `type: openai` with
+  `https://generativelanguage.googleapis.com/v1beta/openai` still validates
+  and serves, but the shipped catalog now claims capabilities that endpoint
+  lacks; give those deployments
+  `capabilities: [streaming, stream_usage, tools, vision, json_schema]`
+  (configs/catalog/README.md).
+- `make record-fixtures` also records Gemini fixtures (needs
+  `GEMINI_API_KEY`), and `make smoke` has a live Gemini test with a
+  two-turn tool call (`TestSmokeGemini`, skipped without the key). Runbook:
+  "Gemini tool calls rejected: missing thought signature".
+
 ## v0.3.0 (2026-11-23)
 
 Adds dated catalog prices, so that Google's announced Gemini price changes

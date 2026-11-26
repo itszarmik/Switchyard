@@ -84,7 +84,7 @@ type Deployment struct {
 	Model *Model
 	// Provider is the provider ID.
 	Provider string
-	// ProviderType is the provider's wire protocol: openai or anthropic.
+	// ProviderType is the provider's wire protocol: openai, anthropic or gemini.
 	ProviderType string
 	// UpstreamModel is the model name sent to the provider.
 	UpstreamModel string

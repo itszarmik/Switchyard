@@ -51,7 +51,8 @@ prompts, responses, API keys, the admin token, DSNs or Redis passwords.
   [Embedding deployment down](#embedding-deployment-down)
 - Providers: [Provider outage and open breakers](#provider-outage-and-open-breakers) ·
   [Every candidate failing: 503 no_healthy_upstream](#every-candidate-failing-503-no_healthy_upstream) ·
-  [Provider key rejected](#provider-key-rejected)
+  [Provider key rejected](#provider-key-rejected) ·
+  [Gemini tool calls rejected: missing thought signature](#gemini-tool-calls-rejected-missing-thought-signature)
 - Money: [Budget exhausted](#budget-exhausted) ·
   [Usage events dropped](#usage-events-dropped)
 - The gateway: [Config reload failed](#config-reload-failed) ·
@@ -256,7 +257,10 @@ providers.
 ## Provider key rejected
 
 **Symptom.** Calls to one provider fail with 401 or 403, and fall back to
-other providers.
+other providers. Google answers a bad key with a 400 whose ErrorInfo
+reason is `API_KEY_INVALID` (and an unbilled project in an unsupported
+region with 400 `FAILED_PRECONDITION`); the gemini adapter counts both as
+auth failures too.
 
 **Signal.** `SwitchyardUpstreamAuthFailures`;
 `switchyard_upstream_requests_total{outcome="auth"}`.
@@ -270,6 +274,44 @@ either set it, or keep `auto` off that provider with `SWITCHYARD_ALLOW`
 (for example `*@openai`). Fix the key in `.env` and run
 `docker compose up -d --force-recreate gateway`; with `${file:...}`
 secrets, replace the file and reload.
+
+## Gemini tool calls rejected: missing thought signature
+
+**Symptom.** Multi-turn tool use on a Gemini deployment (Gemini 3 or 4)
+fails on the turn that sends tool results back: clients get a 400 whose
+message says a function call "is missing a thought_signature", or
+`missing_thought_signature`. Other requests work.
+
+**Signal.** `switchyard_upstream_requests_total{outcome="client_error"}`
+for the google provider, on requests with tool messages; request lines
+with `error_code` set and status 400.
+
+**Impact.** Only the affected conversations fail. A 400 does not fall back,
+since it is the request's.
+
+**What to do.** The gemini adapter carries each thought signature inside
+the tool-call id it returned (DESIGN §6.2) and puts it back on the first
+call of its step. Every first call that has no signature for the model
+(ids the client replaced, cut or reordered, ids from another provider or
+Gemini model, calls Gemini returned unsigned) gets Google's skip value,
+which Google accepts, so a client's handling of the ids does not cause
+this error; at worst it costs some answer quality. The usual cause is:
+
+- a provider of `type: openai` pointed at Google's OpenAI-compatible
+  endpoint, which needs a field standard clients drop: switch it to
+  `type: gemini` with `base_url: https://generativelanguage.googleapis.com/v1beta`.
+
+With `type: gemini`, the error means Google rejected a signature itself
+(for example one edited inside a still-valid id) or changed its rules;
+capture the request line's `request_id` and report it. A client that drops
+the assistant message with the calls gets a different 400 from the
+gateway, "tool_call_id does not match a tool call".
+
+Ids are long (about 4/3 of the signature, often a few kilobytes). A client
+that cuts them gets the skip value, not an error. When the conversation
+moves to an OpenAI or Anthropic deployment, the gateway shortens them to a
+hash (OpenAI rejects ids over 40 characters), so that does not fail
+either.
 
 ## Budget exhausted
 

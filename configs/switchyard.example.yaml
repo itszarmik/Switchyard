@@ -133,7 +133,7 @@ storage:
 # Upstream endpoints and their credentials. Keys per provider:
 #   id               names the provider in deployment IDs (model@provider)
 #   type             wire protocol: openai (OpenAI and every OpenAI-compatible
-#                    upstream) | anthropic
+#                    upstream) | anthropic | gemini (Google's native API)
 #   base_url         absolute http(s) API root; must not embed credentials
 #   api_key          upstream credential, a secret; optional for self-hosted
 #   tags             matched by policies, e.g. self_hosted, zdr, region_eu
@@ -164,11 +164,29 @@ providers:
     # Client headers are not forwarded unless listed.
     forward_headers: [anthropic-beta]
 
-  # Gemini through Google's OpenAI-compatible endpoint.
+  # Gemini through Google's native API (type gemini; base_url is the API
+  # version root). The key is sent in the x-goog-api-key header. Gemini 4
+  # thinks before its first token, so first_token is raised. total stays
+  # at routing.request_timeout (10m below), which caps every call anyway:
+  # Google advises HTTP timeouts of at least 15 minutes for long Gemini 4
+  # Carbon output, so raise both total here and routing.request_timeout
+  # if you serve it.
   - id: google
-    type: openai
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    type: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
     api_key: ${GEMINI_API_KEY}
+    timeouts:
+      first_token: 2m
+      total: 10m
+  # Alternative: Google's OpenAI-compatible endpoint (Google calls it beta).
+  # It lacks forced tool choice, json_object, cached-token reporting and
+  # thought signatures in tool calls, so give each Gemini deployment in the
+  # catalog a deployment-level `capabilities: [streaming, stream_usage,
+  # tools, vision, json_schema]` when you use it.
+  # - id: google
+  #   type: openai
+  #   base_url: https://generativelanguage.googleapis.com/v1beta/openai
+  #   api_key: ${GEMINI_API_KEY}
 
   - id: together
     type: openai

@@ -4,7 +4,9 @@
 // The wire format is already the gateway's canonical one, so the adapter
 // forwards the client's request body losslessly (see
 // schema.ChatRequest.Encode) and returns upstream bodies and stream events
-// byte for byte. Its job is the HTTP call itself: one pooled client per
+// byte for byte. The one change is to tool-call ids longer than OpenAI
+// accepts, such as the gemini adapter's, which are shortened
+// deterministically (toolids.go). Its job is the HTTP call itself: one pooled client per
 // provider, the provider's timeouts, header hygiene, and turning every
 // failure into a *providers.Error.
 package openai
@@ -173,15 +175,16 @@ func New(p config.Provider, o providers.Options) (*Adapter, error) {
 func (a *Adapter) CloseIdleConnections() { a.client.CloseIdleConnections() }
 
 // Chat implements providers.Adapter. total bounds the whole call
-// including the body; first_token does not apply (see post).
+// including the body; first_token does not apply (see post). Tool-call ids
+// longer than OpenAI accepts are shortened (see withShortToolCallIDs).
 func (a *Adapter) Chat(ctx context.Context, req *providers.Request) (*providers.Response, error) {
-	return a.post(ctx, a.endpoint, req.Chat.EncodeFor(req.UpstreamModel, !req.NoStreamUsage), req.Header, maxResponseBytes)
+	return a.post(ctx, a.endpoint, withShortToolCallIDs(req.Chat).EncodeFor(req.UpstreamModel, !req.NoStreamUsage), req.Header, maxResponseBytes)
 }
 
 // ChatStream implements providers.Adapter. first_token bounds the wait for
 // the first event, idle each gap between events, and total the whole call.
 func (a *Adapter) ChatStream(ctx context.Context, req *providers.Request) (providers.Stream, error) {
-	return a.stream(ctx, a.endpoint, req.Chat.EncodeFor(req.UpstreamModel, !req.NoStreamUsage), req.Header)
+	return a.stream(ctx, a.endpoint, withShortToolCallIDs(req.Chat).EncodeFor(req.UpstreamModel, !req.NoStreamUsage), req.Header)
 }
 
 // Completion implements providers.Completer: POST {base_url}/completions,

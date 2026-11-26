@@ -348,7 +348,7 @@ func (st *loadState) validateProviders(ps []Provider) map[string]string {
 		p := &ps[i]
 		base := indexPath("providers", i)
 		st.checkID(base+".id", "provider", p.ID, first)
-		st.checkOneOf(base+".type", p.Type, "openai", "anthropic")
+		st.checkOneOf(base+".type", p.Type, "openai", "anthropic", "gemini")
 		st.checkBaseURL(base+".base_url", p.BaseURL)
 		st.checkTags(base+".tags", p.Tags)
 

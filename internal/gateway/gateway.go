@@ -41,6 +41,7 @@ import (
 	"switchyard/internal/policy"
 	"switchyard/internal/providers"
 	"switchyard/internal/providers/anthropic"
+	"switchyard/internal/providers/gemini"
 	"switchyard/internal/providers/openai"
 	"switchyard/internal/quality"
 	"switchyard/internal/ratelimit"
@@ -289,6 +290,8 @@ func (g *Gateway) build(cfg *config.Config, configVersion string, at time.Time) 
 			a, err = openai.New(p, providers.Options{PropagateTrace: g.propagate})
 		case "anthropic":
 			a, err = anthropic.New(p, providers.Options{PropagateTrace: g.propagate})
+		case "gemini":
+			a, err = gemini.New(p, providers.Options{PropagateTrace: g.propagate})
 		default:
 			// Validation rejects other types; their deployments are
 			// excluded from every request.

@@ -124,7 +124,7 @@ Keys at the top level of the file. Sections that hold further keys link to their
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `providers[].id` | string | - | `id` names the provider in deployment IDs (model@provider). |
-| `providers[].type` | string | - | `type` is the wire protocol: openai (OpenAI and every OpenAI-compatible upstream) or anthropic. |
+| `providers[].type` | string | - | `type` is the wire protocol: openai (OpenAI and every OpenAI-compatible upstream), anthropic (the Messages API) or gemini (Google's native generateContent API; base_url is the API version root, such as https://generativelanguage.googleapis.com/v1beta). |
 | `providers[].base_url` | string | - | `base_url` is the API root, e.g. https://api.openai.com/v1. It must be an absolute http(s) URL and must not embed credentials. |
 | `providers[].api_key` | secret | - | `api_key` is the upstream credential. Optional, for self-hosted upstreams. |
 | `providers[].tags` | list of strings | - | `tags` are matched by policies, e.g. self_hosted, zdr, region_eu. |

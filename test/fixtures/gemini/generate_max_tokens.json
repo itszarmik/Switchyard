@@ -1,0 +1,1 @@
+{"candidates":[{"content":{"parts":[{"text":"The quick brown"}],"role":"model"},"finishReason":"MAX_TOKENS","index":0}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":74,"thoughtsTokenCount":61,"promptTokensDetails":[{"modality":"TEXT","tokenCount":10}]},"modelVersion":"gemini-3.8-flash","responseId":"df9KaT6oQ8-ihMIPs4mZ-Ag"}

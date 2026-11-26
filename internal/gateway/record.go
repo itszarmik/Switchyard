@@ -19,6 +19,7 @@ import (
 	"switchyard/internal/router"
 	"switchyard/internal/schema"
 	"switchyard/internal/tracing"
+	"switchyard/internal/usage"
 )
 
 // record collects what one request did, for its metrics and its
@@ -55,6 +56,10 @@ type record struct {
 	// runAttempt), or nil. A request no upstream served is charged its
 	// estimate if it is set, and nothing otherwise.
 	sentTo *catalog.Deployment
+	// billed lists the attempts the upstream answered and billed but that
+	// failed, with the exact usage they reported (see noteBilled). They are
+	// charged as overhead, on top of what served the request.
+	billed []billedAttempt
 	ttft   time.Duration
 	usage  *schema.Usage
 	// usagePartial is set when usage is what a stream reported before it
@@ -387,7 +392,7 @@ func (r *record) annotateSpan() {
 	ga := tracing.GenAI{RequestModel: r.requestedModel}
 	switch {
 	case r.deployment != nil:
-		ga.System, ga.ResponseModel = r.deployment.ProviderType, r.deployment.Model.ID
+		ga.System, ga.ResponseModel = tracing.GenAISystem(r.deployment.ProviderType), r.deployment.Model.ID
 	case r.cache.entry != nil:
 		ga.ResponseModel = r.cache.entry.Model
 	}
@@ -442,6 +447,29 @@ func (r *record) routeAttrs(attrs []slog.Attr) []slog.Attr {
 		attrs = append(attrs, slog.String("shadow_deployment", rt.shadow.ID))
 	}
 	return attrs
+}
+
+// billedAttempt is an attempt the upstream billed without serving the
+// request: its deployment, its tokens and their cost at its prices.
+type billedAttempt struct {
+	d      *catalog.Deployment
+	tokens usage.Tokens
+	cost   usage.Money
+}
+
+// billedCost is the cost of the request's billed attempts (see billed).
+func (r *record) billedCost() usage.Money {
+	var c usage.Money
+	for _, b := range r.billed {
+		c = c.Add(b.cost)
+	}
+	return c
+}
+
+// overhead is the request's spend besides the deployment that served it:
+// the semantic cache's embedding and the billed attempts.
+func (r *record) overhead() usage.Money {
+	return r.cache.overhead.Add(r.billedCost())
 }
 
 // estIn is the request's input-token estimate on a deployment of m, at m's

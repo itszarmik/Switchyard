@@ -71,10 +71,17 @@ providers:
     base_url: ${SWITCHYARD_ANTHROPIC_BASE_URL:-https://api.anthropic.com}
     api_key: ${ANTHROPIC_API_KEY:-}
     forward_headers: [anthropic-beta]
+  # Gemini's native API. total matches routing.request_timeout (default
+  # 10m), which caps every call; Google advises at least 15 minutes for
+  # long Gemini 4 Carbon output, which needs both raised. For Google's OpenAI-compatible endpoint instead, use
+  # type: openai with base_url
+  # https://generativelanguage.googleapis.com/v1beta/openai and see
+  # configs/catalog/README.md for the capabilities it lacks.
   - id: google
-    type: openai
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    type: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
     api_key: ${GEMINI_API_KEY:-}
+    timeouts: { first_token: 2m, total: 10m }
   - id: together
     type: openai
     base_url: https://api.together.xyz/v1

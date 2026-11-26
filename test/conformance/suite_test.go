@@ -3,6 +3,8 @@ package conformance
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -19,6 +21,7 @@ import (
 	"github.com/openai/openai-go/v3/packages/ssestream"
 	"github.com/openai/openai-go/v3/shared"
 
+	"switchyard/test/fakegemini"
 	"switchyard/test/fakeupstream"
 )
 
@@ -52,8 +55,9 @@ const (
 )
 
 // upstreamFake is the method set of *fakeupstream.Server the suite uses.
-// fakeanthropic's OpenAI view has it too, so the suite can run against a
-// gateway whose deployment is Anthropic-backed.
+// The OpenAI views of fakeanthropic and fakegemini have it too, so the
+// suite can run against a gateway whose deployment is Anthropic- or
+// Gemini-backed.
 type upstreamFake interface {
 	BaseURL() string
 	Reset()
@@ -67,6 +71,7 @@ type upstreamFake interface {
 const (
 	wireOpenAI    = "openai"
 	wireAnthropic = "anthropic"
+	wireGemini    = "gemini"
 )
 
 // suite runs the conformance cases against one base URL.
@@ -77,6 +82,10 @@ type suite struct {
 	// anthropic is set when the gateway's deployment is Anthropic-backed:
 	// the upstream receives translated Messages API requests.
 	anthropic bool
+	// gemini is set when the gateway's deployment is Gemini-backed: the
+	// upstream receives translated generateContent requests, and the
+	// tool-call ids the client sees carry Gemini's ids (see geminiCallID).
+	gemini bool
 	// gateway is set when baseURL is the gateway rather than the fake.
 	// Assertions about gateway headers, forwarding, 404 model_not_found,
 	// auth and error mapping apply only then.
@@ -87,14 +96,17 @@ type suite struct {
 // runSuite drives the official SDK against baseURL with apiKey. upstream is
 // the fake behind it: baseURL is either upstream.BaseURL() itself or a
 // gateway whose only provider is upstream. wire is the upstream's protocol;
-// with wireAnthropic, baseURL must be a gateway.
+// with wireAnthropic or wireGemini, baseURL must be a gateway.
 //
-// Against Anthropic, the cases run unchanged except where the protocol
-// makes the OpenAI expectation impossible; each such case says why:
-// n > 1 is answered by the gateway (no Anthropic deployment has n), an
-// upstream 400's code and param have no Anthropic counterpart, the
+// Against Anthropic and Gemini, the cases run unchanged except where the
+// protocol makes the OpenAI expectation impossible; each such case says
+// why: n > 1 is answered by the gateway (no Anthropic or Gemini deployment
+// has n), an upstream 400's code and param have no counterpart, the
 // upstream body is a translation (so it is not compared byte for byte),
 // and unknown request and response fields cannot cross the translation.
+// Against Gemini, tool-call ids are compared by the Gemini id they carry,
+// and parallel_tool_calls: false is not honored (the native API has no
+// such switch).
 func runSuite(t *testing.T, baseURL, apiKey string, upstream upstreamFake, wire string) {
 	transport := &http.Transport{MaxIdleConnsPerHost: 4}
 	t.Cleanup(transport.CloseIdleConnections)
@@ -103,15 +115,17 @@ func runSuite(t *testing.T, baseURL, apiKey string, upstream upstreamFake, wire 
 		apiKey:    apiKey,
 		upstream:  upstream,
 		anthropic: wire == wireAnthropic,
+		gemini:    wire == wireGemini,
 		gateway:   strings.TrimSuffix(baseURL, "/") != upstream.BaseURL(),
 		http:      &http.Client{Transport: transport},
 	}
-	if s.anthropic && !s.gateway {
-		t.Fatal("the Anthropic upstream can only be reached through the gateway")
+	if s.translated() && !s.gateway {
+		t.Fatal("the Anthropic and Gemini upstreams can only be reached through the gateway")
 	}
 	t.Run("plain chat", s.testPlainChat)
 	t.Run("streaming is incremental", s.testStreamingIncremental)
 	t.Run("tool calls", s.testToolCalls)
+	t.Run("multi-turn tool calls", s.testMultiTurnTools)
 	t.Run("json mode", s.testJSONMode)
 	t.Run("n greater than 1", s.testN)
 	t.Run("stop sequences", s.testStop)
@@ -122,6 +136,10 @@ func runSuite(t *testing.T, baseURL, apiKey string, upstream upstreamFake, wire 
 	t.Run("unknown response fields", s.testUnknownResponseFields)
 	t.Run("models", s.testModels)
 }
+
+// translated reports whether the upstream speaks another protocol than
+// OpenAI's, so requests and responses are translations.
+func (s *suite) translated() bool { return s.anthropic || s.gemini }
 
 // exchange captures one HTTP exchange of the SDK through its middleware.
 type exchange struct {
@@ -341,7 +359,11 @@ func (s *suite) checkSuccess(t *testing.T, r result, stream bool, want []answer)
 	if r.model != s.wantModel() || !strings.HasPrefix(r.id, "chatcmpl-") {
 		t.Errorf("response model %q, id %q, want model %q", r.model, r.id, s.wantModel())
 	}
-	if diff := cmp.Diff(want, r.answers); diff != "" {
+	got := r.answers
+	if s.gemini {
+		got = geminiAnswers(t, got)
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("answers (-want +got):\n%s", diff)
 	}
 	up := s.upstreamRequests(t, 1)[0]
@@ -360,8 +382,9 @@ func (s *suite) checkSuccess(t *testing.T, r result, stream bool, want []answer)
 			t.Errorf("Content-Type %q, want application/json", h.Get("Content-Type"))
 		}
 		// Golden: the body is the upstream's, byte for byte. A translated
-		// Anthropic answer is covered by the adapter's golden tests.
-		if !s.anthropic && !bytes.Equal(r.ex.respBody, up.ResponseBody) {
+		// Anthropic or Gemini answer is covered by the adapter's golden
+		// tests.
+		if !s.translated() && !bytes.Equal(r.ex.respBody, up.ResponseBody) {
 			t.Errorf("response body differs from the upstream's:\n got %s\nwant %s", r.ex.respBody, up.ResponseBody)
 		}
 	}
@@ -400,6 +423,10 @@ func (s *suite) checkForwarded(t *testing.T, ex *exchange, up fakeupstream.Reque
 	t.Helper()
 	if s.anthropic {
 		s.checkTranslated(t, up, stream)
+		return
+	}
+	if s.gemini {
+		s.checkTranslatedGemini(t, up, stream)
 		return
 	}
 	if got := up.Header.Get("Authorization"); got != "Bearer "+providerKey {
@@ -491,6 +518,77 @@ func (s *suite) checkTranslated(t *testing.T, up fakeupstream.Request, stream bo
 	}
 }
 
+// checkTranslatedGemini checks what reached a Gemini upstream: the
+// provider key in x-goog-api-key, never in an Authorization header, the
+// client's key nowhere, the upstream model's generateContent or
+// streamGenerateContent method, and a body with contents and store false.
+// The fake rejects a key in the URL. The translation itself is covered by
+// the adapter's golden tests.
+func (s *suite) checkTranslatedGemini(t *testing.T, up fakeupstream.Request, stream bool) {
+	t.Helper()
+	if got := up.Header.Get("X-Goog-Api-Key"); got != providerKey {
+		t.Errorf("upstream x-goog-api-key %q, want the provider key", redactAuth(got))
+	}
+	if got := up.Header.Get("Authorization"); got != "" {
+		t.Errorf("upstream Authorization %q, want none", redactAuth(got))
+	}
+	for name, values := range up.Header {
+		for _, v := range values {
+			if strings.Contains(v, s.apiKey) {
+				t.Errorf("upstream header %s carries the client's key", name)
+			}
+		}
+	}
+	method := ":generateContent"
+	if stream {
+		method = ":streamGenerateContent"
+	}
+	if want := "/v1beta/models/" + upstreamModel + method; up.Path != want {
+		t.Errorf("upstream path %s, want %s", up.Path, want)
+	}
+	got := decodeObject(t, up.Body)
+	if _, ok := got["contents"]; !ok || string(got["store"]) != "false" {
+		t.Errorf("upstream body has no contents or no store false: %s", up.Body)
+	}
+}
+
+// geminiAnswers replaces each tool-call id with the Gemini functionCall.id
+// it carries, so answers through a Gemini deployment compare with the
+// fake's canned ids.
+func geminiAnswers(t *testing.T, answers []answer) []answer {
+	t.Helper()
+	out := make([]answer, len(answers))
+	for i, a := range answers {
+		out[i] = a
+		out[i].ToolCalls = nil
+		for _, tc := range a.ToolCalls {
+			tc.ID = geminiCallID(t, tc.ID)
+			out[i].ToolCalls = append(out[i].ToolCalls, tc)
+		}
+	}
+	return out
+}
+
+// geminiCallID decodes the documented id format (DESIGN §6.2): "gm1_",
+// then unpadded base64url of a flags byte, a 6-byte model hash, the
+// uvarint length of the Gemini id and the id. It fails the test for an id
+// outside [A-Za-z0-9_-] or in another format.
+func geminiCallID(t *testing.T, id string) string {
+	t.Helper()
+	rest, ok := strings.CutPrefix(id, "gm1_")
+	p, err := base64.RawURLEncoding.DecodeString(rest)
+	if !ok || err != nil || strings.Trim(id, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != "" || len(p) < 8 {
+		t.Errorf("tool-call id %q is not a Gemini adapter id", id)
+		return id
+	}
+	n, k := binary.Uvarint(p[7:])
+	if k <= 0 || uint64(len(p)-7-k) < n {
+		t.Errorf("tool-call id %q has a bad length", id)
+		return id
+	}
+	return string(p[7+k : 7+k+int(n)])
+}
+
 func decodeObject(t *testing.T, b []byte) map[string]json.RawMessage {
 	t.Helper()
 	var m map[string]json.RawMessage
@@ -568,8 +666,8 @@ func (s *suite) testPlainChat(t *testing.T) {
 			}
 		}
 		wantAuth := "Bearer " + providerKey
-		if s.anthropic {
-			wantAuth = "" // the key goes in X-Api-Key
+		if s.translated() {
+			wantAuth = "" // the key goes in X-Api-Key or x-goog-api-key
 		}
 		if got := up.Header.Get("Authorization"); got != wantAuth {
 			t.Errorf("upstream Authorization %q, want %q: the client's is never forwarded", got, wantAuth)
@@ -653,6 +751,11 @@ func (s *suite) testToolCalls(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
+		if s.gemini && tc.parallel != nil && !*tc.parallel {
+			// Gemini has no switch for parallel calls, so the adapter sends
+			// the request without one and the model may call both tools.
+			tc.want = tests[1].want
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			streamModes(t, func(t *testing.T, stream bool) {
 				s.reset(t)
@@ -678,6 +781,63 @@ func (s *suite) testToolCalls(t *testing.T) {
 	}
 }
 
+// testMultiTurnTools sends a tool-call turn's answer back as the next
+// turn's history, with the tool-call ids exactly as the client got them,
+// and checks the upstream accepts it. Against Gemini that proves the
+// thought signatures carried in the ids come back through the gateway: the
+// fake, like Google, rejects a current-turn step without the signature it
+// issued.
+func (s *suite) testMultiTurnTools(t *testing.T) {
+	streamModes(t, func(t *testing.T, stream bool) {
+		s.reset(t)
+		p := params()
+		p.Tools = []openai.ChatCompletionToolUnionParam{weatherTool("get_weather"), weatherTool("get_time")}
+		first := s.call(t, p, stream)
+		if first.err != nil || len(first.answers) != 1 || len(first.answers[0].ToolCalls) != 2 {
+			t.Fatalf("turn 1: %v, answers %+v", first.err, first.answers)
+		}
+		var calls, results []map[string]any
+		for _, tc := range first.answers[0].ToolCalls {
+			calls = append(calls, map[string]any{"id": tc.ID, "type": "function",
+				"function": map[string]any{"name": tc.Name, "arguments": tc.Args}})
+			results = append(results, map[string]any{"role": "tool", "tool_call_id": tc.ID, "content": `{"ok":true}`})
+		}
+		history := []any{
+			map[string]any{"role": "system", "content": "You are a conformance test."},
+			map[string]any{"role": "user", "content": prompt},
+			map[string]any{"role": "assistant", "content": nil, "tool_calls": calls},
+		}
+		for _, r := range results {
+			history = append(history, r)
+		}
+		raw, err := json.Marshal(history)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second := s.call(t, p, stream, option.WithJSONSet("messages", json.RawMessage(raw)))
+		if second.err != nil {
+			t.Fatalf("turn 2, with turn 1's ids: %v", describe(second.err))
+		}
+		reqs := s.upstreamRequests(t, 2)
+		sent := string(reqs[1].Body)
+		switch {
+		case s.gemini:
+			sig := fakegemini.Signature(upstreamModel, fakeupstream.ToolCallID(0, 0))
+			if !strings.Contains(sent, `"thoughtSignature":"`+sig+`"`) || strings.Contains(sent, "skip_thought_signature_validator") {
+				t.Errorf("turn 2 did not carry turn 1's thought signature: %s", sent)
+			}
+		case s.anthropic:
+			if !strings.Contains(sent, `"tool_use_id":"`+fakeupstream.ToolCallID(0, 0)+`"`) {
+				t.Errorf("turn 2 lost the tool-call id: %s", sent)
+			}
+		default:
+			if !strings.Contains(sent, `"tool_call_id":"`+fakeupstream.ToolCallID(0, 0)+`"`) {
+				t.Errorf("turn 2 lost the tool-call id: %s", sent)
+			}
+		}
+	})
+}
+
 func (s *suite) testJSONMode(t *testing.T) {
 	streamModes(t, func(t *testing.T, stream bool) {
 		s.reset(t)
@@ -697,9 +857,10 @@ func (s *suite) testN(t *testing.T) {
 		p := params()
 		p.N = openai.Int(3)
 		r := s.call(t, p, stream)
-		if s.anthropic {
-			// The Messages API has no n: the only deployment lacks the
-			// capability, so the gateway answers without the upstream.
+		if s.translated() {
+			// The Messages API and Gemini have no n: the only deployment
+			// lacks the capability, so the gateway answers without the
+			// upstream.
 			s.checkError(t, r, apiErr{status: 400, typ: "invalid_request_error", code: "no_eligible_model", upstreamNotCalled: true})
 			if !strings.Contains(describe(r.err), "lacks capability n") {
 				t.Errorf("error %v does not name the missing capability", describe(r.err))
@@ -789,14 +950,15 @@ func (s *suite) testErrors(t *testing.T) {
 		edit     func(*openai.ChatCompletionNewParams)
 		direct   *apiErr // nil: not run directly
 		gateway  *apiErr // nil: same as direct
-		// anthropic, when set, replaces gateway for an Anthropic upstream.
+		// anthropic, when set, replaces gateway for an Anthropic or Gemini
+		// upstream.
 		anthropic *apiErr
 	}{
 		{
 			name:     "400 from the upstream",
 			behavior: ptr(fakeupstream.APIError(400, "invalid_request_error", "invalid_value", "temperature", "Invalid 'temperature': decimal above maximum value.")),
 			direct:   &apiErr{status: 400, typ: "invalid_request_error", code: "invalid_value", param: "temperature", message: "Invalid 'temperature': decimal above maximum value."},
-			// An Anthropic error has a type and a message, but no code or
+			// An Anthropic or Gemini error has a message, but no code or
 			// param to carry over.
 			anthropic: &apiErr{status: 400, typ: "invalid_request_error", message: "Invalid 'temperature': decimal above maximum value."},
 		},
@@ -868,7 +1030,7 @@ func (s *suite) testErrors(t *testing.T) {
 			if s.gateway && tc.gateway != nil {
 				want = tc.gateway
 			}
-			if s.anthropic && tc.anthropic != nil {
+			if s.translated() && tc.anthropic != nil {
 				want = tc.anthropic
 			}
 			if want == nil {
@@ -967,8 +1129,13 @@ func (s *suite) testMidStreamError(t *testing.T) {
 	// not one to one with chunks: message_start, content_block_start, a
 	// ping and two text deltas give three chunks.
 	after := 3
-	if s.anthropic {
+	switch {
+	case s.anthropic:
 		after = 5
+	case s.gemini:
+		// One Gemini event per word: the first gives the role and the
+		// first content chunk, the second one more.
+		after = 2
 	}
 	s.upstream.Script(fakeupstream.Behavior{Fault: fakeupstream.FaultDrop, FaultAfterChunks: after})
 	r := s.call(t, params(), true)
@@ -998,8 +1165,8 @@ func (s *suite) testMidStreamError(t *testing.T) {
 }
 
 func (s *suite) testUnknownFields(t *testing.T) {
-	if s.anthropic {
-		t.Skip("OpenAI-only: unknown request fields cannot reach an Anthropic upstream; the adapter translates only the fields it maps")
+	if s.translated() {
+		t.Skip("OpenAI-only: unknown request fields cannot reach an Anthropic or Gemini upstream; the adapter translates only the fields it maps")
 	}
 	// A big integer and an exponent survive only lossless forwarding.
 	const extension = `{"nested":{"big":12345678901234567890,"tiny":1.0e-7,"list":[1,"two",null,true,{}]},"text":"caf\u00e9 <&>"}`
@@ -1024,8 +1191,8 @@ func (s *suite) testUnknownFields(t *testing.T) {
 // byte (checkSuccess compares it with what the upstream sent), and every
 // stream chunk keeps them too.
 func (s *suite) testUnknownResponseFields(t *testing.T) {
-	if s.anthropic {
-		t.Skip("OpenAI-only: the adapter builds chat.completion objects from the Message, so unknown upstream fields are not passed through")
+	if s.translated() {
+		t.Skip("OpenAI-only: the adapter builds chat.completion objects from the Message or GenerateContentResponse, so unknown upstream fields are not passed through")
 	}
 	extra := map[string]json.RawMessage{
 		// A big integer and an exponent survive only lossless forwarding.

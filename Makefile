@@ -353,12 +353,12 @@ bench-cache: ## Measure exact-cache hit latency through the gateway with Redis (
 semantic-eval: ## Evaluate the semantic cache's test sets against a real embedding model (needs SWITCHYARD_SEMANTIC_CONFIG; skips without it).
 	$(GO) test -tags semanticlive -count=1 -v -run TestSemanticLive ./test/cache/
 
-smoke: ## Run the live smoke test against a real provider (needs OPENAI_API_KEY; SMOKE_MODEL optional).
+smoke: ## Run the live smoke tests against real providers (OPENAI_API_KEY and/or GEMINI_API_KEY; each test skips without its key).
 	$(GO) test -tags smoke -count=1 -v ./test/smoke/...
 
 .PHONY: record-fixtures
-record-fixtures: ## Record Anthropic API fixtures (needs ANTHROPIC_API_KEY; skips without it).
-	$(GO) test -tags record -count=1 -v -run TestRecordFixtures ./test/fakeanthropic/...
+record-fixtures: ## Record Anthropic and Gemini API fixtures (needs ANTHROPIC_API_KEY, GEMINI_API_KEY; each skips without its key).
+	$(GO) test -tags record -count=1 -v -run TestRecordFixtures ./test/fakeanthropic/... ./test/fakegemini/...
 
 fmt: ## Format the code (gofmt, goimports).
 	$(GOLANGCI_LINT) fmt

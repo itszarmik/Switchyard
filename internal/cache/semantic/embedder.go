@@ -3,7 +3,6 @@ package semantic
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -139,15 +138,11 @@ func (e *Embedder) costNano(tokens int64) int64 {
 	return m.NanoUSDCeil()
 }
 
-// mayHaveBilled reports whether a failed call may have been billed: as its
-// providers.Error kind says, and yes for any other error (as for a
-// transport failure).
+// mayHaveBilled reports whether a failed call may have been billed (see
+// providers.MayHaveBilled): as its providers.Error says, and yes for any
+// other error (as for a transport failure).
 func mayHaveBilled(err error) bool {
-	var pe *providers.Error
-	if errors.As(err, &pe) {
-		return pe.Kind.MayHaveBilled()
-	}
-	return true
+	return providers.MayHaveBilled(err)
 }
 
 // EmbeddingDeployment resolves semantic_cache.embedding_model to the

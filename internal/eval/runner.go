@@ -446,7 +446,13 @@ func (r *runner) call(ctx context.Context, t Target, req *schema.ChatRequest, es
 	})
 	if err != nil {
 		charged := est
-		if !providers.Kind(providers.Outcome(err)).MayHaveBilled() {
+		switch u := providers.BilledUsage(err); {
+		case u != nil:
+			// An answer the upstream billed although the adapter failed it.
+			if c, ok := usage.Cost(usage.FromUsage(u), d.Prices); ok {
+				charged = c
+			}
+		case !providers.MayHaveBilled(err):
 			charged = usage.Money{}
 		}
 		r.gate.charge(est, charged)

@@ -275,10 +275,20 @@ const (
 	genAIOutputTokens  = attribute.Key("gen_ai.usage.output_tokens")
 )
 
+// GenAISystem returns the GenAI provider name of a provider type, as the
+// semantic conventions spell the well-known ones: openai and anthropic
+// are their own names, and gemini (Google's Gemini API) is gcp.gemini.
+func GenAISystem(providerType string) string {
+	if providerType == "gemini" {
+		return "gcp.gemini"
+	}
+	return providerType
+}
+
 // GenAI holds the GenAI semantic-convention attributes of a span.
 type GenAI struct {
-	// System is the provider, such as openai or anthropic. It sets both
-	// gen_ai.system and gen_ai.provider.name.
+	// System is the provider, such as openai, anthropic or gcp.gemini (see
+	// GenAISystem). It sets both gen_ai.system and gen_ai.provider.name.
 	System string
 	// RequestModel is the model the request asked for; ResponseModel the
 	// one that answered, as the provider reported it.

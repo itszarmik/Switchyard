@@ -1,0 +1,4 @@
+data: {"candidates":[{"content":{"parts":[{"text":"The summary "}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":12000,"cachedContentTokenCount":8192,"candidatesTokenCount":5,"toolUsePromptTokenCount":100,"thoughtsTokenCount":300,"totalTokenCount":12405},"modelVersion":"gemini-4-carbon","responseId":"jf9KaZ0uW8-ihMIPj_aZ-Ag"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"is ready."}],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":12000,"cachedContentTokenCount":8192,"candidatesTokenCount":50,"toolUsePromptTokenCount":100,"thoughtsTokenCount":300,"totalTokenCount":12450},"modelVersion":"gemini-4-carbon","responseId":"jf9KaZ0uW8-ihMIPj_aZ-Ag"}
+

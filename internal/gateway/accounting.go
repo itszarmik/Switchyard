@@ -395,15 +395,19 @@ func (r *record) costHeader() string {
 // against: 0 if no attempt reached an upstream that may have billed it,
 // the exact cost rounded up to micro-USD when known, and the admitted
 // estimate otherwise, as for a request canceled after the upstream
-// received it; plus the semantic cache's embedding cost, rounded up to
-// micro-USD, if a lookup embedded the request's message. A request that
+// received it; plus its overhead (see record.overhead), rounded up to
+// micro-USD: the semantic cache's embedding cost, if a lookup embedded the
+// request's message, and the exact cost of attempts an upstream billed
+// without serving the request. A request that
 // was not admitted (a hit, or a miss refused or failed before admission)
 // is charged its embedding cost alone (see chargeOverhead). It runs even
 // when the client has gone away.
 func (r *record) settle() {
-	overhead := r.cache.overhead.MicroUSDCeil()
+	overhead := r.overhead().MicroUSDCeil()
 	if !r.admitted {
-		r.chargeOverhead(overhead)
+		// Only a lookup's embedding: a request that was not admitted made
+		// no upstream attempt that could have billed.
+		r.chargeOverhead(r.cache.overhead.MicroUSDCeil())
 		return
 	}
 	a := r.account()
@@ -419,7 +423,9 @@ func (r *record) settle() {
 	defer cancel()
 	if err := r.g.budgets.Settle(ctx, r.adm, actual+overhead); err != nil {
 		r.g.metrics.budgetStoreErrors.Inc()
-		if overhead > 0 {
+		// The cache counter counts the cache's embedding cost only; a
+		// billed attempt's is in budget_store_errors_total with the rest.
+		if r.cache.overhead.MicroUSDCeil() > 0 {
 			r.g.metrics.overheadUncharged.Inc()
 		}
 		warnStore(r.ctx, "budget settlement failed; the budgets keep the estimate", err)
@@ -470,6 +476,11 @@ func (r *record) recordUsage(latency time.Duration) {
 		baseline = r.baselineCost(a.tokens)
 		r.g.metrics.savingsCache.Add(baseline.Float64())
 	}
+	// Billed attempts cost their own deployments, though another served.
+	for _, b := range r.billed {
+		r.g.metrics.cost.WithLabelValues(b.d.Provider, b.d.Model.ID).Add(b.cost.Float64())
+		addTokens(r.g.metrics.tokens, b.d, b.tokens)
+	}
 	if d != nil && a.costKnown {
 		m := r.g.metrics
 		m.cost.WithLabelValues(d.Provider, d.Model.ID).Add(a.cost.Float64())
@@ -512,7 +523,7 @@ func (r *record) recordUsage(latency time.Duration) {
 		FallbackReason: r.fallbackReason,
 		RouteReason:    r.info.RouteReason,
 		CacheStatus:    usage.CacheStatusMiss,
-		OverheadCost:   r.cache.overhead,
+		OverheadCost:   r.overhead(),
 		Tokens:         a.tokens,
 		UsageKnown:     a.usageKnown,
 		UsageEstimated: a.usageEstimated,
@@ -543,6 +554,9 @@ func (r *record) recordUsage(latency time.Duration) {
 		ev.Deployment, ev.Provider = d.ID, d.Provider
 	case r.sentTo != nil:
 		ev.Deployment, ev.Provider = r.sentTo.ID, r.sentTo.Provider
+	case len(r.billed) > 0:
+		last := r.billed[len(r.billed)-1].d
+		ev.Deployment, ev.Provider = last.ID, last.Provider
 	}
 	if r.model != nil {
 		ev.BaselineModel = r.model.ID
